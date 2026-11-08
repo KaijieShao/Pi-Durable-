@@ -28,7 +28,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import type { Git } from "../../src/coordinator/git.ts";
 import { INTERRUPTED_KEPT_REASON } from "../../src/coordinator/messages.ts";
 import type { FsRequest, FsResponse, Sandbox } from "../../src/coordinator/ports.ts";
@@ -49,6 +48,7 @@ type TaskRow = {
 };
 type RunRow = { id: number; task_id: number; state: string; reason: string | null; dispatched_at: number | null };
 type IntentRow = {
+	id: number;
 	tool: string;
 	path: string | null;
 	state: string;
@@ -367,12 +367,29 @@ test("restart mid-edit, a third content → the group freezes naming the file (n
 	assert.ok(existsSync(worktree), "not archived while the change is unresolved");
 	assert.equal(await stack.branchSha("task/1"), undefined);
 
-	const unfrozen = ownerUnfreeze(stack.coordinator.store, GROUP);
-	assert.match(unfrozen.text, /Recorded your resolution of 1 uncertain file change/);
+	// The owner's unfreeze before reviewing the file: the recovery checks find the unresolved change, still frozen.
+	const refused = await stack.owner("unfreeze");
+	assert.equal(refused.code, 1);
+	assert.match(
+		refused.stderr,
+		new RegExp(
+			`FAILED file changes: unresolved: change ${change?.id} \\(Task 1, edit index\\.js in .*\\)\\. Review each file`,
+		),
+	);
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "frozen");
+	await stack.coordinator.idle();
+	assert.ok(existsSync(worktree), "still not archived");
+	// The owner reviews the file, records the resolution (owner resolve), then unfreezes.
+	const resolved = await stack.owner("resolve", String(change?.id));
+	assert.equal(resolved.code, 0, resolved.stderr);
+	assert.match(resolved.stdout, /resolved, accepted as it is in the worktree/);
 	assert.deepEqual(
 		[intents(stack)[1]?.state, intents(stack)[1]?.resolution],
-		["resolved", "owner unfreeze: accepted as found in the worktree"],
+		["resolved", "owner resolve: accepted as found in the worktree"],
 	);
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "frozen", "resolving is not unfreezing");
+	const unfrozen = await stack.owner("unfreeze");
+	assert.equal(unfrozen.code, 0, unfrozen.stderr);
 	const notice = await stack.waitForBotMessage(/^Task 1 was interrupted by restart/, { since });
 	assert.ok(notice.text.includes("index.js (edit): reviewed by the owner"), notice.text);
 	assert.match(

@@ -21,9 +21,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import { type Git, GitError } from "../../src/coordinator/git.ts";
-import { Store } from "../../src/coordinator/store.ts";
 import type { ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { waitFor } from "../helpers/env.ts";
 import { commitOnOrigin, originGit } from "../helpers/fake-github.ts";
@@ -543,12 +541,8 @@ for (const [what, lands] of [
 		// GitHub is reachable again; the owner unfreezes; the recheck compares with GitHub, then finishes the review.
 		net.down = false;
 		net.failPush = false;
-		const owner = new Store(join(stack.config.paths.dataDir, "coordinator.sqlite"));
-		try {
-			assert.equal(ownerUnfreeze(owner, GROUP).ok, true);
-		} finally {
-			owner.close();
-		}
+		const unfrozen = await stack.owner("unfreeze");
+		assert.equal(unfrozen.code, 0, unfrozen.stderr);
 		const review = await reviewOf(stack, 1, 1, frozen.id);
 		assert.equal(review.head, head.stdout.trim());
 		assert.equal(await stack.branchSha("task/1"), review.head);

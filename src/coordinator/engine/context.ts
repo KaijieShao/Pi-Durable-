@@ -196,6 +196,11 @@ export type EngineOptions = {
 	readonly diskRecheckMs?: number;
 	/** The watchdog: its link (the Coordinator's SQLite in production) and how long to wait for it. */
 	readonly watchdog: WatchdogOptions;
+	/**
+	 * How long the owner's unfreeze waits for the group's stopped runs and other work in flight to finish before it
+	 * refuses (engine/unfreeze.ts; default UNFREEZE_QUIET_MS). Tests shorten it.
+	 */
+	readonly unfreezeQuietMs?: number;
 };
 
 export type WatchdogOptions = { readonly link: WatchdogLink } & WatchdogTimings;
@@ -259,6 +264,12 @@ export type Ctx = {
 	 * Effects: "Dispatch stays blocked until reconciliation finishes"). Dispatch and merges wait while any is here.
 	 */
 	readonly reconciling: Set<number>;
+	/**
+	 * Freezes this engine asked for (freezeGroup), counted even when the group was frozen already (the first reason is
+	 * kept): the owner's unfreeze refuses if one came while its checks ran (engine/unfreeze.ts).
+	 */
+	freezes: number;
+	lastFreezeReason: string | undefined;
 	/** Run queued work in the background, tracked for idle(); marks `taskId` busy while it runs. */
 	track(kind: string, taskId: number | undefined, work: () => Promise<void>): void;
 	kick(): void;
@@ -401,6 +412,8 @@ export function conversationPath(ctx: Ctx, id: string): string {
  */
 export function freezeGroup(ctx: Ctx, reason: string): void {
 	if (ctx.stopped) return;
+	ctx.freezes += 1;
+	ctx.lastFreezeReason = reason;
 	try {
 		tx(ctx, () => {
 			if (ctx.store.freeze(ctx.chatId, reason)) {

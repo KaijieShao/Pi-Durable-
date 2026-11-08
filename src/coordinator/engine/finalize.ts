@@ -378,12 +378,12 @@ async function finalizeNormal(
 		settleAfterNormal(ctx, active, decision.finished);
 	});
 	if (problem !== undefined) {
-		// review_done stays 0: the review step runs at the recheck after the owner resolves the freeze.
+		// review_done stays 0: the review step runs as a recovery job once the owner's unfreeze passed its checks.
 		freezeGroup(ctx, problem);
 		return;
 	}
 	// A file change could not be reconciled: the group is frozen, and the review step (which commits and pushes the
-	// worktree) runs at the recheck after the owner resolved it.
+	// worktree) runs as a recovery job once the owner resolved it (owner resolve) and the unfreeze passed its checks.
 	if (effects?.frozen !== undefined) return;
 	try {
 		await reviewStep(ctx, active.runId, { interrupted: false });

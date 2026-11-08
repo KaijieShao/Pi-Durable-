@@ -15,6 +15,11 @@
 #
 # The watchdog unit starts first; the Coordinator dispatches nothing until the watchdog has verified its restart
 # sweep, and nothing new while the watchdog's heartbeat is stale.
+#
+# The owner socket is /var/lib/pi-durable/owner/owner.sock (0700 directory, 0600 socket and token, this unit's user
+# only; docs/security.md "The owner socket"). Run the owner CLI as that user, e.g. (it reads only PI_DATA_DIR,
+# PI_TASK_DIR, TELEGRAM_GROUP_CHAT_ID and the disk sizes from the file, never a secret):
+#   sudo -u pi-coordinator /usr/bin/node /opt/pi-durable/src/cli/main.ts owner status --env-file /etc/pi-durable/coordinator.env
 
 [Unit]
 Description=Pi Durable group Coordinator (Telegram, relay, outbox, runs)

@@ -61,7 +61,8 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
   nor pushed, and the bot lists those files. A reply then starts a fresh conversation seeded with them (its review
   pushes them), or `/cancel` archives the task (its final checkpoint pushes them). A run that had not reached Pi yet
   (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop or a
-  GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
+  GitHub outcome, it freezes the group; only the owner CLI unfreezes it, and only after the Coordinator's recovery
+  checks pass again (the group stays frozen while they run, and the CLI names the check that failed).
 - **Uncertain file edits:** before an `edit` or `write` runs in the agent container, its intent (the file, its hash
   before, the intended hash) is saved. If the answer never comes (a crash, a client timeout), the run is stopped, and
   once its Pi process and containers are verified gone the Coordinator hashes the file itself (no symlink followed,
@@ -77,7 +78,8 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
 ```sh
 pi-durable-telegram watchdog [--env-file <path>]
 pi-durable-telegram run [--env-file <path>]
-pi-durable-telegram owner status|unfreeze|failed-events [--env-file <path>]
+pi-durable-telegram owner status|unfreeze [<group>]|resolve <change>...|failed-events [--env-file <path>]
+pi-durable-telegram owner conversations [<task>]|inspect <conversation> [--env-file <path>]
 ```
 
 `watchdog` is the independent stop path, its own process (its own systemd unit and user in production): start it
@@ -85,8 +87,12 @@ first. It needs no secret. At every Coordinator start it kills and verifies ever
 container before anything is dispatched, cleans up after a crashed Coordinator, and enforces the run deadline; without
 it the Coordinator queues commands but starts no run ([security.md](docs/security.md#the-watchdog)).
 
-From the sources: `node src/cli/main.ts …` (Node 22 strips the types). `owner` opens the Coordinator's database
-directly and may run next to a live Coordinator.
+From the sources: `node src/cli/main.ts …` (Node 22 strips the types). `owner` talks to the running Coordinator over
+its owner-only local socket, `<PI_DATA_DIR>/owner/owner.sock`; run it as the Coordinator's user. `owner unfreeze`
+makes the Coordinator repeat its recovery checks and unfreezes the group only if all pass; `owner resolve` records
+your review of an uncertain file change; `owner inspect` prints a quarantined conversation's transcript, read without
+writing anything. Without a running Coordinator it says so and exits 3 (`owner status` adds a labelled read-only
+status from the database) ([RUN-LOCAL.md](RUN-LOCAL.md#owner-cli), [security.md](docs/security.md#the-owner-socket)).
 
 ## Model endpoint (OPENAI_BASE_URL)
 
@@ -100,8 +106,7 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 
 ## Not built yet
 
-Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; the
-owner CLI's local socket and read-only inspection of quarantined conversations; a task disk that fills up during a
+Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; a task disk that fills up during a
 run (only a new worktree is checked against the task disk); size limits and retention rules for the boot disk's
 budgets (database, Pi's stores, logs, retained trials: `owner status` only reports their usage); trial reset and the
 stress test.

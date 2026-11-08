@@ -41,14 +41,14 @@ pgrep -fl -- --pi-durable-deployment=      # all Pi processes, of every local de
 On Linux, the units are listed with `systemctl list-units 'pi-run-*'` or
 `systemd-cgls /pi.slice/pi-durable.slice/pi-durable-runs.slice`.
 
-Restart cleanup (recovery step 2, at startup and again at the recheck after the owner unfreezes a group) runs in both
+Restart cleanup (recovery step 2, at startup and again in the recovery checks of an owner unfreeze) runs in both
 modes. It kills the Pi process of every run the database shows in progress, then every other Pi process of this
 deployment, whatever run it served: under systemd every unit named `pi-run-<deployment>-*` (in practice everything in
 the slice), in the process mode every process carrying this deployment's markers. It verifies each one is gone; if
 that cannot be confirmed, or the units or processes cannot be listed, the group freezes. Another deployment's units
 or processes are never touched by this Coordinator-side cleanup. It is defense in depth: the gate is the watchdog, a
 separate unit that survives the Coordinator ([security.md](security.md#the-watchdog)). Asked by the Coordinator at
-every start and recheck, it kills everything in the slice (every process in its control group, so a child that left
+every start and every owner unfreeze, it kills everything in the slice (every process in its control group, so a child that left
 its session is caught too) and every labelled container, verifies both are empty, and only then is dispatch reopened.
 
 ## What is verified where
@@ -61,7 +61,7 @@ its session is caught too) and every labelled container, verifies both are empty
   - kill through `systemctl kill`, and that `exited` waits for the unit to be gone, also for a unit that runs apart
     from its client and that `systemctl kill` missed (it exits on the closed stdin);
   - restart cleanup of a unit that outlived its Coordinator and of every other unit (or marked process) of this
-    deployment, never another deployment's, at restart and at the recheck after an unfreeze, and the freeze when
+    deployment, never another deployment's, at restart and in the recovery checks of an unfreeze, and the freeze when
     systemctl cannot tell;
   - failing closed when the isolation is unusable;
   - `/task` to review through the whole stack (test/runner/systemd.test.ts, test/e2e/isolation.test.ts).

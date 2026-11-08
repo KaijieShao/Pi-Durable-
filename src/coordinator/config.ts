@@ -12,6 +12,7 @@ import {
 	ISOLATIONS,
 	isolationFrom,
 	nonEmpty,
+	readEnvFileOnly,
 	SLICE_NAME,
 } from "../config/shared.ts";
 
@@ -129,6 +130,15 @@ export type CoordinatorConfig = {
 
 type Collector = { readonly problems: ConfigProblem[]; add(variable: string, message: string): void };
 
+function collector(): Collector {
+	return {
+		problems: [],
+		add(variable, message) {
+			this.problems.push({ variable, message });
+		},
+	};
+}
+
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 /** A POSIX user or group name (as systemd accepts it for User= / Group=). */
 const ACCOUNT = /^[a-z_][a-z0-9_-]{0,31}$/;
@@ -150,6 +160,62 @@ export function loadCoordinatorConfig(options: { envFile?: string; env?: NodeJS.
 	return parseCoordinatorConfig(env);
 }
 
+/**
+ * The owner CLI's own configuration (src/cli/owner.ts): only what it needs, never a secret (Deployment § Secrets: "The
+ * secrets are held only in the Coordinator's memory"). Every command goes to the running Coordinator over its owner
+ * socket, which holds the bot token, the model key and the GitHub token; the CLI reads none of them, not even from the
+ * Coordinator's env file: as for the watchdog, its other lines are dropped before parsing (readEnvFileOnly).
+ */
+export type OwnerConfig = {
+	/** TELEGRAM_GROUP_CHAT_ID: the group of `owner unfreeze` without an argument and of the read-only status. */
+	readonly groupChatId: number;
+	/** PI_DATA_DIR (the owner socket, the database) and PI_TASK_DIR, resolved exactly as for the Coordinator. */
+	readonly paths: { readonly dataDir: string; readonly taskDir: string };
+	/** The disk settings the read-only status reports (PI_BOOT_DISK_MIN_FREE, ...), parsed as for the Coordinator. */
+	readonly disk: CoordinatorConfig["disk"];
+};
+
+/** The only variables the owner CLI reads. */
+export const OWNER_VARIABLES = [
+	"PI_DATA_DIR",
+	"PI_TASK_DIR",
+	"TELEGRAM_GROUP_CHAT_ID",
+	"PI_BOOT_DISK_MIN_FREE",
+	"PI_TASK_DISK_MIN_FREE",
+	"PI_TASK_DISK_BUDGET",
+	"PI_WORKTREE_HEADROOM",
+] as const;
+
+/** Parse the owner CLI's variables (only those); throws ConfigError listing every problem, never a value. */
+export function parseOwnerConfig(
+	env: Env,
+	defaults: { readonly cwd: string; readonly home: string } = { cwd: process.cwd(), home: homedir() },
+): OwnerConfig {
+	const out = collector();
+	const dataDir = dataDirFrom(env.PI_DATA_DIR, defaults);
+	const config: OwnerConfig = {
+		groupChatId: parseInteger(env, "TELEGRAM_GROUP_CHAT_ID", out, { negative: true, required: true }),
+		paths: { dataDir, taskDir: taskDirFrom(env, dataDir, defaults.cwd) },
+		disk: parseDisk(env, out),
+	};
+	if (out.problems.length > 0) throw new ConfigError(out.problems);
+	return config;
+}
+
+/**
+ * The owner CLI's variables from `env` (they win) and the optional env file: only OWNER_VARIABLES are taken from the
+ * file; nothing is written to `env`.
+ */
+export function loadOwnerConfig(options: { readonly envFile?: string; readonly env?: Env } = {}): OwnerConfig {
+	const env = options.env ?? process.env;
+	const file = options.envFile === undefined ? {} : readEnvFileOnly(options.envFile, OWNER_VARIABLES);
+	if (file === undefined)
+		throw new ConfigError([{ variable: "--env-file", message: `${options.envFile}: cannot be read` }]);
+	const picked: Record<string, string | undefined> = {};
+	for (const name of OWNER_VARIABLES) picked[name] = env[name] ?? file[name];
+	return parseOwnerConfig(picked);
+}
+
 type Defaults = {
 	cwd: string;
 	home: string;
@@ -165,12 +231,7 @@ export function parseCoordinatorConfig(
 	env: Env,
 	defaults: Defaults = { cwd: process.cwd(), home: homedir(), ...uidGid(), ...currentUser() },
 ): CoordinatorConfig {
-	const out: Collector = {
-		problems: [],
-		add(variable, message) {
-			this.problems.push({ variable, message });
-		},
-	};
+	const out = collector();
 	const telegram = parseTelegram(env, out);
 	const agents = parseAgents(env, out);
 	const model = parseModel(env, out);
@@ -238,7 +299,7 @@ function parseLocal(
 	defaults: Defaults,
 ): Pick<CoordinatorConfig, "paths" | "docker" | "relay" | "setupScript" | "logLevel"> {
 	const dataDir = dataDirFrom(env.PI_DATA_DIR, defaults);
-	const taskDir = resolvePath(nonEmpty(env.PI_TASK_DIR) ?? join(dataDir, "tasks"), defaults.cwd);
+	const taskDir = taskDirFrom(env, dataDir, defaults.cwd);
 	const user = parseContainerUser(env, out, defaults);
 	const setupScript = parseSetupScript(env, out);
 	const logLevel = parseLogLevel(env, out);
@@ -259,6 +320,11 @@ function parseLocal(
 		setupScript,
 		logLevel,
 	};
+}
+
+/** PI_TASK_DIR, resolved from `cwd`; default `<PI_DATA_DIR>/tasks`. */
+function taskDirFrom(env: Env, dataDir: string, cwd: string): string {
+	return resolvePath(nonEmpty(env.PI_TASK_DIR) ?? join(dataDir, "tasks"), cwd);
 }
 
 function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorConfig["runner"] {

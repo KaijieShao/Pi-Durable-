@@ -6,11 +6,12 @@
  * The engine reads the Coordinator SQLite store: commands.ts records commands (tasks, follow-ups, cancels,
  * approvals) and kicks the engine, which then acts. Every engine write is one synchronous `store.tx()`; network,
  * git, container and IPC work happens outside transactions. A tick (on kick, every second, and after each piece of
- * work) runs, in order: frozen-group cancels, the post-unfreeze recheck, the watchdog's late answer, recovery jobs,
- * cancels, steers, review reminders, the merge worker, the look at tasks held because their branch changed on GitHub
- * (engine/held.ts), the look at a task disk too full for a new worktree (engine/task-disk.ts), and dispatch.
- * Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's verified watchdog sweep and a fresh
- * watchdog heartbeat (engine/watchdog.ts).
+ * work) runs, in order: frozen-group cancels, the recheck of a database an earlier version unfroze, the watchdog's
+ * late answer, recovery jobs, cancels, steers, review reminders, the merge worker, the look at tasks held because their
+ * branch changed on GitHub (engine/held.ts), the look at a task disk too full for a new worktree (engine/task-disk.ts),
+ * and dispatch. Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's verified watchdog sweep
+ * and a fresh watchdog heartbeat (engine/watchdog.ts). The owner's unfreeze (unfreeze(), engine/unfreeze.ts) runs the
+ * recovery checks while the group is still frozen and turns it normal only if they all pass.
  */
 
 import type { Logger } from "../runtime/log.ts";
@@ -44,6 +45,7 @@ import {
 	sendPendingSteers,
 } from "./engine/runs.ts";
 import { liftTaskDiskHold, recheckTaskDisk, TASK_DISK_RECHECK_MS } from "./engine/task-disk.ts";
+import { UNFREEZE_QUIET_MS, type UnfreezeOutcome, unfreezeGroup } from "./engine/unfreeze.ts";
 import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
 import {
 	holdNote,
@@ -57,6 +59,7 @@ import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
 
 export type { EngineOptions } from "./engine/context.ts";
+export type { UnfreezeOutcome } from "./engine/unfreeze.ts";
 
 export type Engine = {
 	/** The relay's base URL (http://127.0.0.1:P/v1); no run is dispatched before it is set. */
@@ -84,6 +87,11 @@ export type Engine = {
 	idle(): Promise<void>;
 	/** Runs currently dispatched (tests and /status diagnostics). */
 	activeRuns(): readonly number[];
+	/**
+	 * The owner's unfreeze (owner socket): while the group stays frozen, repeat the recovery checks; set it normal and
+	 * reopen dispatch only if every one passes (engine/unfreeze.ts). Call after start().
+	 */
+	unfreeze(): Promise<UnfreezeOutcome>;
 };
 
 const TICK_MS = 1000;
@@ -198,7 +206,11 @@ function cancelFrozenRuns(ctx: Ctx, state: EngineState, group: GroupState): bool
 	return undecided.length > 0;
 }
 
-/** The owner unfroze the group: repeat recovery steps 1–4 once nothing is in flight, then reopen dispatch. */
+/**
+ * A database an earlier version's owner CLI unfroze directly (state normal, recheck_required=1): repeat recovery steps
+ * 1–4 once nothing is in flight, then reopen dispatch. The owner socket's unfreeze checks before the group turns normal
+ * (ownerUnfreeze below) and never sets the flag.
+ */
 function maybeRecheck(ctx: Ctx, state: EngineState, group: GroupState): boolean {
 	if (group.state !== "normal" || !group.recheck) return false;
 	if (state.recheckRunning || state.recoveryRunning || state.merging || ctx.active.size > 0) return false;
@@ -216,6 +228,32 @@ async function recheck(ctx: Ctx, state: EngineState): Promise<void> {
 		);
 	});
 	ctx.log.info("recheck_done", { chat: ctx.chatId, jobs: jobs.length });
+}
+
+/** Nothing of the engine in flight that the unfreeze checks could race: runs, merges, recovery jobs, cancels. */
+function quiet(ctx: Ctx, state: EngineState): boolean {
+	if (ctx.active.size > 0 || state.merging || state.recoveryRunning) return false;
+	return ctx.busy.size === 0 && ctx.reconciling.size === 0;
+}
+
+/**
+ * The owner's unfreeze, one at a time; tracked (idle() waits for it). recheckRunning keeps recovery jobs, merges and
+ * dispatch closed meanwhile; the group stays frozen until every check passed (engine/unfreeze.ts).
+ */
+function ownerUnfreeze(ctx: Ctx, state: EngineState, quietMs: number): Promise<UnfreezeOutcome> {
+	const group = ctx.store.groupState(ctx.chatId);
+	if (group.state !== "frozen") return Promise.resolve({ kind: "not_frozen", state: group.state });
+	if (state.recheckRunning) return Promise.resolve({ kind: "in_progress" });
+	state.recheckRunning = true;
+	const outcome = unfreezeGroup(ctx, {
+		quiet: () => quiet(ctx, state),
+		addJobs: (jobs) => addRecoveryJobs(ctx, state, jobs),
+		quietMs,
+	}).finally(() => {
+		state.recheckRunning = false;
+	});
+	track(ctx, state, "unfreeze", undefined, () => outcome.then(() => undefined));
+	return outcome;
 }
 
 function addRecoveryJobs(ctx: Ctx, state: EngineState, jobs: readonly RecoveryJob[]): void {
@@ -507,6 +545,8 @@ export function createEngine(options: EngineOptions): Engine {
 		enforcement: undefined,
 		recoveryPending: 0,
 		reconciling: new Set<number>(),
+		freezes: 0,
+		lastFreezeReason: undefined,
 		track: (kind, taskId, work) => track(ctx, state, kind, taskId, work),
 		kick,
 	};
@@ -547,6 +587,7 @@ export function createEngine(options: EngineOptions): Engine {
 		stop: () => stopEngine(ctx, state),
 		idle: () => idle(ctx, state),
 		activeRuns: () => [...ctx.active.keys()],
+		unfreeze: () => ownerUnfreeze(ctx, state, options.unfreezeQuietMs ?? UNFREEZE_QUIET_MS),
 	};
 }
 

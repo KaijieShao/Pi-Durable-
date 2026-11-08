@@ -18,7 +18,8 @@ async function main(argv: readonly string[]): Promise<number | undefined> {
 			return 2;
 		case "owner": {
 			const { runOwnerCommand } = await import("./owner.ts");
-			return runOwnerCommand(args.action, { envFile: args.envFile });
+			const { command: _command, envFile, ...invocation } = args;
+			return runOwnerCommand(invocation, { envFile });
 		}
 		case "watchdog": {
 			// Its own minimal configuration: no Coordinator configuration and no secret is ever loaded here.

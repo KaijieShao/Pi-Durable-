@@ -22,8 +22,9 @@
  * - Frozen group (evaluation.md; architecture.md § Frozen group): an unconfirmed merge freezes the group while one
  *   task runs and one is queued; the running task is cancelled "group frozen", nothing dispatches or merges, the task
  *   in review keeps its pull request, /task, follow-ups and /approve get the frozen notice, /status and /cancel work,
- *   a restart keeps it frozen; the owner CLI's unfreeze, then the recheck (which finds the merge already on main: no
- *   second merge), reopens dispatch.
+ *   a restart keeps it frozen; the owner CLI's unfreeze over the owner socket repeats the recovery checks while the
+ *   group stays frozen: refused (the group stays frozen, the CLI names the check) while GitHub cannot confirm the saved
+ *   merge, then passing (the merge is found already on main: no second merge) and dispatch reopens.
  * - Telegram offset (§ Telegram "The offset is saved only after the batch is saved"; evaluation.md "Duplicate update
  *   ID"): a batch that fails part-way is fetched again, its saved updates are duplicates (dropped by update id) before
  *   and after a restart, and a forced redelivery is dropped too.
@@ -38,9 +39,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { type TestContext, test } from "node:test";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import { INTERRUPTED_KEPT_REASON } from "../../src/coordinator/messages.ts";
-import { Store } from "../../src/coordinator/store.ts";
+import type { Store } from "../../src/coordinator/store.ts";
 import { OFFSET_KEY } from "../../src/coordinator/telegram/poller.ts";
 import { type ApiCall, type FakeBotApi, groupUpdate, type ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { waitFor } from "../helpers/env.ts";
@@ -930,17 +930,34 @@ test("frozen group: an unconfirmed merge freezes it; running task cancelled, no 
 		"the frozen notice is posted once",
 	);
 
-	// The owner resolves it with the owner CLI (its own connection to the database).
+	// The owner's unfreeze (the owner CLI, over the Coordinator's owner socket) while GitHub is still unreadable: the
+	// Coordinator repeats the recovery checks, the saved merge cannot be confirmed, the group stays frozen.
+	const early = await stack.owner("unfreeze");
+	assert.equal(early.code, 1, early.stdout);
+	assert.match(
+		early.stderr,
+		/^Group -1001234567890 stays frozen \(frozen: the merge outcome of Task 1 on GitHub is unknown\): the recovery check "merges" failed\. Nothing was unfrozen\./,
+	);
+	assert.match(
+		early.stderr,
+		/\n {2}ok {5}watchdog: .*\n {2}FAILED merges: the saved merge of Task 1 is still unknown: GitHub could not be read \(merge check\)\n/,
+	);
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "frozen");
+	assert.deepEqual(
+		intents().map((intent) => intent.state),
+		["pending"],
+	);
+	await stack.coordinator.idle();
+	assert.equal(stack.runs<RunRow>().find((run) => run.task_id === 4)?.state, "queued", "no dispatch after a refusal");
+	assert.equal(stack.github.count("PUT", /\/merge$/), 1, "no merge after a refusal");
+	// GitHub can be read again: the owner unfreezes, and every recovery check passes.
 	compareDown.on = false;
-	const owner = new Store(join(stack.config.paths.dataDir, "coordinator.sqlite"));
-	let unfrozen: ReturnType<typeof ownerUnfreeze>;
-	try {
-		unfrozen = ownerUnfreeze(owner, GROUP);
-	} finally {
-		owner.close();
-	}
-	assert.equal(unfrozen.ok, true);
-	assert.match(unfrozen.text, /unfrozen \(it was frozen: the merge outcome of Task 1 on GitHub is unknown\)/);
+	const unfrozen = await stack.owner("unfreeze", String(GROUP));
+	assert.equal(unfrozen.code, 0, unfrozen.stderr);
+	assert.match(
+		unfrozen.stdout,
+		/^Group -1001234567890 unfrozen \(it was frozen: the merge outcome of Task 1 on GitHub is unknown\)\. Every recovery check passed:/,
+	);
 	// The recheck finds main already containing Task 1's head: merged without a second merge; then dispatch reopens.
 	const merged = await stack.waitForBotMessage(/^Task 1 merged into main \(([0-9a-f]{7})\)\./, { since: frozen.id });
 	await stack.waitForBotMessage(/^Task 4 is ready for review \(run 1\)/, { since: frozen.id });

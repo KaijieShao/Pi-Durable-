@@ -25,8 +25,6 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
-import { Store } from "../../src/coordinator/store.ts";
 import type { ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { waitFor } from "../helpers/env.ts";
 import { commitOnOrigin, type FakeCall, type FakeGitHub, originGit } from "../helpers/fake-github.ts";
@@ -420,8 +418,10 @@ test("two approved tasks merge one at a time: never two merge intents pending; t
 	const maxPending = probePendingIntents(stack);
 	const mainBefore = await stack.mainSha();
 	stack.sendCommand(USER1, `/task alpha ${A_TASK}`);
-	stack.sendCommand(USER2, `/task beta ${B_TASK}`);
+	// Task 2 is sent once Task 1's review is posted, so each gets the pull request number the test names (run at the
+	// same time, the review that finishes first gets #1). Both still start from the same main: nothing has merged yet.
 	const review1 = await reviewOf(stack, 1);
+	stack.sendCommand(USER2, `/task beta ${B_TASK}`);
 	const review2 = await reviewOf(stack, 2);
 
 	// Every merge call reaching GitHub: which pull request, and the pending merge intents at that moment. The first
@@ -634,8 +634,10 @@ test("two tasks edit the same lines: the second merge lists the conflict, nothin
 		hold.release,
 	);
 	stack.sendCommand(USER1, "/task alpha reword the README tagline (alpha)");
-	stack.sendCommand(USER2, "/task beta reword the README tagline (beta)");
+	// Task 2 is sent once Task 1's review is posted, so each gets the pull request number the test names (run at the
+	// same time, the review that finishes first gets #1). Both still start from the same main: nothing has merged yet.
 	await reviewOf(stack, 1);
+	stack.sendCommand(USER2, "/task beta reword the README tagline (beta)");
 	const review2 = await reviewOf(stack, 2);
 	const ack1 = await command(stack, USER1, "/approve 1");
 	await stack.waitForBotMessage(/^Task 1 merged into main/, { since: ack1.id });
@@ -769,13 +771,9 @@ test("lost pull request response and GitHub unreadable: the group freezes; after
 	await stack.coordinator.idle();
 	assert.equal(stack.coordinator.store.groupState(GROUP).state, "frozen");
 	assert.equal(stack.runs<RunRow>()[0]?.review_done, 0);
-	// The owner CLI: its own connection to the Coordinator's database.
-	const owner = new Store(join(stack.config.paths.dataDir, "coordinator.sqlite"));
-	try {
-		assert.equal(ownerUnfreeze(owner, GROUP).ok, true);
-	} finally {
-		owner.close();
-	}
+	// The owner CLI, over the Coordinator's owner socket: the recovery checks pass, the group unfreezes.
+	const unfrozen = await stack.owner("unfreeze");
+	assert.equal(unfrozen.code, 0, unfrozen.stderr);
 
 	// The recheck redoes the review step: it looks the pull request up by head and base and opens no second one.
 	const { message } = await reviewOf(stack, 1, 1, frozen.id);

@@ -2,7 +2,7 @@
 # Independent stop path — Separate unit; survives a Coordinator crash"; spec/architecture.md § Watchdog). Its own
 # unit and its own user: it keeps running when the Coordinator crashes or restarts, and it holds no secret (no bot
 # token, no model key, no GitHub token) and has no network. What it does (src/watchdog/watchdog.ts):
-#   - answers the Coordinator's sweep requests (every restart, and the recheck after an owner unfreeze): kills
+#   - answers the Coordinator's sweep requests (every restart, and the recovery checks of an owner unfreeze): kills
 #     everything in the Pi slice and every container labelled pi-durable.managed=1, verifies both are empty, and only
 #     then lets admission reopen; unverified → the group freezes;
 #   - while no Coordinator runs (its lock is gone or stale), kills whatever it left;

@@ -13,8 +13,9 @@
  *      worktree) against the intent: the intended result → applied; the state before → unchanged ("currently
  *      unchanged"); a run_check → failed ("reported as failed once termination is confirmed").
  *   4. "Anything else freezes the group": unresolved; the task's users are told which file (never its content), the
- *      group freezes, and nothing archives, reviews or pushes the task's worktree until the owner's unfreeze records
- *      the resolution (src/cli/owner.ts: state resolved).
+ *      group freezes, and nothing archives, reviews or pushes the task's worktree until the owner records the
+ *      resolution (`owner resolve <change>`, src/coordinator/owner/service.ts: state resolved); the owner's unfreeze
+ *      refuses while any is unresolved (engine/unfreeze.ts).
  */
 import { classifyTarget, type PlannedChange, TargetUnreadable, targetState } from "../effect-target.ts";
 import { type ReconciledEffect, unresolvedEffect, unresolvedEffectReason } from "../messages.ts";

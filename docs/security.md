@@ -27,20 +27,25 @@ test outputs, the watchdog and the GitHub repository settings. Untrusted: model 
   read-only root filesystem, non-root user, all capabilities dropped, no new privileges, CPU, memory and process
   limits, only the task's worktree mounted with its `.git` masked, no credentials or secret environment.
 - **The watchdog: an independent stop path** ([the watchdog](#the-watchdog)). A separate process (its own systemd
-  unit and user in production) that survives a Coordinator crash. At every Coordinator start, and at the recheck after
-  an owner unfreeze, it kills everything in the Pi slice and every container labelled `pi-durable.managed=1`,
+  unit and user in production) that survives a Coordinator crash. At every Coordinator start, and during the recovery
+  checks of an owner unfreeze, it kills everything in the Pi slice and every container labelled `pi-durable.managed=1`,
   verifies both are empty, and only then does the Coordinator dispatch again. While no Coordinator runs it removes
   whatever was left; it enforces each run's 10-minute deadline on its own.
 - **Fail closed.** If Docker or the images are unavailable, or the Pi process isolation (systemd, the slice, the
   host setup), or the watchdog (no verified sweep, or no heartbeat for 15 s), no execution starts; commands are still
   saved and queued. If a stop or a GitHub outcome cannot be confirmed, by the Coordinator or by the watchdog, the group
-  freezes until the owner resolves it and unfreezes it with the owner CLI. So does a file change whose outcome stays
+  freezes until the owner resolves it and unfreezes it with the owner CLI ([the owner socket](#the-owner-socket)): the
+  running Coordinator repeats its recovery checks while the group stays frozen and unfreezes it only if every one
+  passes. So does a file change whose outcome stays
   unknown: each `edit`/`write` saves its intent (file, hash before, intended hash) before it runs; after an unknown
   outcome the run is stopped and, once its processes and containers are verified gone, the Coordinator hashes the
   file itself (no symlink followed, confined to the worktree): applied or currently unchanged, else frozen. An
   interrupted run's changes are never committed or pushed at recovery. A push GitHub refuses because a task branch
   was changed outside the Coordinator is a known outcome (nothing was pushed): the Coordinator never force-pushes, and
   only that task waits, with its worktree kept, until the branch is restored.
+- **The owner CLI talks only to the running Coordinator, over an owner-only Unix socket** ([the owner
+  socket](#the-owner-socket)): it never writes the database; the transcript of a quarantined conversation goes to the
+  owner's terminal only, read without writing anything.
 - **Logs are metadata only:** ids, counts, outcomes, denial categories and hashes; never message text, prompts, tool
   output, headers or secrets. Raw task and follow-up text is stored only in the Coordinator's SQLite database (mode
   600; 660 shared with the watchdog's group when `PI_STATE_GROUP` is set) and the Pi conversation stores under `PI_DATA_DIR` (mode 700 locally; under systemd isolation 0660 files in a
@@ -62,7 +67,7 @@ unit; survives a Coordinator crash"; [spec/architecture.md](../spec/architecture
 | Pi processes | Systemd isolation: every process in the slice's control group (`systemctl show -p ControlGroup`, then `cgroup.procs` of it and every cgroup below), SIGKILLed and listed again until empty: a process cannot leave its cgroup, so a `setsid` or double-fork escape is still caught. Process isolation (Mac): the runner's command line with this deployment's marker. Both under systemd |
 | Containers | Every container labelled `pi-durable.managed=1` (`docker rm -f`, listed again until none is); for a deadline, the run's task and generation labels |
 | Verified | Both lists read again and empty, with a bounded retry. Anything left, or a list that cannot be read, is an unverified stop: the group freezes |
-| When | Each Coordinator start (recovery step 2, before dispatch reopens) and each recheck after an unfreeze, on request; on its own when the Coordinator's lock is gone or its owner dead and anything is left; for a run still starting, running or finalizing 60 s past its deadline (an unverified stop there freezes the run's own group, even if the watchdog's `TELEGRAM_GROUP_CHAT_ID` differs: that mismatch is logged as `watchdog_group_mismatch`) |
+| When | Each Coordinator start (recovery step 2, before dispatch reopens) and each owner unfreeze (its recovery checks, while the group is still frozen), on request; on its own when the Coordinator's lock is gone or its owner dead and anything is left; for a run still starting, running or finalizing 60 s past its deadline (an unverified stop there freezes the run's own group, even if the watchdog's `TELEGRAM_GROUP_CHAT_ID` differs: that mismatch is logged as `watchdog_group_mismatch`) |
 | Gate | The Coordinator dispatches, merges and runs its recovery checks only after its own verified sweep and while the heartbeat is younger than 15 s; it waits 30 s for an answer at start, then runs paused (commands queued, the group told once) and resumes by itself when the watchdog answers |
 
 Production host setup (after [isolation.md](isolation.md#one-time-host-setup-linux)), as root:
@@ -92,6 +97,28 @@ install -D -m 0644 deploy/systemd/docker.service.d/pi-durable-task-disk.conf \
 - One watchdog acts per Coordinator database: the one whose pid holds the heartbeat. A second one (started by
   mistake) logs `watchdog_standby`, writes and kills nothing, and takes over only once the first one is gone, stalled
   or stopped (its heartbeat older than 5 s), so a sweep never runs after another watchdog's answer reopened dispatch.
+
+## The owner socket
+
+[spec/interfaces-and-storage.md](../spec/interfaces-and-storage.md) § Interfaces, Owner CLI: "A local socket for
+status, frozen-group resolution, failed events and read-only inspection of quarantined conversations"; § Recovery
+After a Restart: "The owner unfreezes through the CLI, then recovery checks repeat before dispatch opens for admitted
+work" and "Its conversation is quarantined and opened only read-only". Code: `src/coordinator/owner/` (the
+Coordinator's side), `src/cli/owner.ts` and `src/cli/owner-client.ts` (the CLI).
+
+| | |
+|---|---|
+| Where | `<PI_DATA_DIR>/owner/owner.sock`, a Unix domain socket the Coordinator binds right after it opens its database (status answers during startup too; an unfreeze waits until the engine runs) and removes when it stops |
+| Files | The directory `owner/` is 0700 and the Coordinator user's (an existing one of its own is tightened; another owner, a symlink or not a directory refuses the start). The socket is 0600, set right after bind and verified (the 0700 directory covers the moment in between). `owner.token`: 32 random bytes in hex, new at every start, 0600, created exclusively and never through a symlink, removed on stop |
+| Who may connect | Node exposes no peer credentials of a Unix socket (no SO_PEERCRED or getpeereid), so the peer's uid is not read. What is enforced instead: the client must search the 0700 directory and connect to the 0600 socket (Linux checks write permission on the socket), and every request must carry the token it read from the 0600 file (compared in constant time): only the Coordinator's user and root can do all three. On the VM the owner runs the CLI as that user: `sudo -u pi-coordinator node /opt/pi-durable/src/cli/main.ts owner status --env-file /etc/pi-durable/coordinator.env`. The CLI first checks the directory is its own and not reachable by others; otherwise it sends nothing (no token goes to a socket someone else could have placed) |
+| Stale socket | A socket file a crashed Coordinator left behind is removed at the next start, but only if it is a socket and nothing answers on it (the data directory's lock is held already, so no other Coordinator of this deployment runs); a live listener or a file that is not a socket refuses the start |
+| Protocol | One connection, one request, one response, each a single line of JSON (`{"v":1,"token":…,"command":…}` → `{"ok":…,"text":…}`). A request is at most 64 KiB and must arrive within 5 s, else it is refused (`too_large`, `timeout`) and the connection closed; anything after the first line is not read; at most 8 connections at a time. Bad requests get their reason (`bad_request`); a missing or wrong token is `unauthorized` and never reaches a command |
+| Commands | `status`; `unfreeze [<group>]` (this Coordinator's group only); `resolve <change>...`; `failed-events`; `conversations [<task>]`; `inspect <conversation>` |
+| Unfreeze | The group stays frozen while the Coordinator repeats the recovery checks, in order: nothing of the group still stopping, every run key closed, its own kills of leftover Pi processes and containers verified, the watchdog's sweep (reason `recheck`) answered and verified, every saved merge intent checked against GitHub, every pending file change reconciled and none unresolved without the owner's `resolve`, the relay running, and no new freeze meanwhile (none by the Coordinator, e.g. a `/cancel`'s archive that could not reach GitHub, and no stop the watchdog could not verify). A task a `/cancel` archives while the checks run gets no recovery job: that archive finishes on its own. Only if all pass does the group turn normal (in one transaction with the recovery jobs found); otherwise it stays frozen and the CLI prints which check failed (exit 1). Nothing interrupted resumes; tasks the freeze cancelled stay cancelled. The CLI never writes the database: without a running Coordinator there is no unfreeze |
+| Read-only inspection | Only a quarantined conversation of the group, stored in `<PI_DATA_DIR>/conversations/`, never through a symlink. Without a `-wal` file (or an empty one) the file is opened with SQLite's `mode=ro&immutable=1`: no lock, no `-wal` or `-shm` created. With a `-wal` that holds entries (its Pi process was killed), the file and its WAL are copied (read) into a private scratch directory under `owner/`, the copy is read and deleted at once (and at the next start if a crash left one). Pi Durable's own storage is not opened (its open migrates in a write transaction and its close checkpoints). The transcript goes back over the socket to the owner's terminal only; control characters and bidirectional overrides are escaped, known secret shapes masked |
+| Logs | The command, its outcome and duration (`owner_request`), a refused token (`owner_request_refused`), an inspection's conversation id, entry count and source (`owner_inspect`), a resolution's change and task (`owner_effect_resolved`); never the token, a transcript or any text |
+| Secrets | None in the CLI (Deployment § Secrets: "held only in the Coordinator's memory"): it reads only `PI_DATA_DIR`, `PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes, and from an env file (the Coordinator's, on the VM) only those lines; the bot token, the model key and the GitHub token are dropped before parsing |
+| Without a Coordinator | The CLI says it is not running and exits 3. `owner status` then also prints the status from a read-only, query-only connection to the database (no migration, refused unless the schema is the current one), labelled `READ-ONLY STATUS FROM THE DATABASE` |
 
 Report vulnerabilities privately, see [SECURITY.md](../SECURITY.md).
 

@@ -290,14 +290,24 @@ pgrep -fl -- --pi-durable-deployment=                # no output (every Pi proce
 
 ## Owner CLI
 
-Run with the same env file, in a second terminal while the Coordinator runs or while it is stopped (it opens the
-Coordinator's SQLite database directly; the owner socket from the docs is not built yet):
+The owner CLI talks to the running Coordinator over its owner socket, `<PI_DATA_DIR>/owner/owner.sock` (a 0700
+directory, the socket and a per-start token 0600; [docs/security.md](docs/security.md#the-owner-socket)). Run it with
+the same env file, as the same user as the Coordinator, in a second terminal (it reads only `PI_DATA_DIR`,
+`PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes from it, never a secret):
 
 ```sh
-node src/cli/main.ts owner status --env-file .env.local          # group state, slots, the watchdog, tasks and PRs
-node src/cli/main.ts owner failed-events --env-file .env.local   # Telegram messages that could not be delivered
-node src/cli/main.ts owner unfreeze --env-file .env.local        # frozen group back to normal, recovery rechecked
+node src/cli/main.ts owner status --env-file .env.local              # group state, slots, the watchdog, tasks, disks
+node src/cli/main.ts owner failed-events --env-file .env.local       # Telegram messages that could not be delivered
+node src/cli/main.ts owner unfreeze --env-file .env.local            # recovery checks again; unfrozen only if all pass
+node src/cli/main.ts owner resolve 7 --env-file .env.local           # accept uncertain file change 7 as it is now
+node src/cli/main.ts owner conversations --env-file .env.local       # quarantined conversations (optionally: <task>)
+node src/cli/main.ts owner inspect <conversation> --env-file .env.local   # its transcript, opened read-only
 ```
+
+Exit codes: 0 done, 1 refused or failed (for example a recovery check failed), 2 configuration error, 3 the
+Coordinator is not running. Without a running Coordinator the CLI says so; `owner status` then also prints the status
+read from the database, labelled `READ-ONLY STATUS FROM THE DATABASE` (nothing in it is live), and nothing else works:
+in particular there is no unfreeze without the Coordinator's recovery checks.
 
 `owner status` also shows the watchdog: its last heartbeat ("stale" when older than 15 s: no new run starts), its
 last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it.
@@ -308,11 +318,35 @@ file matches neither its content before the change nor the intended result). A p
 because a task branch was changed outside the Coordinator is not unknown and does not freeze the group: only that task
 waits until the branch is restored (step 7 of the walkthrough; `owner status` lists such held tasks). Resolve the cause
 first (no leftover containers or Pi processes, see above; GitHub branch and pull request state as expected; for an
-uncertain file change, `owner status` lists the task, the file and its worktree: look at the file and fix it by hand if
-needed), then unfreeze. Unfreezing records your resolution of every unresolved file change (accepted as the file is
-now in the worktree) and sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery
-checks, including a new watchdog sweep (`reason=recheck`), before it dispatches queued work again. A `/cancel` sent
-while the change was unresolved goes ahead only then. Nothing that was cancelled resumes.
+uncertain file change, `owner status` lists the task, the file, its worktree and the change's number: look at the file,
+fix it by hand if needed, then record your resolution with `owner resolve <change>`, which accepts the file as it is
+now in the worktree), then unfreeze. `owner unfreeze` makes the Coordinator repeat its recovery checks while the group
+stays frozen: close every run key, kill and verify leftover Pi processes and containers, a new watchdog sweep
+(`reason=recheck`) that must be answered and verified, every saved merge checked against GitHub, every pending file
+change reconciled and none unresolved, the relay running, and nothing froze the group again meanwhile (including a
+stop the watchdog could not verify). Only if all pass is the group set to normal and dispatch
+reopens for queued work; otherwise it stays frozen and the CLI prints every check with the one that failed, for
+example:
+
+```
+Group -1001234567890 stays frozen (frozen: the merge outcome of Task 1 on GitHub is unknown): the recovery check "merges" failed. Nothing was unfrozen.
+Recovery checks, in order (the ones after the failed check did not run):
+  ok     runs: nothing of the group is running
+  ok     run keys: 0 open run keys closed
+  ok     leftovers: 0 leftover Pi processes killed; none left
+  ok     watchdog: its sweep verified the Pi slice and every labelled container empty
+  FAILED merges: the saved merge of Task 1 is still unknown: GitHub could not be read (merge check)
+Resolve the cause, then run owner unfreeze again.
+```
+
+A `/cancel` sent while a file change was unresolved goes ahead once it is resolved. Nothing that was cancelled
+resumes, and an interrupted run never does.
+
+A run interrupted by a restart leaves its conversation **quarantined**: never written or reused again (a reply starts
+a fresh conversation). `owner conversations` lists them with their task and run; `owner inspect <id>` prints the
+transcript (inputs, the model's answers and tool calls, tool results) to your terminal only, read without writing
+anything to the conversation's files (no `-wal` or `-shm` file is created; a WAL left by a killed Pi process is read
+from a private copy that is deleted at once). Control characters are escaped and known secret shapes masked.
 
 ## Where the data lives
 
@@ -320,7 +354,7 @@ while the change was unresolved goes ahead only then. Nothing that was cancelled
   follow-ups, queue, approvals, merge intents, file-change intents, budget ledger, outbox, Telegram offset),
   `conversations/` (one Pi SQLite
   file per conversation; raw task content lives here and in `coordinator.sqlite` only), `run-home/` (empty HOME for Pi
-  processes) and the lock file.
+  processes), `owner/` (mode 700: the owner socket and its token while the Coordinator runs) and the lock file.
 - `PI_TASK_DIR` (default `<PI_DATA_DIR>/tasks`): `repo.git` (the Coordinator's clone), `worktrees/task-<id>` (one per
   open task; deleted when the task is archived, the branch stays on GitHub), `scratch/` (check scratch space, wiped
   after each check).

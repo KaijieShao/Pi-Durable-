@@ -239,7 +239,7 @@ export interface RunLauncher {
 	 * everything in the slice: src/watchdog/reapers.ts): every Pi
 	 * process of this deployment that may still be there, whatever run it served (by unit name under systemd, by the
 	 * argv markers in the process mode), for isRunner/killRunner; undefined when they cannot be listed. Called only
-	 * while this Coordinator has no live run (recovery at startup and its recheck after an unfreeze).
+	 * while this Coordinator has no live run (recovery at startup and the owner unfreeze's recovery checks).
 	 */
 	leftovers(): readonly RunnerRef[] | undefined;
 }

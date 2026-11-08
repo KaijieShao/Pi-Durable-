@@ -3,8 +3,8 @@
  * file (Store schema v2, WAL; each side has its own connection). No socket, no secret: the watchdog never holds the
  * bot token, the model key or the GitHub token (src/watchdog/config.ts).
  *
- *   Coordinator → watchdog   a pending sweep request (reason coordinator_start at recovery step 2, or recheck after the
- *                            owner unfroze the group), with the requesting Coordinator's pid
+ *   Coordinator → watchdog   a pending sweep request (reason coordinator_start at recovery step 2, or recheck in the
+ *                            recovery checks of an owner unfreeze), with the requesting Coordinator's pid
  *   watchdog → Coordinator   the same row, done: verified (every Pi process and labelled container gone) or not, with
  *                            the counts; an unverified stop also freezes the group in the same transaction, with a
  *                            required notice in the outbox

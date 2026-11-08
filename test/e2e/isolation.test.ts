@@ -24,11 +24,9 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import { hashRunKey } from "../../src/coordinator/relay.ts";
 import { defaultRunnerPath } from "../../src/coordinator/runner-launcher.ts";
 import { unitName } from "../../src/coordinator/runner-systemd.ts";
-import { Store } from "../../src/coordinator/store.ts";
 import { deploymentId, runnerArgv } from "../../src/runner/argv.ts";
 import { sleep, waitFor } from "../helpers/env.ts";
 import { createSystemdShims } from "../helpers/systemd-shims.ts";
@@ -228,14 +226,12 @@ test("process isolation: restart cleanup and the recheck after an unfreeze kill 
 	// starts the recheck, which must kill and verify it too before dispatch reopens.
 	stack.coordinator.store.freeze(GROUP, "the Pi process of Task 9 could not be confirmed stopped");
 	const leftover = await markedPiProcess(t, dir, deployment, 998);
-	const owner = new Store(join(dir, "coordinator.sqlite"));
-	try {
-		assert.equal(ownerUnfreeze(owner, GROUP).ok, true);
-	} finally {
-		owner.close();
-	}
-	await waitFor(() => !pidAlive(leftover), { what: "the leftover killed by the recheck", timeoutMs: 15_000 });
-	await waitFor(() => !stack.coordinator.store.groupState(GROUP).recheck, { what: "recheck done", timeoutMs: 15_000 });
+	// The owner's unfreeze repeats the recovery checks before the group turns normal: the leftover is killed and
+	// verified gone by then.
+	const unfrozen = await stack.owner("unfreeze");
+	assert.equal(unfrozen.code, 0, unfrozen.stderr);
+	assert.match(unfrozen.stdout, /\n {2}ok {5}leftovers: [1-9]\d* leftover Pi process(es)? killed; none left\n/);
+	assert.equal(pidAlive(leftover), false, "killed and verified gone before the group turned normal");
 	assert.equal(stack.coordinator.store.groupState(GROUP).state, "normal");
 	assert.ok(pidAlive(foreign));
 	// Dispatch reopened: a task runs to review.

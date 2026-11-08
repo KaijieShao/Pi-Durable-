@@ -297,9 +297,17 @@ export class Store {
 	readonly now: () => number;
 	#depth = 0;
 
-	constructor(path: string, now: () => number = Date.now) {
-		this.db = new DatabaseSync(path);
+	/**
+	 * `readOnly`: the owner CLI's fallback while the Coordinator is not running. Opened read-only and query-only: no
+	 * migration, no PRAGMA that writes; the schema must already be SCHEMA_VERSION.
+	 */
+	constructor(path: string, now: () => number = Date.now, options: { readonly readOnly?: boolean } = {}) {
+		this.db = new DatabaseSync(path, { readOnly: options.readOnly === true });
 		this.now = now;
+		if (options.readOnly === true) {
+			this.#checkReadOnly();
+			return;
+		}
 		try {
 			// First: another connection (the watchdog, the owner CLI) may hold a lock while this one sets up.
 			this.db.exec("PRAGMA busy_timeout = 5000");
@@ -307,6 +315,19 @@ export class Store {
 			this.db.exec("PRAGMA synchronous = FULL");
 			this.db.exec("PRAGMA foreign_keys = ON");
 			this.tx(() => this.#migrate());
+		} catch (error) {
+			this.db.close();
+			throw error;
+		}
+	}
+
+	#checkReadOnly(): void {
+		try {
+			this.db.exec("PRAGMA busy_timeout = 5000");
+			this.db.exec("PRAGMA query_only = ON");
+			const version = this.getMeta("schema_version");
+			if (version !== String(SCHEMA_VERSION))
+				throw new Error(`the database has schema ${version ?? "none"}; this version reads schema ${SCHEMA_VERSION}`);
 		} catch (error) {
 			this.db.close();
 			throw error;

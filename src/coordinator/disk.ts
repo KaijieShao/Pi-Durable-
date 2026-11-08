@@ -58,7 +58,7 @@ export type DiskSettings = {
 	readonly worktreeHeadroomBytes: number;
 };
 
-export function diskSettings(config: CoordinatorConfig, limits: Limits): DiskSettings {
+export function diskSettings(config: Pick<CoordinatorConfig, "disk">, limits: Limits): DiskSettings {
 	const { disk } = config;
 	return {
 		bootMinFreeBytes: disk.bootMinFreeBytes ?? limits.minFreeDiskBytes,

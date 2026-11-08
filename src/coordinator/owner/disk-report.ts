@@ -7,21 +7,18 @@
  * retention rule deletes anything: conversations and the database grow until a trial reset (not built), logs follow
  * journald's own retention on the VM, and there are no retained trials (sealing is not built). The boot disk's
  * free-space floor (new tasks rejected) is the only boot-disk limit enforced.
+ *
+ * The folders are walked asynchronously (treeBytes): `owner status` runs inside the Coordinator, whose event loop (the
+ * poller, the relay, the runs) must not stall while a task folder that is not a mount point is measured.
  */
-import { readdirSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { CoordinatorConfig } from "../coordinator/config.ts";
-import {
-	type DiskSettings,
-	diskSettings,
-	isMountPointSync,
-	statfsSpace,
-	TASK_DISK_WAIT_KEY,
-	treeBytesSync,
-} from "../coordinator/disk.ts";
-import { DEMO_LIMITS } from "../coordinator/limits.ts";
-import { formatBytes } from "../coordinator/messages.ts";
-import type { Store } from "../coordinator/store.ts";
+import type { CoordinatorConfig } from "../config.ts";
+import { type DiskSettings, diskSettings, isMountPoint, statfsSpace, TASK_DISK_WAIT_KEY, treeBytes } from "../disk.ts";
+import { DEMO_LIMITS } from "../limits.ts";
+import { formatBytes } from "../messages.ts";
+import type { Store } from "../store.ts";
 
 const UNMEASURED = "cannot be measured";
 
@@ -32,6 +29,30 @@ function measured(measure: () => string): string {
 	} catch {
 		return UNMEASURED;
 	}
+}
+
+/** `measure()` formatted, or "cannot be measured" if it fails. */
+async function measuredAsync(measure: () => Promise<string>): Promise<string> {
+	try {
+		return await measure();
+	} catch {
+		return UNMEASURED;
+	}
+}
+
+/** The names in `dir`, or undefined if it does not exist; other errors throw. */
+async function namesIn(dir: string): Promise<string[] | undefined> {
+	try {
+		return await readdir(dir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+/** Bytes under `dir` (0 if it does not exist). */
+async function bytesUnder(dir: string): Promise<number> {
+	return (await namesIn(dir)) === undefined ? 0 : treeBytes(dir);
 }
 
 function fileBytes(path: string): number {
@@ -57,13 +78,13 @@ function databaseLine(dataDir: string): string {
 	return `  Database (coordinator.sqlite with its WAL): ${formatBytes(bytes)}; no retention rule enforced yet`;
 }
 
-function piStoreLine(store: Store, dataDir: string): string {
+async function piStoreLine(store: Store, dataDir: string): Promise<string> {
 	const conversations = store.get<{ n: number }>("SELECT COUNT(*) AS n FROM conversations")?.n ?? 0;
 	const dir = join(dataDir, "conversations");
-	const size = measured(() => {
-		const bytes = treeBytesSync(dir);
-		const files = bytes === undefined ? 0 : readdirSync(dir).length;
-		return `${formatBytes(bytes ?? 0)} in ${files} files`;
+	const size = await measuredAsync(async () => {
+		const names = await namesIn(dir);
+		const bytes = names === undefined ? 0 : await treeBytes(dir);
+		return `${formatBytes(bytes)} in ${names?.length ?? 0} files`;
 	});
 	return (
 		`  Pi raw-content store (conversations/): ${size}, ${conversations} conversations; no retention rule enforced ` +
@@ -71,12 +92,12 @@ function piStoreLine(store: Store, dataDir: string): string {
 	);
 }
 
-function taskLine(store: Store, taskDir: string, settings: DiskSettings): string {
-	const mounted = isMountPointSync(taskDir);
-	const space = measured(() => {
+async function taskLine(store: Store, taskDir: string, settings: DiskSettings): Promise<string> {
+	const mounted = await isMountPoint(taskDir).catch(() => false);
+	const space = await measuredAsync(async () => {
 		const { free, size, used } = statfsSpace(taskDir);
 		// A mount point: the filesystem's usage (Docker's data included); else what is under PI_TASK_DIR.
-		const inUse = mounted ? formatBytes(used) : `${formatBytes(treeBytesSync(taskDir) ?? 0)} under PI_TASK_DIR`;
+		const inUse = mounted ? formatBytes(used) : `${formatBytes(await bytesUnder(taskDir))} under PI_TASK_DIR`;
 		return `${formatBytes(free)} free of ${formatBytes(size)}, ${inUse} in use`;
 	});
 	const worktrees = store.get<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE worktree_path IS NOT NULL")?.n ?? 0;
@@ -89,17 +110,23 @@ function taskLine(store: Store, taskDir: string, settings: DiskSettings): string
 	);
 }
 
+/** What the disk lines need: the Coordinator's configuration, or the owner CLI's (no secrets). */
+export type DiskReportConfig = {
+	readonly paths: { readonly dataDir: string; readonly taskDir: string };
+	readonly disk: CoordinatorConfig["disk"];
+};
+
 /** The disk lines of `owner status`. */
-export function diskReport(store: Store, config: CoordinatorConfig): string[] {
+export async function diskReport(store: Store, config: DiskReportConfig): Promise<string[]> {
 	const settings = diskSettings(config, DEMO_LIMITS);
 	const { dataDir, taskDir } = config.paths;
 	const lines = [
 		bootLine(dataDir, settings),
 		databaseLine(dataDir),
-		piStoreLine(store, dataDir),
+		await piStoreLine(store, dataDir),
 		"  Metadata logs: stdout and stderr (journald on the VM, with its own retention); not on PI_DATA_DIR, not measured",
 		"  Retained trials: none (sealing and trial reset are not built)",
-		taskLine(store, taskDir, settings),
+		await taskLine(store, taskDir, settings),
 	];
 	const held = store.getMeta(TASK_DISK_WAIT_KEY);
 	if (held !== undefined) lines.push(`  New worktrees are held: ${held}`);

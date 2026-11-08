@@ -10,7 +10,6 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { type TestContext, test } from "node:test";
 import type { Update } from "grammy/types";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import { admitRun } from "../../src/coordinator/admission.ts";
 import { ConfigError, type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { startCoordinator } from "../../src/coordinator/coordinator.ts";
@@ -24,6 +23,7 @@ import {
 	UNCERTAIN_TOOL_RESULT,
 	uncertainChangeReason,
 } from "../../src/coordinator/messages.ts";
+import { resolveChanges } from "../../src/coordinator/owner/service.ts";
 import {
 	type FsResponse,
 	type GitHubApi,
@@ -34,6 +34,7 @@ import {
 	type RunnerHandle,
 	type Sandbox,
 	type SendMessageParams,
+	type SweepAnswer,
 	type TelegramApi,
 	TelegramError,
 } from "../../src/coordinator/ports.ts";
@@ -1336,7 +1337,7 @@ test("an unknown outcome stops the run; dispatch waits until its stop is verifie
 	assert.equal(taskRow(h, second).state, "review");
 });
 
-test("a refusal that left the file in a third state freezes the group; nothing archives until the owner's unfreeze records the resolution", async (t) => {
+test("a refusal that left the file in a third state freezes the group; the unfreeze is refused until the owner resolves it, then the task archives", async (t) => {
 	const h = await harness(t, {
 		sandbox: answerFor("third.txt", async (worktree) => writeFile(join(worktree, "third.txt"), "THIRD STATE\n"), {
 			ok: false,
@@ -1366,10 +1367,27 @@ test("a refusal that left the file in a third state freezes the group; nothing a
 	assert.equal(h.world.remote.get(`task/${taskId}`), undefined, "nothing pushed");
 	assert.equal(await readFile(join(task.worktree_path, "third.txt"), "utf8"), "THIRD STATE\n");
 
-	// The owner reviews the file and unfreezes: the resolution is recorded, the recheck archives the task.
-	assert.equal(ownerUnfreeze(h.store, CHAT).ok, true);
-	const [row] = h.store.all<{ state: string; resolution: string }>("SELECT * FROM effect_intents");
-	assert.equal(row?.state, "resolved");
+	// An unfreeze before the owner's resolution: the recovery checks find the unresolved change, the group stays frozen.
+	const [row] = h.store.all<{ id: number; state: string; resolution: string }>("SELECT * FROM effect_intents");
+	const refused = await h.engine.unfreeze();
+	assert.equal(refused.kind, "refused");
+	const failed = refused.kind === "refused" ? refused.checks.at(-1) : undefined;
+	assert.equal(failed?.name, "file changes");
+	assert.match(
+		failed?.detail ?? "",
+		new RegExp(`unresolved: change ${row?.id} \\(Task ${taskId}, write third\\.txt in `),
+	);
+	assert.match(failed?.detail ?? "", /owner resolve <change>/);
+	assert.equal(h.store.groupState(CHAT).state, "frozen");
+	await h.engine.idle();
+	assert.ok(existsSync(task.worktree_path), "still not archived");
+	assert.equal(messages(h, "effect_unresolved").length, 1, "not told twice");
+	// The owner reviews the file and records the resolution, then unfreezes: the checks pass, the task archives.
+	assert.equal(resolveChanges(h.store, CHAT, [row?.id ?? 0], silentLogger).ok, true);
+	assert.equal(h.store.groupState(CHAT).state, "frozen", "resolving alone does not unfreeze");
+	const unfrozen = await h.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
 	h.engine.kick();
 	await h.engine.idle();
 	assert.equal(taskRow(h, taskId).worktree_path, null, "archived after the owner's review");
@@ -1572,10 +1590,26 @@ test("restart while a first run was starting and leftovers cannot be verified go
 	assert.equal(h2.fake.runs.length, 0, "nothing dispatches while frozen");
 	assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), "check", "the worktree job waits for the unfreeze");
 
-	leftover.on = false;
-	h2.store.tx(() =>
-		h2.store.run("UPDATE groups SET state = 'normal', reason = NULL, recheck_required = 1 WHERE chat_id = ?", CHAT),
+	// The owner's unfreeze while the leftover container is still there: its own kills cannot verify it, refused.
+	const refused = await h2.engine.unfreeze();
+	assert.equal(refused.kind, "refused");
+	assert.deepEqual(refused.kind === "refused" ? refused.checks.map((check) => [check.name, check.ok]) : [], [
+		["runs", true],
+		["run keys", true],
+		["leftovers", false],
+	]);
+	assert.equal(
+		refused.kind === "refused" ? refused.checks.at(-1)?.detail : "",
+		"leftover containers could not be verified gone",
 	);
+	assert.equal(h2.store.groupState(CHAT).state, "frozen");
+	assert.equal(slotCount(h2), 1, "the slot is still held");
+	await h2.engine.idle();
+	assert.equal(h2.fake.runs.length, 0, "still nothing dispatched");
+
+	leftover.on = false;
+	const unfrozen = await h2.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
 	h2.engine.kick();
 	await h2.engine.idle();
 	assert.equal(h2.fake.runs.length, 1, "it runs once");
@@ -2555,15 +2589,266 @@ test("frozen group: running task cancelled as 'group frozen', nothing dispatched
 	assert.equal(taskRow(h, reviewed).state, "review");
 	assert.equal(h.world.pulls.get(1)?.state, "open");
 	assert.equal(h.fake.runs.length, 2);
-	// The owner CLI unfreezes: recheck, then dispatch reopens.
+	// The owner unfreezes: the recovery checks pass while the group is still frozen, then dispatch reopens.
 	h.fake.control.script = workScript();
-	h.store.tx(() =>
-		h.store.run("UPDATE groups SET state = 'normal', reason = NULL, recheck_required = 1 WHERE chat_id = ?", CHAT),
-	);
+	const unfrozen = await h.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
+	assert.deepEqual(unfrozen.kind === "unfrozen" ? unfrozen.checks.map((check) => [check.name, check.ok]) : [], [
+		["runs", true],
+		["run keys", true],
+		["leftovers", true],
+		["watchdog", true],
+		["merges", true],
+		["file changes", true],
+		["relay", true],
+	]);
+	assert.equal(unfrozen.kind === "unfrozen" ? unfrozen.reason : "", "test freeze");
+	assert.deepEqual(h.store.groupState(CHAT), { state: "normal", reason: null, recheck: false });
+	assert.deepEqual(await h.engine.unfreeze(), { kind: "not_frozen", state: "normal" });
 	h.engine.kick();
 	await h.engine.idle();
-	assert.equal(h.store.groupState(CHAT).recheck, false);
 	assert.equal(taskRow(h, queued).state, "review");
+	assert.equal(taskRow(h, running).state, "cancelled", "a task the freeze cancelled stays cancelled");
+});
+
+/** A watchdog link whose answer to the sweeps after recovery's first one is chosen by the test. */
+function scriptedWatchdog(answerTimeoutMs: number) {
+	const requests: string[] = [];
+	const control = { answer: "verified" as SweepAnswer["kind"] };
+	const watchdog: WatchdogOptions = {
+		link: {
+			request(reason) {
+				requests.push(reason);
+				return requests.length;
+			},
+			answer: (id) => (id === 1 ? { kind: "verified" } : { kind: control.answer }),
+			heartbeatAgeMs: () => 0,
+		},
+		answerTimeoutMs,
+		heartbeatMaxAgeMs: 15_000,
+	};
+	return { watchdog, requests, control };
+}
+
+const checkNames = (outcome: Awaited<ReturnType<Engine["unfreeze"]>>) =>
+	"checks" in outcome ? outcome.checks.map((check) => `${check.name}:${check.ok ? "ok" : "FAILED"}`) : [];
+
+test("owner unfreeze: the watchdog must answer its sweep and verify it; otherwise the group stays frozen and nothing dispatches", async (t) => {
+	const { watchdog, requests, control } = scriptedWatchdog(1_000);
+	const h = await harness(t, { watchdog });
+	h.store.tx(() => h.store.freeze(CHAT, "a stop could not be confirmed (test)"));
+	h.fake.control.script = workScript();
+	const taskId = submitTask(h, "alpha", "waits for the unfreeze");
+	control.answer = "unverified";
+	const unverified = await h.engine.unfreeze();
+	assert.equal(unverified.kind, "refused");
+	assert.deepEqual(checkNames(unverified), ["runs:ok", "run keys:ok", "leftovers:ok", "watchdog:FAILED"]);
+	assert.match(
+		unverified.kind === "refused" ? (unverified.checks.at(-1)?.detail ?? "") : "",
+		/could not verify that the leftovers are gone/,
+	);
+	control.answer = "pending";
+	const silent = await h.engine.unfreeze();
+	assert.equal(silent.kind, "refused");
+	assert.equal(
+		silent.kind === "refused" ? silent.checks.at(-1)?.detail : "",
+		"the watchdog did not answer its sweep request within 1 s",
+	);
+	assert.deepEqual(requests, ["coordinator_start", "recheck", "recheck"]);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual(h.store.groupState(CHAT), {
+		state: "frozen",
+		reason: "a stop could not be confirmed (test)",
+		recheck: false,
+	});
+	assert.equal(h.fake.runs.length, 0, "nothing dispatched while it stays frozen");
+	assert.equal(taskRow(h, taskId).state, "queued");
+	// The watchdog verifies the next sweep: unfrozen, and the queued task runs (once).
+	control.answer = "verified";
+	const unfrozen = await h.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "review");
+	assert.equal(h.fake.runs.length, 1);
+});
+
+test("owner unfreeze: a saved merge GitHub cannot confirm keeps the group frozen; once GitHub answers it is found merged, never merged twice", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	const approvalId = approve(h, taskId);
+	const head = taskRow(h, taskId).head_commit as string;
+	// GitHub merged, but the answer was lost and the group froze with the intent pending.
+	assert.ok((await h.world.github.mergePullRequest(1, head, "Merge task")).merged);
+	h.store.tx(() => {
+		h.store.run(
+			"INSERT INTO merge_intents(task_id, approval_id, head_commit, state, created_at) VALUES (?, ?, ?, 'pending', ?)",
+			taskId,
+			approvalId,
+			head,
+			Date.now(),
+		);
+		h.store.run("UPDATE tasks SET state = 'merging' WHERE id = ?", taskId);
+		h.store.freeze(CHAT, `the merge outcome of Task ${taskId} on GitHub is unknown`);
+	});
+	const merges = count(h.world.calls, "mergePullRequest");
+	const branchContains = h.world.github.branchContains;
+	h.world.github.branchContains = async () => {
+		throw new GitHubError("GitHub is down", 503, true);
+	};
+	const refused = await h.engine.unfreeze();
+	assert.equal(refused.kind, "refused");
+	assert.deepEqual(checkNames(refused), ["runs:ok", "run keys:ok", "leftovers:ok", "watchdog:ok", "merges:FAILED"]);
+	assert.equal(
+		refused.kind === "refused" ? refused.checks.at(-1)?.detail : "",
+		`the saved merge of Task ${taskId} is still unknown: GitHub could not be read (merge check)`,
+	);
+	assert.equal(h.store.groupState(CHAT).state, "frozen");
+	assert.equal(h.store.get<{ state: string }>("SELECT state FROM merge_intents")?.state, "pending");
+	h.world.github.branchContains = branchContains;
+	const unfrozen = await h.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
+	assert.equal(unfrozen.kind === "unfrozen" ? unfrozen.jobs : 0, 1, "the merged task's archive");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.get<{ state: string }>("SELECT state FROM merge_intents")?.state, "merged");
+	assert.equal(taskRow(h, taskId).state, "merged");
+	assert.equal(taskRow(h, taskId).worktree_path, null);
+	assert.equal(count(h.world.calls, "mergePullRequest"), merges, "not merged twice");
+	assert.equal(messages(h, "task_merged").length, 1);
+});
+
+test("owner unfreeze: refused when something froze the group again while its checks ran (a cancel's archive could not reach GitHub)", async (t) => {
+	const { watchdog, requests, control } = scriptedWatchdog(30_000);
+	const h = await harness(t, { watchdog });
+	const taskId = await runToReview(h);
+	h.store.tx(() => h.store.freeze(CHAT, "test freeze"));
+	control.answer = "pending";
+	const getPullRequest = h.world.github.getPullRequest;
+	h.world.github.getPullRequest = async () => {
+		throw new GitHubError("GitHub is down", 503, true);
+	};
+	const unfreezing = h.engine.unfreeze();
+	await waitFor(() => requests.length === 2, { what: "the unfreeze's sweep request" });
+	// While the watchdog has not answered yet, an authorized /cancel archives the task in review: it cannot read the
+	// pull request on GitHub, so it freezes the group (already frozen: the first reason stays).
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await waitFor(() => messages(h, "task_final").some((m) => /could not be archived yet/.test(m.text)), {
+		what: "the archive's freeze",
+	});
+	control.answer = "verified";
+	const refused = await unfreezing;
+	assert.equal(refused.kind, "refused");
+	assert.equal(refused.kind === "refused" ? refused.checks.at(-1)?.name : "", "no new freeze");
+	assert.equal(
+		refused.kind === "refused" ? refused.checks.at(-1)?.detail : "",
+		"the group froze again meanwhile (GitHub could not be read (pull request))",
+	);
+	assert.deepEqual([h.store.groupState(CHAT).state, h.store.groupState(CHAT).reason], ["frozen", "test freeze"]);
+	// GitHub is back: the next unfreeze passes and the archive is redone.
+	h.world.github.getPullRequest = getPullRequest;
+	const unfrozen = await h.engine.unfreeze();
+	assert.equal(unfrozen.kind, "unfrozen");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual([taskRow(h, taskId).state, taskRow(h, taskId).worktree_path], ["cancelled", null]);
+	assert.equal(h.world.pulls.get(1)?.state, "closed");
+});
+
+test("owner unfreeze: a /cancel's archive in flight while the checks run is not redone by a recovery job (its users are told once)", async (t) => {
+	const { watchdog, requests, control } = scriptedWatchdog(30_000);
+	const h = await harness(t, { watchdog });
+	const taskId = await runToReview(h);
+	h.store.tx(() => h.store.freeze(CHAT, "test freeze"));
+	control.answer = "pending";
+	// The cancel's archive waits on GitHub (reading the pull request) until the test lets it go on.
+	let reached = false;
+	let release: () => void = () => {};
+	const released = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const getPullRequest = h.world.github.getPullRequest;
+	h.world.github.getPullRequest = async (number) => {
+		reached = true;
+		await released;
+		return getPullRequest(number);
+	};
+	const unfreezing = h.engine.unfreeze();
+	await waitFor(() => requests.length === 2, { what: "the unfreeze's sweep request" });
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await waitFor(() => reached, { what: "the cancel's archive on GitHub" });
+	// The task is cancelled and still holds its worktree while the checks reconcile the database.
+	assert.equal(taskRow(h, taskId).state, "cancelled");
+	assert.notEqual(taskRow(h, taskId).worktree_path, null);
+	control.answer = "verified";
+	const unfrozen = await unfreezing;
+	assert.equal(unfrozen.kind, "unfrozen");
+	assert.equal(unfrozen.kind === "unfrozen" ? unfrozen.jobs : -1, 0, "no archive job for the cancel's own archive");
+	release();
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual([taskRow(h, taskId).state, taskRow(h, taskId).worktree_path], ["cancelled", null]);
+	assert.equal(h.world.pulls.get(1)?.state, "closed");
+	assert.equal(messages(h, "task_final").length, 1, "the cancellation is posted once");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("owner unfreeze: refused when the watchdog could not verify a stop while the checks ran (its freeze of a frozen group is a no-op)", async (t) => {
+	const { watchdog, requests, control } = scriptedWatchdog(30_000);
+	const h = await harness(t, { watchdog });
+	h.store.tx(() => h.store.freeze(CHAT, "test freeze"));
+	control.answer = "pending";
+	const unfreezing = h.engine.unfreeze();
+	await waitFor(() => requests.length === 2, { what: "the unfreeze's sweep request" });
+	// Meanwhile the watchdog answers a sweep of its own (a run's deadline) not verified: it freezes the group in the same
+	// transaction, which changes nothing in a frozen group.
+	h.store.tx(() => {
+		h.store.run(
+			`INSERT INTO watchdog_sweeps(reason, state, run_id, task_id, generation, verified, processes_killed,
+			   containers_killed, detail, requested_at, started_at, finished_at)
+			 VALUES ('deadline', 'done', 7, 3, 1, 0, 0, 0, 'containers_left', 1, 1, 1)`,
+		);
+		assert.equal(h.store.freeze(CHAT, "the watchdog could not verify that Task 3 was stopped"), false);
+	});
+	control.answer = "verified";
+	const refused = await unfreezing;
+	assert.equal(refused.kind, "refused");
+	assert.deepEqual(checkNames(refused), [
+		"runs:ok",
+		"run keys:ok",
+		"leftovers:ok",
+		"watchdog:ok",
+		"merges:ok",
+		"file changes:ok",
+		"relay:ok",
+		"no new freeze:FAILED",
+	]);
+	assert.equal(
+		refused.kind === "refused" ? refused.checks.at(-1)?.detail : "",
+		"the watchdog could not verify a stop meanwhile (owner status shows its last sweep)",
+	);
+	assert.deepEqual([h.store.groupState(CHAT).state, h.store.groupState(CHAT).reason], ["frozen", "test freeze"]);
+	// Nothing new since: the next unfreeze passes.
+	assert.equal((await h.engine.unfreeze()).kind, "unfrozen");
+});
+
+test("a database an earlier version's owner CLI unfroze directly (normal, recheck_required=1) is still rechecked before anything dispatches", async (t) => {
+	const verified = verifiedWatchdog();
+	const h = await harness(t, { watchdog: verified });
+	h.store.tx(() => {
+		h.store.freeze(CHAT, "old freeze");
+		h.store.run("UPDATE groups SET state = 'normal', reason = NULL, recheck_required = 1 WHERE chat_id = ?", CHAT);
+	});
+	h.fake.control.script = workScript();
+	const taskId = submitTask(h, "alpha", "after the old unfreeze");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual(verified.requests, ["coordinator_start", "recheck"]);
+	assert.equal(h.store.groupState(CHAT).recheck, false);
+	assert.equal(taskRow(h, taskId).state, "review");
 });
 
 // ---------------------------------------------------------------------------------------------------------------

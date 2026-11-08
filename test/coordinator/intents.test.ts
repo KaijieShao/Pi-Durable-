@@ -5,8 +5,8 @@
  * before → unchanged, anything else or an unreadable target → unresolved) and a pending run_check is reported failed;
  * the task's effects count as open (nothing may archive, cancel or review the worktree) while a row is pending or
  * unresolved or its interrupted run is not reconciled; an unresolved row freezes the group with a reason naming the
- * task and file, tells the task's users once (the file name, never its content) and stops recovery's job; the owner's
- * unfreeze records the resolution and `owner status` lists what waits for review. In a live run (engine/tools.ts): an
+ * task and file, tells the task's users once (the file name, never its content) and stops recovery's job; `owner
+ * resolve <change>` records the owner's resolution (it unfreezes nothing) and `owner status` lists what waits for review. In a live run (engine/tools.ts): an
  * answered refusal is inspected at once (as before → failed, the intended result → applied), a third state freezes the
  * group and revokes the run in the same step (no later call of it runs), and an answer the file operation never gave
  * stops the run, keeps the intent pending and holds dispatch until finalize reconciles it.
@@ -17,7 +17,6 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { ownerStatus, ownerUnfreeze } from "../../src/cli/owner.ts";
 import { planFileChange } from "../../src/coordinator/effect-target.ts";
 import { type ActiveRun, type Ctx, interruptedKey } from "../../src/coordinator/engine/context.ts";
 import {
@@ -35,6 +34,8 @@ import {
 import { executeTool } from "../../src/coordinator/engine/tools.ts";
 import { DEMO_LIMITS } from "../../src/coordinator/limits.ts";
 import { UNCERTAIN_TOOL_RESULT, uncertainChangeReason } from "../../src/coordinator/messages.ts";
+import { ownerStatus } from "../../src/coordinator/owner/report.ts";
+import { OWNER_RESOLUTION, resolveChanges } from "../../src/coordinator/owner/service.ts";
 import type { AgentSandbox, FsRequest, FsResponse } from "../../src/coordinator/ports.ts";
 import { Store } from "../../src/coordinator/store.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
@@ -166,7 +167,7 @@ test("a target that cannot be inspected (the worktree is gone) is unresolved, ne
 	assert.deepEqual([row?.state, row?.observed_hash], ["unresolved", null]);
 });
 
-test("unresolved freezes the group naming the task and file, tells its users once (no content), stops recovery's job; the owner's unfreeze records the resolution", async () => {
+test("unresolved freezes the group naming the task and file, tells its users once (no content), stops recovery's job; owner resolve records the resolution", async () => {
 	const s = setup();
 	writeFileSync(join(s.worktree, "src.js"), "CONTENT BEFORE\n");
 	const plan = await planFileChange(s.worktree, { op: "write", path: "src.js", content: "CONTENT INTENDED\n" });
@@ -195,14 +196,30 @@ test("unresolved freezes the group naming the task and file, tells its users onc
 	assert.equal(outbox(s.store).filter((message) => message.kind === "effect_unresolved").length, 1);
 
 	const status = ownerStatus(s.store, CHAT);
-	assert.match(status, /Uncertain file changes \(unresolved: review the file, then unfreeze/);
-	assert.ok(status.includes(`#1 run ${s.runId}: write src.js in ${s.worktree} (unresolved)`), status);
-	const unfrozen = ownerUnfreeze(s.store, CHAT);
-	assert.equal(unfrozen.ok, true);
-	assert.match(unfrozen.text, /Recorded your resolution of 1 uncertain file change \(accepted as found/);
+	assert.match(
+		status,
+		/Uncertain file changes \(unresolved: review the file, then owner resolve <change> and owner unfreeze/,
+	);
+	const [pending] = rows(s.store);
+	assert.ok(
+		status.includes(`#1 run ${s.runId}: write src.js in ${s.worktree} (unresolved; change ${pending?.id})`),
+		status,
+	);
+	// Another group's or an unknown change is not touched; a change that is not unresolved stays as it is.
+	const unknown = resolveChanges(s.store, CHAT, [999], silentLogger);
+	assert.equal(unknown.ok, false);
+	assert.match(unknown.text, /change 999: no such file change in this group/);
+	assert.equal(resolveChanges(s.store, -2002, [pending?.id ?? 0], silentLogger).ok, false);
+	const resolved = resolveChanges(s.store, CHAT, [pending?.id ?? 0], silentLogger);
+	assert.equal(resolved.ok, true);
+	assert.match(resolved.text, /change \d+ \(Task 1, src\.js\): resolved, accepted as it is in the worktree/);
+	assert.match(resolved.text, /owner unfreeze repeats the recovery checks/);
 	const [row] = rows(s.store);
-	assert.deepEqual([row?.state, row?.resolution], ["resolved", "owner unfreeze: accepted as found in the worktree"]);
-	assert.equal(s.store.groupState(CHAT).state, "normal");
+	assert.deepEqual([row?.state, row?.resolution], ["resolved", OWNER_RESOLUTION]);
+	assert.equal(OWNER_RESOLUTION, "owner resolve: accepted as found in the worktree");
+	assert.equal(s.store.groupState(CHAT).state, "frozen", "resolving is not unfreezing");
+	const again = resolveChanges(s.store, CHAT, [pending?.id ?? 0], silentLogger);
+	assert.match(again.text, /resolved, not unresolved; unchanged/);
 	assert.equal(effectsOpen(s.store, s.taskId), false, "resolved: the worktree may be used again");
 	assert.deepEqual(await settleTaskEffects(s.ctx, s.taskId), [], "the recheck's job now goes on");
 	assert.deepEqual(

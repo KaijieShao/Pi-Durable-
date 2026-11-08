@@ -9,6 +9,9 @@
  *   engine/watchdog.ts) → relay (step 4) → outbox → poller → engine ticks (step 5: dispatch only once the watchdog
  *   verified this Coordinator's sweep and while its heartbeat is fresh).
  *
+ * The owner socket (owner/socket.ts, <PI_DATA_DIR>/owner/owner.sock) listens from right after the Store opened: status
+ * and the read-only commands answer during startup too; unfreeze waits until the engine runs.
+ *
  * Secrets stay in `config` (memory only) and go only to the relay (model key), git/GitHub (GitHub token) and the
  * Telegram client (bot token); each Pi process gets only its run key. Production defaults: Docker sandbox, Pi
  * processes as transient systemd units in the Pi slice as the Pi user on Linux (PI_RUNNER_ISOLATION=systemd; the
@@ -29,6 +32,9 @@ import { createGit, type Git } from "./git.ts";
 import { createGitHub } from "./github.ts";
 import { DEMO_LIMITS, type Limits } from "./limits.ts";
 import { type OutboxSender, startOutbox } from "./outbox.ts";
+import { removeScratchCopies } from "./owner/inspect.ts";
+import { ownerService } from "./owner/service.ts";
+import { type OwnerSocket, startOwnerSocket } from "./owner/socket.ts";
 import type { GitHubApi, RunLauncher, Sandbox, TelegramApi, WatchdogLink } from "./ports.ts";
 import { startRelay } from "./relay.ts";
 import { createRunLauncher } from "./runner-launcher.ts";
@@ -111,8 +117,11 @@ async function requireMountPoint(taskDir: string): Promise<void> {
 }
 
 type Parts = {
+	owner?: OwnerSocket;
 	store?: Store;
 	engine?: Engine;
+	/** The engine once it runs (the owner socket's unfreeze waits for it). */
+	running?: Engine;
 	relay?: { close(): Promise<void> };
 	outbox?: { stop(): Promise<void> };
 	poller?: { stop(): Promise<void> };
@@ -298,6 +307,7 @@ async function shutdown(parts: Parts, lock: DataDirLock, log: Logger): Promise<v
 			log.warn("coordinator_stop_step_failed", { step: name, error: errorSummary(error) });
 		}
 	};
+	await step("owner_socket", () => parts.owner?.close());
 	await step("poller", () => parts.poller?.stop());
 	await step("engine", () => parts.engine?.stop());
 	await step("relay", () => parts.relay?.close());
@@ -371,6 +381,7 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 	const poller = startPollerFor(setup, store, telegram, engine, outbox);
 	parts.poller = poller;
 	engine.start();
+	parts.running = engine;
 	log.info("coordinator_started", { relay_port: new URL(relay.url).port });
 	return { engine, relay, outbox, poller };
 }
@@ -401,6 +412,12 @@ export async function startCoordinator(config: CoordinatorConfig, deps: Coordina
 			);
 		}
 		log.info("coordinator_starting", { ...describeConfig(config), isolation: launcher.isolation });
+		parts.owner = await startOwnerSocket({
+			dataDir: config.paths.dataDir,
+			log,
+			handle: ownerService({ store, config, log, engine: () => parts.running, startedAt: now() }),
+		});
+		await removeScratchCopies(parts.owner.paths.dir);
 		const { engine, relay, outbox, poller } = await boot(setup, parts, store, now, launcher);
 		let stopping: Promise<void> | undefined;
 		return {

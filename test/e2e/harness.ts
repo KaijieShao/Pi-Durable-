@@ -28,6 +28,8 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "../../src/cli/args.ts";
+import { runOwnerCommand } from "../../src/cli/owner.ts";
 import { type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { type Coordinator, startCoordinator } from "../../src/coordinator/coordinator.ts";
 import type { DiskProbe } from "../../src/coordinator/disk.ts";
@@ -520,6 +522,28 @@ export async function startStack(options: StackOptions = {}) {
 		async fileAtMain(path: string): Promise<string | undefined> {
 			const result = await originGit(origin.bare, ["show", `refs/heads/main:${path}`], { okCodes: [0, 128] });
 			return result.code === 0 ? result.stdout : undefined;
+		},
+		/**
+		 * The owner CLI (`owner <argv>`) against this stack: the production client over the Coordinator's owner socket
+		 * (<PI_DATA_DIR>/owner/owner.sock), with this stack's configuration. Its exit code and what it printed.
+		 */
+		async owner(...argv: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+			const parsed = parseArgs(["owner", ...argv]);
+			if (parsed.command !== "owner") throw new Error(`not an owner command: ${argv.join(" ")}`);
+			const { command: _command, envFile: _envFile, ...invocation } = parsed;
+			const out: string[] = [];
+			const err: string[] = [];
+			const code = await runOwnerCommand(invocation, {
+				// The owner CLI's own configuration (it reads no secret), from this stack's.
+				config: {
+					groupChatId: config.telegram.groupChatId,
+					paths: { dataDir: config.paths.dataDir, taskDir: config.paths.taskDir },
+					disk: config.disk,
+				},
+				stdout: (text) => out.push(text),
+				stderr: (text) => err.push(text),
+			});
+			return { code, stdout: out.join(""), stderr: err.join("") };
 		},
 		/** Stop the Coordinator and start a new one on the same directories (same fakes). */
 		async restart(): Promise<void> {

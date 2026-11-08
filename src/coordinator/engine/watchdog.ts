@@ -3,7 +3,7 @@
  * in the slice and every labelled container, verifies both are empty, and "only then lets admission reopen";
  * Architecture § Fails closed: "If enforcement is unavailable, no new execution starts").
  *
- *   Recovery step 2 (and the recheck after an owner unfreeze) asks the watchdog for a sweep and waits for its answer:
+ *   Recovery step 2 (and the owner unfreeze's recovery checks) asks the watchdog for a sweep and waits for its answer:
  *     verified     this Coordinator may dispatch (while the watchdog's heartbeat stays fresh);
  *     unverified   the watchdog froze the group in the same transaction (the Coordinator freezes it too, idempotent);
  *     no answer    the watchdog is unavailable: fail closed. Polling and commands go on and are queued, but nothing

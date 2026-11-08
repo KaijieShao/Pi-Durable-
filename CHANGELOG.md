@@ -70,11 +70,27 @@
   intent still pending is reconciled by hashing the file on the host (no symlink followed, confined to the worktree):
   the intended result is "applied", the content before "currently unchanged", a `run_check` is reported failed, and
   anything else freezes the group, naming the task and the file (never its content). Dispatch waits for this, and
-  nothing archives, reviews or pushes the task's worktree before it. The owner's unfreeze records the resolution;
-  `owner status` lists the files waiting for review. **Changed:** a run interrupted by a restart is no longer
+  nothing archives, reviews or pushes the task's worktree before it. The owner records the resolution with
+  `owner resolve <change>`; `owner status` lists the files waiting for review. **Changed:** a run interrupted by a restart is no longer
   tested, checkpointed and pushed at recovery. Its changes since the last checkpoint stay uncommitted in the worktree,
   the bot lists them, `/approve` is refused, and only a reply (a fresh run seeded with them, untracked files included
   in its diff) or `/cancel` (the final checkpoint) moves them on.
+
+- The owner CLI talks to the running Coordinator over a local socket (Interfaces and Storage § Owner CLI),
+  `<PI_DATA_DIR>/owner/owner.sock`: an owner-only directory (0700), socket and per-start token (0600), the token on
+  every request (Node exposes no peer credentials), one line of JSON each way, bounded in size and time; a socket a
+  crash left is replaced, and it is removed on stop. **Breaking:** the CLI no longer opens the database to change it.
+  `owner unfreeze [<group>]` makes the Coordinator repeat its recovery checks while the group stays frozen (runs
+  stopped, run keys closed, its own kills and the watchdog's sweep verified, saved merges checked against GitHub,
+  pending file changes reconciled and none unresolved, the relay running, no new freeze) and unfreezes it only if all
+  pass, else it names the failed check (exit 1); it no longer resolves uncertain file changes by itself: the new
+  `owner resolve <change>...` records that review. New `owner conversations [<task>]` lists quarantined conversations
+  and `owner inspect <conversation>` prints one's transcript to the owner's terminal, opened without writing anything
+  (SQLite immutable, or a private copy when its WAL holds entries). Without a running Coordinator the CLI says so and
+  exits 3; `owner status` then adds a labelled read-only status from the database. A database an earlier CLI unfroze
+  directly (`recheck_required=1`) is still rechecked before dispatch. **Changed:** the owner CLI reads only
+  `PI_DATA_DIR`, `PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes (even from the Coordinator's env file), so
+  it needs no secret and never holds one.
 
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.

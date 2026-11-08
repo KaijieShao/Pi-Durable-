@@ -3,13 +3,17 @@
 The Coordinator reads its configuration from the environment, optionally loaded from a file with
 `--env-file <path>` (variables already set in the environment win over the file). Every invalid or missing value
 stops it at start with one line per problem and exit code 2; values are never printed. The same file serves the
-owner CLI (`owner status|unfreeze|failed-events --env-file <path>`). The watchdog (`watchdog --env-file <path>`)
+owner CLI (`owner status|unfreeze|resolve|failed-events|conversations|inspect --env-file <path>`), which talks to the
+running Coordinator over `<PI_DATA_DIR>/owner/owner.sock` ([security.md](security.md#the-owner-socket)) and reads
+only `PI_DATA_DIR`, `PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes (`PI_BOOT_DISK_MIN_FREE`,
+`PI_TASK_DISK_MIN_FREE`, `PI_TASK_DISK_BUDGET`, `PI_WORKTREE_HEADROOM`): the file's other lines, secrets included, are
+dropped before parsing, so no secret reaches it. The watchdog (`watchdog --env-file <path>`)
 reads only its own few variables, see [Watchdog](#watchdog). Start from [.env.example](../.env.example); the local
 walkthrough is [RUN-LOCAL.md](../RUN-LOCAL.md).
 
 Secrets (marked below) are held only in the Coordinator's memory: after reading the configuration it removes them
 from its environment, the model key goes only to its relay, and the GitHub token only to its git and GitHub calls.
-Pi processes and containers never receive them.
+Pi processes, containers, the watchdog and the owner CLI never receive them.
 
 ## Telegram
 
@@ -51,7 +55,7 @@ Pi processes and containers never receive them.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`, mode 600; 660 with `PI_STATE_GROUP`), one Pi SQLite file per conversation, lock; mode 700 (0710 with systemd isolation: the Pi group may only traverse it) |
+| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`, mode 600; 660 with `PI_STATE_GROUP`), one Pi SQLite file per conversation, lock, and `owner/` (mode 700: the owner socket `owner.sock` and its token, 600, while the Coordinator runs); mode 700 (0710 with systemd isolation: the Pi group may only traverse it). `<PI_DATA_DIR>/owner/owner.sock` must fit in a socket path (103 bytes; 107 on Linux), else the Coordinator does not start (exit 2) |
 | `PI_TASK_DIR` | no | `<PI_DATA_DIR>/tasks` | The task disk: git repository, one worktree per open task, check scratch space |
 | `PI_REQUIRE_TASK_MOUNT` | no | off | `1`: refuse to start unless `PI_TASK_DIR` is a mount point (a separate task disk on a server) |
 | `PI_STATE_GROUP` | no | unset (owner-only) | A group (name, or gid) the Coordinator hands its database (0660) and lock file (0640) to at every start, so the watchdog can run as its own user (production: `pi-watchdog`, [security.md](security.md#the-watchdog)). Never `PI_RUNNER_GROUP` or root's; the Coordinator must be a member and the Pi user must not, else it refuses to start |

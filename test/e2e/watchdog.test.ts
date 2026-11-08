@@ -12,8 +12,9 @@
  *     asks for its own sweep, gets it verified, and only then dispatches the queued task.
  *   - No watchdog: commands are acknowledged and queued, nothing is dispatched, the group is told once; starting the
  *     watchdog reopens admission by itself; if the watchdog dies, no new run starts until it is back.
- *   - After the owner unfreezes the group, the recheck asks the watchdog for a sweep (reason recheck) and dispatch
- *     waits for its answer.
+ *   - The owner's unfreeze asks the watchdog for a sweep (reason recheck) while the group stays frozen: no answer, it
+ *     is refused (the CLI names the check, /task still gets the frozen notice); verified, the group unfreezes and
+ *     dispatch reopens.
  *   - The deadline, independently: a run the Coordinator's own timer would not stop yet is stopped by the watchdog
  *     (its Pi process and its container), verified and recorded; the Coordinator then fails the task.
  */
@@ -25,8 +26,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { type TestContext, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { ownerUnfreeze } from "../../src/cli/owner.ts";
-import { Store } from "../../src/coordinator/store.ts";
 import { createStoreWatchdogLink } from "../../src/coordinator/watchdog-link.ts";
 import { deploymentId } from "../../src/runner/argv.ts";
 import type { SweepRow } from "../../src/watchdog/protocol.ts";
@@ -277,31 +276,48 @@ test("no watchdog: commands are queued, nothing dispatched, the group told once;
 	assert.equal(sweeps(stack).length, 1, "no new sweep was needed");
 });
 
-test("after the owner unfreezes the group, the recheck asks the watchdog for a sweep and dispatch waits for its answer", {
+test("the owner's unfreeze asks the watchdog for a sweep (reason recheck): unanswered, the group stays frozen; verified, dispatch reopens", {
 	timeout: 120_000,
 }, async (t) => {
-	const stack = await startStack({ model: agent });
+	// The Coordinator waits 2 s for the watchdog's answer here (30 s in production), so the unanswered unfreeze is short.
+	const stack = await startStack({ model: agent, watchdogTimings: { answerTimeoutMs: 2_000 } });
 	t.after(() => stack.stop());
 	stack.coordinator.store.tx(() => stack.coordinator.store.freeze(GROUP, "a stop could not be confirmed (test)"));
 	await stack.watchdog.stop();
-	const owner = new Store(join(stack.config.paths.dataDir, "coordinator.sqlite"));
-	try {
-		assert.equal(ownerUnfreeze(owner, GROUP).ok, true);
-	} finally {
-		owner.close();
-	}
+	const refused = await stack.owner("unfreeze");
+	assert.equal(refused.code, 1, refused.stdout);
+	assert.match(
+		refused.stderr,
+		/stays frozen \(frozen: a stop could not be confirmed \(test\)\): the recovery check "watchdog" failed/,
+	);
+	assert.match(refused.stderr, /\n {2}FAILED watchdog: the watchdog did not answer its sweep request within 2 s\n/);
+	const first = sweeps(stack).find((row) => row.reason === "recheck");
+	assert.equal(first?.state, "pending");
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "frozen");
+	// Still frozen: a new task gets the frozen notice, nothing is queued or dispatched.
+	const early = stack.sendCommand(USER1, "/task alpha TOO-EARLY: add a file");
+	const notice = await stack.waitForBotMessage((message) => message.replyTo === early);
+	assert.match(notice.text, /The group is frozen \(a stop could not be confirmed \(test\)\)\./);
+	assert.equal(stack.runs<RunRow>().length, 0);
+
+	// The watchdog is back: the next unfreeze's sweep is answered and verified before the group turns normal.
+	stack.watchdog.start();
+	const unfrozen = await stack.owner("unfreeze");
+	assert.equal(unfrozen.code, 0, unfrozen.stderr);
+	assert.match(
+		unfrozen.stdout,
+		/\n {2}ok {5}watchdog: its sweep verified the Pi slice and every labelled container empty\n/,
+	);
+	const answered = sweeps(stack)
+		.filter((row) => row.reason === "recheck")
+		.at(-1);
+	assert.notEqual(answered?.id, first?.id, "a new request");
+	assert.deepEqual([answered?.state, answered?.verified], ["done", 1]);
+	assert.deepEqual(stack.coordinator.store.groupState(GROUP), { state: "normal", reason: null, recheck: false });
 	const command = stack.sendCommand(USER1, "/task alpha AFTER-UNFREEZE: add a file");
 	await stack.waitForBotMessage((message) => message.replyTo === command && /^Task 1 accepted/.test(message.text));
-	const recheck = await waitFor(() => sweeps(stack).find((row) => row.reason === "recheck"), { what: "a recheck" });
-	assert.equal(recheck.state, "pending");
-	await sleep(1_000);
-	assert.equal(stack.runs<RunRow>()[0]?.state, "queued", "no dispatch before the watchdog answers");
-	stack.watchdog.start();
 	await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/, { timeoutMs: 60_000 });
-	const answered = sweeps(stack).find((row) => row.id === recheck.id);
-	assert.deepEqual([answered?.state, answered?.verified], ["done", 1]);
 	assert.ok((stack.runs<RunRow>()[0]?.dispatched_at ?? 0) >= (answered?.finished_at ?? Number.POSITIVE_INFINITY));
-	assert.equal(stack.coordinator.store.groupState(GROUP).recheck, false);
 });
 
 test("the watchdog enforces the run deadline on its own: it kills the run's Pi process and container, verifies, records", {
