@@ -217,8 +217,11 @@ How to check:
 Press **Ctrl-C** (SIGINT; SIGTERM does the same). The Coordinator logs `shutdown reason=SIGINT`, stops polling and
 dispatch, stops running runs and their containers, and closes the relay, the database and its lock. A run stopped
 this way is **not** resumed: on the next start it is marked "interrupted by restart", its work is checkpointed and
-pushed, and the task waits in review until someone replies (a fresh conversation). A second Ctrl-C exits at once; a
-shutdown that takes longer than 30 seconds exits with code 1.
+pushed, and the task waits in review until someone replies (a fresh conversation). A run still starting (its run key
+not opened and its Pi process not launched yet) is queued again instead, in the same place, and the bot says so; a
+first run's worktree is kept only if its setup finished and nothing changed it, otherwise it is recreated from the
+latest main. After 3 such returns the next restart fails the task. A second Ctrl-C exits at once; a shutdown that
+takes longer than 30 seconds exits with code 1.
 
 Check that nothing is left behind:
 

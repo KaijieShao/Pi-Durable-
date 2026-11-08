@@ -254,6 +254,30 @@ export function branchName(ctx: Ctx, taskId: number): string {
 	return `${ctx.config.git.branchPrefix}${taskId}`;
 }
 
+/**
+ * Meta key of a task's setup step (runs.ts writes it, restart recovery reads it): "started" before the setup script
+ * runs, "done" once it passed (or there is none). Absent: not reached, or written before this key existed (unknown).
+ * Deleted when the run starts its Pi process.
+ */
+export function setupStateKey(taskId: number): string {
+	return `setup:${taskId}`;
+}
+
+/** Meta key: how many times a restart before the run started returned it to the queue. Deleted when it starts. */
+export function restartReturnsKey(runId: number): string {
+	return `restart_returns:${runId}`;
+}
+
+export const WORKTREE_CHECK_PREFIX = "restart_worktree:";
+
+/**
+ * Meta key of a first run's worktree reconciliation still to do after a restart ("check": keep a pristine one or
+ * start over; "discard": the task failed). Deleted once done, so another restart finds it again.
+ */
+export function worktreeCheckKey(taskId: number): string {
+	return `${WORKTREE_CHECK_PREFIX}${taskId}`;
+}
+
 export function conversationPath(ctx: Ctx, id: string): string {
 	return join(ctx.config.paths.dataDir, "conversations", `${id}.sqlite`);
 }

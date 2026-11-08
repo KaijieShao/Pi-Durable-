@@ -47,6 +47,17 @@ export type Git = {
 	createWorktree(branch: string, path: string, base: string): Promise<void>;
 	/** Delete the worktree folder and its registration; the branch is kept. */
 	removeWorktree(path: string): Promise<void>;
+	/**
+	 * True if `path` is this repository's worktree, checked out on `branch` at commit `base`, with nothing staged,
+	 * changed or untracked (ignored files allowed). Never throws for a missing or foreign path (false).
+	 */
+	isPristineWorktree(path: string, branch: string, base: string): Promise<boolean>;
+	/**
+	 * Delete a local branch that has no commits of its own: its tip is still `createdAt` (the commit it was created
+	 * at), or is on the fetched base branch. A missing branch is fine. A branch with commits of its own, or one
+	 * checked out in a worktree, is refused (GitError).
+	 */
+	deleteBranch(branch: string, createdAt?: string): Promise<void>;
 	head(path: string): Promise<string>;
 	/** Stage everything (untracked included, .gitignore respected) and commit if anything changed or a merge is open. */
 	checkpoint(path: string, message: string): Promise<{ commit: string; created: boolean }>;
@@ -482,6 +493,31 @@ export function createGit(options: GitOptions): Git {
 		await assertClean(wt);
 	}
 
+	async function pristine(path: string, branch: string, base: string): Promise<boolean> {
+		assertBranch(branch);
+		assertRev(base);
+		const target = resolve(path);
+		if (!existsSync(target)) return false;
+		try {
+			await adoptExisting(target, branch, base);
+			return true;
+		} catch (error) {
+			if (error instanceof GitError) return false;
+			throw error;
+		}
+	}
+
+	async function dropBranch(branch: string, createdAt: string | undefined): Promise<void> {
+		assertBranch(branch);
+		if (createdAt !== undefined) assertRev(createdAt);
+		const tip = await maybeRef(repo, `refs/heads/${branch}`);
+		if (tip === undefined) return;
+		if (tip !== createdAt && !(await ancestor(tip, baseRef)))
+			throw new GitError("failed", "refusing to delete a branch with commits of its own");
+		await exec([...repo, "worktree", "prune"], { op: "worktree-prune" });
+		await exec([...repo, "branch", "-D", branch], { op: "branch-delete" });
+	}
+
 	async function addWorktree(branch: string, path: string, base: string): Promise<void> {
 		assertBranch(branch);
 		assertRev(base);
@@ -640,6 +676,8 @@ export function createGit(options: GitOptions): Git {
 		remoteBranchSha: (branch) => lsRemote(branch),
 		createWorktree: (branch, path, base) => serialized("repo", () => addWorktree(branch, path, base)),
 		removeWorktree: (path) => serialized(wtKey(path), () => serialized("repo", () => discardWorktree(resolve(path)))),
+		isPristineWorktree: (path, branch, base) => serialized(wtKey(path), () => pristine(path, branch, base)),
+		deleteBranch: (branch, createdAt) => serialized("repo", () => dropBranch(branch, createdAt)),
 		head: (path) => serialized(wtKey(path), async () => revParse(await worktreeArgs(path), "HEAD")),
 		checkpoint: (path, message) => serialized(wtKey(path), () => commitAll(path, message)),
 		push: (path, branch) => serialized(wtKey(path), () => pushHead(path, branch)),

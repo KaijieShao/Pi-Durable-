@@ -9,7 +9,16 @@
  * Merging tasks are not cancellable.
  */
 import { taskCancelled } from "../messages.ts";
-import { type Ctx, enqueueTask, loadTask, type TaskRow, TERMINAL_TASK_STATES, taskRef, tx } from "./context.ts";
+import {
+	type Ctx,
+	enqueueTask,
+	loadTask,
+	type TaskRow,
+	TERMINAL_TASK_STATES,
+	taskRef,
+	tx,
+	worktreeCheckKey,
+} from "./context.ts";
 import { archiveTask, effectFailed, terminalText } from "./effects.ts";
 import { archivePending, decide, expireFollowups } from "./finalize.ts";
 
@@ -34,6 +43,9 @@ function cancelOne(ctx: Ctx, task: TaskRow): boolean {
 		return true;
 	}
 	if (ctx.busy.has(task.id)) return false;
+	// A first run's worktree still to be reconciled after a restart (recovery.ts): wait for it, so a worktree that may
+	// be half set up is never checkpointed or pushed (the reconciliation discards it for a task being cancelled).
+	if (ctx.store.getMeta(worktreeCheckKey(task.id)) !== undefined) return false;
 	if (task.state === "queued" && task.worktree_path === null) cancelQueued(ctx, task.id);
 	else ctx.track("cancel", task.id, () => cancelWithArchive(ctx, task.id));
 	return true;

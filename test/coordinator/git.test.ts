@@ -230,6 +230,57 @@ test("removeWorktree deletes the folder and its registration, keeps the branch, 
 	await assert.rejects(s.git.removeWorktree(join(s.root, "elsewhere")), /outside the task directory/);
 });
 
+test("isPristineWorktree: only our clean worktree on the branch at the base (ignored files allowed)", async () => {
+	const s = await setup();
+	const { path, branch, base } = await withWorktree(s);
+	assert.equal(await s.git.isPristineWorktree(path, branch, base), true);
+	mkdirSync(join(path, "ignored"), { recursive: true });
+	writeFileSync(join(path, "ignored", "cache.bin"), "setup output\n");
+	assert.equal(await s.git.isPristineWorktree(path, branch, base), true, "ignored files do not count");
+	assert.equal(await s.git.isPristineWorktree(path, "task/2", base), false, "another branch");
+	writeFileSync(join(path, "partial.txt"), "half done\n");
+	assert.equal(await s.git.isPristineWorktree(path, branch, base), false, "an untracked file");
+	rmSync(join(path, "partial.txt"));
+	writeFileSync(join(path, "a.txt"), "changed\n");
+	assert.equal(await s.git.isPristineWorktree(path, branch, base), false, "a changed file");
+	const { commit } = await s.git.checkpoint(path, "work");
+	assert.equal(await s.git.isPristineWorktree(path, branch, base), false, "not at the base any more");
+	assert.equal(await s.git.isPristineWorktree(path, branch, commit), true);
+	assert.equal(await s.git.isPristineWorktree(join(s.taskDir, "worktrees", "task-9"), branch, base), false, "missing");
+	const foreign = join(s.taskDir, "worktrees", "not-a-worktree");
+	mkdirSync(foreign, { recursive: true });
+	assert.equal(await s.git.isPristineWorktree(foreign, branch, base), false, "not a worktree of the repository");
+});
+
+test("deleteBranch deletes a local branch without commits of its own, is idempotent, refuses one with commits", async () => {
+	const s = await setup();
+	const { path, branch, base } = await withWorktree(s);
+	await assert.rejects(s.git.deleteBranch(branch), GitError, "checked out in a worktree");
+	await s.git.removeWorktree(path);
+	await commitOnOrigin(s.bare, "main", { "b.txt": "b\n" });
+	await s.git.fetchBase();
+	await s.git.deleteBranch(branch);
+	assert.equal(
+		(await originGit(s.repoDir, ["rev-parse", "-q", "--verify", `refs/heads/${branch}`], { okCodes: [0, 1] })).code,
+		1,
+	);
+	await s.git.deleteBranch(branch);
+	await s.git.createWorktree(branch, path, base);
+	writeFileSync(join(path, "c.txt"), "c\n");
+	await s.git.checkpoint(path, "own work");
+	await s.git.removeWorktree(path);
+	await assert.rejects(s.git.deleteBranch(branch), /commits of its own/);
+	const tip = await local(s, ["rev-parse", `refs/heads/${branch}`]);
+	await assert.rejects(s.git.deleteBranch(branch, base), /commits of its own/, "it moved past where it was created");
+	await s.git.deleteBranch(branch, tip);
+	assert.equal(
+		(await originGit(s.repoDir, ["rev-parse", "-q", "--verify", `refs/heads/${branch}`], { okCodes: [0, 1] })).code,
+		1,
+		"still at the commit it was created at",
+	);
+	await assert.rejects(s.git.deleteBranch("-bad"), /invalid branch name/);
+});
+
 test("diffSummary, showFile and changedFiles", async () => {
 	const s = await setup({ "a.txt": "one\n", "AGENTS.md": "# Guidance\nBe careful.\n" });
 	const { path, base } = await withWorktree(s);

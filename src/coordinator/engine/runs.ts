@@ -29,7 +29,9 @@ import {
 	loadRun,
 	loadTask,
 	type RunRow,
+	restartReturnsKey,
 	runNumber,
+	setupStateKey,
 	type TaskRow,
 	taskRef,
 	tx,
@@ -276,9 +278,21 @@ async function taskDiskLow(ctx: Ctx, active: ActiveRun): Promise<boolean> {
 	return true;
 }
 
-/** The project's checked-in setup script, in a check container with the worktree writable for that step only. */
+function setSetupState(ctx: Ctx, taskId: number, state: "started" | "done"): void {
+	ctx.store.setMeta(setupStateKey(taskId), state);
+}
+
+/**
+ * The project's checked-in setup script, in a check container with the worktree writable for that step only. Its
+ * progress is saved ("started", then "done" once it passed) so restart recovery can tell a worktree whose setup
+ * completed from one it may have changed part-way.
+ */
 async function runSetup(ctx: Ctx, active: ActiveRun, task: TaskRow, path: string): Promise<void> {
-	if (!(await isRegularFile(join(path, ctx.config.setupScript)))) return;
+	if (!(await isRegularFile(join(path, ctx.config.setupScript)))) {
+		tx(ctx, () => setSetupState(ctx, task.id, "done"));
+		return;
+	}
+	tx(ctx, () => setSetupState(ctx, task.id, "started"));
 	const result = await ctx.sandbox
 		.runCheck({
 			taskId: task.id,
@@ -289,10 +303,14 @@ async function runSetup(ctx: Ctx, active: ActiveRun, task: TaskRow, path: string
 			timeoutMs: ctx.limits.checkDeadlineMs,
 		})
 		.catch(() => undefined);
+	// A setup that ends after the run was stopped (cancel, freeze, shutdown) is not this run's to report: its state
+	// stays "started" (unknown), so a restart starts the worktree over.
+	checkStop(active);
 	const outcome = result?.outcome ?? "error";
-	tx(ctx, () =>
-		enqueueTask(ctx, loadTask(ctx, task.id), "task_setup", `${taskRef(task.id)}: setup script ${outcome}.`, "progress"),
-	);
+	tx(ctx, () => {
+		if (outcome === "passed") setSetupState(ctx, task.id, "done");
+		enqueueTask(ctx, loadTask(ctx, task.id), "task_setup", `${taskRef(task.id)}: setup script ${outcome}.`, "progress");
+	});
 	ctx.log.info("setup_done", { task: task.id, outcome });
 	if (outcome === "failed") throw new PrepareError("the setup script failed");
 	if (outcome !== "passed") throw new PrepareError(`the setup script ended: ${outcome}`);
@@ -452,6 +470,12 @@ function launch(ctx: Ctx, active: ActiveRun, prepared: Prepared): void {
 			ctx.now(),
 			active.agentBox?.name ?? null,
 			active.runId,
+		);
+		// Restart evidence of the start is no longer needed: from here on a restart interrupts the run.
+		ctx.store.run(
+			"DELETE FROM meta WHERE key IN (?, ?)",
+			setupStateKey(active.taskId),
+			restartReturnsKey(active.runId),
 		);
 		return rows;
 	});

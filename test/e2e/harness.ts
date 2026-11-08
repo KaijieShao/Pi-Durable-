@@ -20,7 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { type Coordinator, startCoordinator } from "../../src/coordinator/coordinator.ts";
+import { createGit, type Git } from "../../src/coordinator/git.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
+import type { Sandbox } from "../../src/coordinator/ports.ts";
 import { createRunLauncher } from "../../src/coordinator/runner-launcher.ts";
 import { createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
 import type { Row } from "../../src/coordinator/store.ts";
@@ -70,6 +72,11 @@ export type StackOptions = {
 	readonly sandbox?: "local" | "docker";
 	/** Passed to startCoordinator as deps.onFatal (the CLI exits non-zero on it). */
 	readonly onFatal?: (reason: string, error: unknown) => void;
+	/**
+	 * Wrappers around the real git module (built as the Coordinator would build it) and the local sandbox, e.g. to
+	 * hold one step of a run's start. The wrapped objects go in as deps.git / deps.sandbox and survive restart().
+	 */
+	readonly wrap?: { readonly git?: (git: Git) => Git; readonly sandbox?: (sandbox: Sandbox) => Sandbox };
 };
 
 export type BotMatch = RegExp | ((message: ServerMessage) => boolean);
@@ -166,18 +173,34 @@ export async function startStack(options: StackOptions = {}) {
 	const config: CoordinatorConfig = stackConfig(dir, urls, { ...containerUser, ...options.env });
 	const log = stackLogger();
 	const limits: Limits = { ...DEMO_LIMITS, ...options.limits };
-	const sandbox =
-		options.sandbox === "docker"
+	const local = (): Sandbox => {
+		const created = createLocalSandbox({
+			taskDir: config.paths.taskDir,
+			checks: { test: nodeTestCheck, ...options.checks },
+		});
+		return options.wrap?.sandbox?.(created) ?? created;
+	};
+	const sandbox = options.sandbox === "docker" ? {} : { sandbox: local() };
+	const wrapGit = options.wrap?.git;
+	const wrappedGit =
+		wrapGit === undefined
 			? {}
 			: {
-					sandbox: createLocalSandbox({
-						taskDir: config.paths.taskDir,
-						checks: { test: nodeTestCheck, ...options.checks },
-					}),
+					git: wrapGit(
+						createGit({
+							taskDir: config.paths.taskDir,
+							remoteUrl: origin.bare,
+							baseBranch: config.github.baseBranch,
+							token: config.github.token,
+							author: { name: config.git.authorName, email: config.git.authorEmail },
+							log,
+						}),
+					),
 				};
 	const deps = {
 		remoteUrl: origin.bare,
 		...sandbox,
+		...wrappedGit,
 		launcher: createRunLauncher({ dataDir: config.paths.dataDir, log, testEnv: { PI_RUNNER_TEST_FAST_RETRY: "1" } }),
 		limits,
 		log,

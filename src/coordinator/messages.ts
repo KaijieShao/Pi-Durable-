@@ -435,6 +435,11 @@ export function followupExpired(taskId: number, cause: string): string {
 	return `Follow-up to ${taskRef(taskId)} expired: ${why}.`;
 }
 
+/** Interfaces and Storage § Recovery: a run that had not started when the Coordinator restarted is queued again. */
+export function requeuedAfterRestart(taskId: number, position: number): string {
+	return `${taskRef(taskId)} is queued again after a restart: its run had not started yet. Queue position ${position}.`;
+}
+
 export function taskCancelled(id: number): string {
 	return `${taskRef(id)} cancelled.`;
 }

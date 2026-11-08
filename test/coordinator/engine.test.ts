@@ -24,6 +24,7 @@ import {
 	type RunLauncher,
 	type RunnerExit,
 	type RunnerHandle,
+	type Sandbox,
 	type SendMessageParams,
 	type TelegramApi,
 	TelegramError,
@@ -157,6 +158,15 @@ function createWorld() {
 			calls.push("removeWorktree");
 			await rm(path, { recursive: true, force: true });
 			worktrees.delete(path);
+		},
+		async isPristineWorktree(path, branch, base) {
+			const entry = worktrees.get(path);
+			if (entry === undefined || entry.branch !== branch || entry.head !== base || entry.mergeParent !== undefined)
+				return false;
+			return sameTree(await readTree(path), files(base));
+		},
+		async deleteBranch() {
+			calls.push("deleteBranch");
 		},
 		async head(path) {
 			return wt(path).head;
@@ -471,6 +481,8 @@ async function harness(
 		world?: World;
 		/** The engine's clock (default: the store's). */
 		now?: () => number;
+		/** Wraps the local sandbox (e.g. to report a leftover container). */
+		sandbox?: (sandbox: Sandbox) => Sandbox;
 	} = {},
 ) {
 	const dir = options.dir ?? (await mkdtemp(join(tmpdir(), "engine-test-")));
@@ -480,10 +492,11 @@ async function harness(
 	await mkdir(config.paths.taskDir, { recursive: true });
 	const store = options.store ?? new Store(join(config.paths.dataDir, "coordinator.sqlite"));
 	const world = options.world ?? createWorld();
-	const sandbox = createLocalSandbox({
+	const local = createLocalSandbox({
 		taskDir: config.paths.taskDir,
 		...(options.checks ? { checks: options.checks } : {}),
 	});
+	const sandbox = options.sandbox?.(local) ?? local;
 	const keyState = (key: string) =>
 		store.get<{ state: string }>("SELECT state FROM run_keys WHERE key_hash = ?", hashRunKey(key))?.state;
 	const fake = createFakeLauncher((run) => {
@@ -1081,6 +1094,204 @@ test("restart recovery: running run failed as interrupted, conversation quaranti
 	assert.equal(row?.parent_id, interrupted.conversation_id);
 	assert.equal(taskRow(h2, taskId).state, "review");
 	assert.equal(taskRow(h2, taskId).reason, null);
+});
+
+test("restart while a first run was starting and leftovers cannot be verified gone: queued again, its slot kept and nothing dispatched until the owner unfreezes; then it runs once", async (t) => {
+	const h1 = await harness(t);
+	const taskId = submitTask(h1, "alpha", "started before the restart");
+	const [queued] = runsOf(h1, taskId);
+	// The state a dispatch leaves before the worktree is created: slot reserved, run starting, task running.
+	h1.store.tx(() => {
+		h1.store.run(
+			"INSERT INTO slots(kind, task_id, run_id, agent_id, acquired_at) VALUES ('run', ?, ?, 'alpha', ?)",
+			taskId,
+			queued?.id as number,
+			Date.now(),
+		);
+		h1.store.run("UPDATE tasks SET generation = 1, state = 'running' WHERE id = ?", taskId);
+		h1.store.run("UPDATE runs SET state = 'starting', generation = 1 WHERE id = ?", queued?.id as number);
+	});
+	await h1.engine.stop();
+
+	const leftover = { on: true };
+	const h2 = await harness(t, {
+		store: h1.store,
+		dir: h1.dir,
+		world: h1.world,
+		sandbox: (local) => ({
+			...local,
+			live: async (filter) => (leftover.on ? ["pi-durable-check-99-1"] : local.live(filter)),
+		}),
+	});
+	h2.fake.control.script = workScript();
+	await h2.engine.recover();
+	assert.equal(h2.store.groupState(CHAT).state, "frozen");
+	const [run] = runsOf(h2, taskId);
+	assert.deepEqual([run?.id, run?.state, taskRow(h2, taskId).state], [queued?.id, "queued", "queued"]);
+	assert.equal(slotCount(h2), 1, "the slot is held until the leftovers are verified gone");
+	assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), "check");
+	assert.ok(messages(h2, "task_requeued").some((m) => /queued again after a restart/.test(m.text)));
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(h2.fake.runs.length, 0, "nothing dispatches while frozen");
+	assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), "check", "the worktree job waits for the unfreeze");
+
+	leftover.on = false;
+	h2.store.tx(() =>
+		h2.store.run("UPDATE groups SET state = 'normal', reason = NULL, recheck_required = 1 WHERE chat_id = ?", CHAT),
+	);
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(h2.fake.runs.length, 1, "it runs once");
+	assert.equal(h2.fake.runs[0]?.start.runId, queued?.id);
+	assert.equal(taskRow(h2, taskId).state, "review");
+	assert.equal(runsOf(h2, taskId).length, 1);
+	assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), undefined);
+	assert.equal(h2.store.getMeta(`restart_returns:${queued?.id}`), undefined, "dropped once the run started");
+	assert.equal(slotCount(h2), 0);
+});
+
+/** The state a dispatch leaves for a run that has not opened its run key yet: slot reserved, run starting. */
+function markStarting(h: Harness, taskId: number, runId: number, agent: string): void {
+	h.store.tx(() => {
+		h.store.run(
+			"INSERT INTO slots(kind, task_id, run_id, agent_id, acquired_at) VALUES ('run', ?, ?, ?, ?)",
+			taskId,
+			runId,
+			agent,
+			Date.now(),
+		);
+		h.store.run("UPDATE tasks SET generation = generation + 1, state = 'running' WHERE id = ?", taskId);
+		h.store.run(
+			"UPDATE runs SET state = 'starting', generation = (SELECT generation FROM tasks WHERE id = ?) WHERE id = ?",
+			taskId,
+			runId,
+		);
+	});
+}
+
+/** A first run that created its worktree and finished setup, then stopped before its run key. */
+async function startedFirstRun(h: Harness, agent: string, text: string): Promise<{ taskId: number; runId: number }> {
+	const taskId = submitTask(h, agent, text);
+	const runId = runsOf(h, taskId)[0]?.id as number;
+	const path = join(h.config.paths.taskDir, "worktrees", `task-${taskId}`);
+	await h.world.git.createWorktree(`task/${taskId}`, path, h.world.state.main);
+	h.store.tx(() => {
+		h.store.run(
+			"UPDATE tasks SET branch = ?, worktree_path = ?, base_commit = ?, head_commit = ? WHERE id = ?",
+			`task/${taskId}`,
+			path,
+			h.world.state.main,
+			h.world.state.main,
+			taskId,
+		);
+		h.store.setMeta(`setup:${taskId}`, "done");
+	});
+	markStarting(h, taskId, runId, agent);
+	return { taskId, runId };
+}
+
+test("a restart while a follow-up run starts after 3 returns fails the task and archives it like any failed task (work pushed, pull request closed, branch kept)", async (t) => {
+	const h1 = await harness(t);
+	const taskId = await runToReview(h1);
+	const head = taskRow(h1, taskId).head_commit;
+	const runId = followupRun(h1, taskId, "one more thing");
+	markStarting(h1, taskId, runId, "alpha");
+	h1.store.tx(() => h1.store.setMeta(`restart_returns:${runId}`, "3"));
+	await h1.engine.stop();
+
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world });
+	await h2.engine.recover();
+	const reason = "the Coordinator restarted 4 times before its run could start, so it is not queued again";
+	assert.deepEqual(
+		[runsOf(h2, taskId)[1]?.state, runsOf(h2, taskId)[1]?.reason, taskRow(h2, taskId).state],
+		["failed", reason, "failed"],
+	);
+	assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), undefined, "a follow-up's worktree is not discarded");
+	h2.engine.kick();
+	await h2.engine.idle();
+	const task = taskRow(h2, taskId);
+	assert.deepEqual([task.worktree_path, task.archived, task.branch], [null, 1, `task/${taskId}`]);
+	assert.equal(h2.world.remote.get(`task/${taskId}`), head, "the branch is kept on GitHub");
+	assert.equal(h2.world.pulls.get(task.pr_number as number)?.state, "closed");
+	assert.equal(count(h2.world.calls, "deleteBranch"), 0);
+	assert.equal(h2.fake.runs.length, 0, "never resubmitted");
+	const final = `Task ${taskId} failed: ${reason}. Pull request closed; branch task/${taskId} kept.`;
+	assert.deepEqual(
+		messages(h2, "task_final").map((m) => m.text),
+		[`${final} Send a new /task for further work.`],
+	);
+	assert.equal(messages(h2, "task_requeued").length, 0);
+	assert.equal(slotCount(h2), 0);
+});
+
+test("a cancel requested before a returned first run's worktree is reconciled: the worktree is discarded, not kept, and nothing is pushed; the other returned run keeps its pristine worktree", async (t) => {
+	const h1 = await harness(t);
+	// Staged with the engine stopped, so nothing dispatches the runs meanwhile.
+	await h1.engine.stop();
+	const kept = await startedFirstRun(h1, "alpha", "keep my worktree");
+	const cancelled = await startedFirstRun(h1, "beta", "cancel me after the restart");
+
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world });
+	// Settled first (its sandbox check), so no tick runs the reconciliation before the cancel below is saved.
+	await h2.engine.idle();
+	await h2.engine.recover();
+	for (const { taskId } of [kept, cancelled]) {
+		assert.equal(taskRow(h2, taskId).state, "queued");
+		assert.equal(h2.store.getMeta(`restart_worktree:${taskId}`), "check");
+	}
+	// Accepted while the reconciliation is pending (commands.ts sets the flag: the task still records a worktree).
+	requestCancel(h2, cancelled.taskId);
+	h2.engine.kick();
+	await h2.engine.idle();
+
+	const gone = taskRow(h2, cancelled.taskId);
+	assert.deepEqual([gone.state, gone.worktree_path, gone.branch], ["cancelled", null, null]);
+	assert.equal(existsSync(join(h2.config.paths.taskDir, "worktrees", `task-${cancelled.taskId}`)), false);
+	assert.equal(h2.world.remote.get(`task/${cancelled.taskId}`), undefined, "nothing pushed for the cancelled task");
+	assert.deepEqual(
+		messages(h2, "task_final").map((m) => m.text),
+		[`Task ${cancelled.taskId} cancelled.`],
+	);
+	assert.equal(runsOf(h2, cancelled.taskId)[0]?.state, "cancelled");
+	// The other one kept its worktree at the recorded base and ran once.
+	assert.equal(taskRow(h2, kept.taskId).state, "review");
+	assert.equal(taskRow(h2, kept.taskId).base_commit, h2.world.root);
+	assert.deepEqual(
+		h2.fake.runs.map((run) => run.start.runId),
+		[kept.runId],
+	);
+	assert.equal(count(h2.world.calls, "deleteBranch"), 1);
+	assert.equal(slotCount(h2), 0);
+});
+
+test("the worktree reconciliation of an ended task removes leftovers no one records, and leaves a recorded branch to its archive", async (t) => {
+	const h1 = await harness(t);
+	// Staged with the engine stopped, so nothing dispatches the runs meanwhile.
+	await h1.engine.stop();
+	// Task A: recovery had forgotten its worktree (or never recorded it) when it was cancelled; the folder is left.
+	const a = submitTask(h1, "alpha", "forgotten worktree");
+	const leftover = join(h1.config.paths.taskDir, "worktrees", `task-${a}`);
+	await h1.world.git.createWorktree(`task/${a}`, leftover, h1.world.root);
+	// Task B: cancelled and archived, its branch kept.
+	const b = submitTask(h1, "beta", "archived");
+	h1.store.tx(() => {
+		h1.store.run("UPDATE runs SET state = 'cancelled' WHERE task_id IN (?, ?)", a, b);
+		h1.store.run("UPDATE tasks SET state = 'cancelled', reason = 'cancelled' WHERE id IN (?, ?)", a, b);
+		h1.store.run("UPDATE tasks SET branch = ?, archived = 1 WHERE id = ?", `task/${b}`, b);
+		h1.store.setMeta(`restart_worktree:${a}`, "check");
+		h1.store.setMeta(`restart_worktree:${b}`, "check");
+	});
+	const h = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world });
+	await h.engine.recover();
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(existsSync(leftover), false, "the leftover folder is removed");
+	assert.equal(count(h.world.calls, "deleteBranch"), 1, "only the unrecorded branch is deleted");
+	assert.equal(h.store.getMeta(`restart_worktree:${a}`), undefined);
+	assert.equal(h.store.getMeta(`restart_worktree:${b}`), undefined);
+	assert.equal(taskRow(h, b).branch, `task/${b}`);
+	assert.equal(h.store.groupState(CHAT).state, "normal");
 });
 
 test("restart mid-merge: main already contains the head → merged, no second merge", async (t) => {

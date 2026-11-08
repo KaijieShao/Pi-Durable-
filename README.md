@@ -50,8 +50,9 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
   opens or updates the task's pull request. Merges run one at a time; GitHub's "up to date" rule refuses a merge after
   `main` moved, and a moved `main` is combined, retested and approved again; a conflict starts a new admitted run.
 - **Recovery:** after a restart nothing in progress resumes. An interrupted run is marked failed, its work is pushed,
-  its conversation is quarantined, and a later follow-up starts a fresh conversation. Whenever the Coordinator cannot
-  confirm a stop or a GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
+  its conversation is quarantined, and a later follow-up starts a fresh conversation. A run that had not reached Pi
+  yet (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop
+  or a GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
 
 ## Command line
 
