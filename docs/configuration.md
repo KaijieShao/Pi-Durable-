@@ -50,7 +50,7 @@ Pi processes and containers never receive them.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`), one Pi SQLite file per conversation, lock; mode 700 |
+| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`, mode 600), one Pi SQLite file per conversation, lock; mode 700 (0710 with systemd isolation: the Pi group may only traverse it) |
 | `PI_TASK_DIR` | no | `<PI_DATA_DIR>/tasks` | The task disk: git repository, one worktree per open task, check scratch space |
 | `PI_REQUIRE_TASK_MOUNT` | no | off | `1`: refuse to start unless `PI_TASK_DIR` is a mount point (a separate task disk on a server) |
 
@@ -66,6 +66,18 @@ Relative paths are resolved from the current directory.
 | `PI_SETUP_SCRIPT` | no | `.pi/setup.sh` | Repository path of the setup script, run once per task in a check container with the worktree writable; skipped when absent |
 | `DOCKER_BIN` | no | `docker` | The Docker CLI |
 | `RELAY_PORT` | no | `0` (any free port) | Port of the relay on 127.0.0.1 |
+
+## Pi processes
+
+How each run's Pi process is isolated; see [isolation.md](isolation.md) for both modes and the one-time host setup.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | `systemd`: one transient unit per run as the Pi user in the Pi slice, sandboxed, loopback-only network; without the host setup no task runs (fails closed). `process`: a child process as the Coordinator's own user, the weaker local mode |
+| `PI_RUNNER_USER` | no | `pi-runner` | The Pi user (systemd only); never `root` or the Coordinator's own user |
+| `PI_RUNNER_GROUP` | no | `pi-durable` | Group shared by the Pi user and the Coordinator user for `<PI_DATA_DIR>/conversations` |
+| `PI_RUNNER_SLICE` | no | `pi-durable-runs.slice` | The slice of the Pi units ([deploy/systemd](../deploy/systemd/pi-durable-runs.slice)); must be installed |
+| `SYSTEMD_RUN_BIN`, `SYSTEMCTL_BIN` | no | `systemd-run`, `systemctl` | The systemd CLIs: absolute paths or names on `PATH` |
 
 ## Logs
 

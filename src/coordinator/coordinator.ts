@@ -4,21 +4,24 @@
  * review, merge, cancel) ↔ relay (127.0.0.1) and the outbox sender. Startup order:
  *
  *   private dirs → data-dir lock → Store → getMe (username must match; log can_read_all_group_messages) →
- *   sandbox.available() (fail closed: no execution starts, logged and posted once) → git.ensureRepo + fetchBase →
- *   recovery (steps 1–3) → relay (step 4) → outbox → poller → engine ticks (step 5: dispatch).
+ *   sandbox.available() + launcher.available() (fail closed: no execution starts, logged and posted once) →
+ *   git.ensureRepo + fetchBase → recovery (steps 1–3) → relay (step 4) → outbox → poller → engine ticks (step 5).
  *
  * Secrets stay in `config` (memory only) and go only to the relay (model key), git/GitHub (GitHub token) and the
- * Telegram client (bot token). Production defaults: Docker sandbox, real git and GitHub, real Telegram,
- * DEMO_LIMITS; the local test sandbox is only ever passed in by tests.
+ * Telegram client (bot token); each Pi process gets only its run key. Production defaults: Docker sandbox, Pi
+ * processes as transient systemd units in the Pi slice as the Pi user on Linux (PI_RUNNER_ISOLATION=systemd; the
+ * weaker local "process" mode elsewhere), real git and GitHub, real Telegram, DEMO_LIMITS; the local test sandbox is
+ * only ever passed in by tests.
  */
-import { mkdir, stat } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { acquireDataDirLock, type DataDirLock } from "../runtime/lock.ts";
 import { createLogger, errorSummary, type Logger } from "../runtime/log.ts";
-import { ensurePrivateDir } from "../runtime/private-dir.ts";
+import { ensurePrivateDir, makePrivate } from "../runtime/private-dir.ts";
 import { handleUpdate } from "./commands.ts";
 import { ConfigError, type CoordinatorConfig, describeConfig } from "./config.ts";
-import { createEngine, type Engine } from "./engine.ts";
+import { createEngine, type Enforcement, type Engine, enforcementAvailable } from "./engine.ts";
 import { createGit, type Git } from "./git.ts";
 import { createGitHub } from "./github.ts";
 import { DEMO_LIMITS, type Limits } from "./limits.ts";
@@ -26,6 +29,7 @@ import { type OutboxSender, startOutbox } from "./outbox.ts";
 import type { GitHubApi, RunLauncher, Sandbox, TelegramApi } from "./ports.ts";
 import { startRelay } from "./relay.ts";
 import { createRunLauncher } from "./runner-launcher.ts";
+import { createSystemdRunLauncher } from "./runner-systemd.ts";
 import { createDockerSandbox } from "./sandbox/docker.ts";
 import { Store } from "./store.ts";
 import { createTelegramApi } from "./telegram/api.ts";
@@ -101,15 +105,51 @@ function fetchOption(deps: CoordinatorDeps): { fetch?: typeof fetch } {
 	return deps.fetch === undefined ? {} : { fetch: deps.fetch };
 }
 
-/** Private data dirs and the task dir; with PI_REQUIRE_TASK_MOUNT nothing is written unless the task disk is mounted. */
-async function prepareDirs(config: CoordinatorConfig): Promise<void> {
+/**
+ * The data dirs and the task dir; with PI_REQUIRE_TASK_MOUNT nothing is written unless the task disk is mounted.
+ * "process" isolation: everything private to the Coordinator's user (mode 700). "systemd" isolation: the Pi user
+ * reaches the data dir through the shared group (mode 0710: traverse only), and `conversations/` (2770, shared group)
+ * and `run-home/` (the Pi user's) come from the one-time host setup; the launcher's availability check verifies
+ * them (docs/isolation.md).
+ */
+async function prepareDirs(config: CoordinatorConfig, isolation: RunLauncher["isolation"]): Promise<void> {
 	const { dataDir, taskDir } = config.paths;
 	if (config.paths.requireTaskMount) await requireMountPoint(taskDir);
-	await ensurePrivateDir(dataDir);
-	await ensurePrivateDir(join(dataDir, "conversations"));
-	await ensurePrivateDir(join(dataDir, "run-home"));
+	if (isolation === "systemd") {
+		await mkdir(dataDir, { recursive: true, mode: 0o710 });
+		await chmod(dataDir, 0o710);
+	} else {
+		await ensurePrivateDir(dataDir);
+		await ensurePrivateDir(join(dataDir, "conversations"));
+		await ensurePrivateDir(join(dataDir, "run-home"));
+	}
 	await mkdir(taskDir, { recursive: true, mode: 0o750 });
 }
+
+/** The Pi process launcher of the configured isolation (deps.launcher in tests). */
+function createLauncher(config: CoordinatorConfig, log: Logger): RunLauncher {
+	const { runner } = config;
+	if (runner.isolation === "process") {
+		if (process.platform === "linux") log.warn("runner_isolation_weak", { isolation: "process" });
+		return createRunLauncher({ dataDir: config.paths.dataDir, log });
+	}
+	return createSystemdRunLauncher({
+		dataDir: config.paths.dataDir,
+		log,
+		user: runner.user,
+		group: runner.group,
+		slice: runner.slice,
+		systemdRun: runner.systemdRunBin,
+		systemctl: runner.systemctlBin,
+	});
+}
+
+const ENFORCEMENT_NOTICE: Readonly<Record<Exclude<Enforcement, { ok: true }>["kind"], string>> = {
+	containers:
+		"Task execution is paused: container enforcement is unavailable, so no run starts. Commands are still saved and queued.",
+	isolation:
+		"Task execution is paused: Pi process isolation is unavailable, so no run starts. Commands are still saved and queued.",
+};
 
 /** getMe: the token must belong to the configured bot; log whether privacy mode hides plain group messages. */
 async function checkBot({ config, deps, log }: Setup): Promise<TelegramApi> {
@@ -126,8 +166,16 @@ async function checkBot({ config, deps, log }: Setup): Promise<TelegramApi> {
 	return telegram;
 }
 
-/** Fails closed: without enforcement the engine dispatches nothing; the group is told once per outage. */
-async function checkSandbox({ config, deps, log, limits }: Setup, store: Store, now: () => number): Promise<Sandbox> {
+/**
+ * Fails closed: without enforcement (containers, Pi process isolation) the engine dispatches nothing; the group is
+ * told once per outage.
+ */
+async function checkSandbox(
+	{ config, deps, log, limits }: Setup,
+	store: Store,
+	now: () => number,
+	launcher: RunLauncher,
+): Promise<Sandbox> {
 	const sandbox =
 		deps.sandbox ??
 		createDockerSandbox({
@@ -140,14 +188,11 @@ async function checkSandbox({ config, deps, log, limits }: Setup, store: Store, 
 			log,
 			setupScript: config.setupScript,
 		});
-	const available = await sandbox
-		.available()
-		.catch((): { ok: false; reason: string } => ({ ok: false, reason: "sandbox check failed" }));
+	const available = await enforcementAvailable(sandbox, launcher, log);
 	if (available.ok) {
 		store.tx(() => store.run("DELETE FROM meta WHERE key = ?", ENFORCEMENT_NOTICE_KEY));
 		return sandbox;
 	}
-	log.error("sandbox_unavailable", { reason: available.reason });
 	store.tx(() => {
 		if (store.getMeta(ENFORCEMENT_NOTICE_KEY) !== undefined) return;
 		store.setMeta(ENFORCEMENT_NOTICE_KEY, String(now()));
@@ -155,7 +200,7 @@ async function checkSandbox({ config, deps, log, limits }: Setup, store: Store, 
 			chatId: config.telegram.groupChatId,
 			priority: "required",
 			kind: "enforcement_unavailable",
-			text: "Task execution is paused: container enforcement is unavailable, so no run starts. Commands are still saved and queued.",
+			text: ENFORCEMENT_NOTICE[available.kind],
 		});
 	});
 	return sandbox;
@@ -247,10 +292,10 @@ async function idleAll(store: Store, engine: Engine, outbox: OutboxSender, polle
 }
 
 /** Everything after the lock and the store, in the startup order of the design. */
-async function boot(setup: Setup, parts: Parts, store: Store, now: () => number) {
+async function boot(setup: Setup, parts: Parts, store: Store, now: () => number, launcher: RunLauncher) {
 	const { config, deps, log, limits } = setup;
 	const telegram = await checkBot(setup);
-	const sandbox = await checkSandbox(setup, store, now);
+	const sandbox = await checkSandbox(setup, store, now, launcher);
 	const git = await prepareGit(setup);
 	const github =
 		deps.github ??
@@ -261,7 +306,6 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number)
 			log,
 			...fetchOption(deps),
 		});
-	const launcher = deps.launcher ?? createRunLauncher({ dataDir: config.paths.dataDir, log });
 	let outboxKick: () => void = () => {};
 	const engine = createEngine({
 		store,
@@ -298,14 +342,20 @@ export async function startCoordinator(config: CoordinatorConfig, deps: Coordina
 	const log = deps.log ?? createLogger({ level: config.logLevel });
 	const setup: Setup = { config, deps, log, limits: deps.limits ?? DEMO_LIMITS };
 	const now = deps.now ?? Date.now;
-	await prepareDirs(config);
+	const launcher = deps.launcher ?? createLauncher(config, log);
+	await prepareDirs(config, launcher.isolation);
 	const lock: DataDirLock = acquireDataDirLock(config.paths.dataDir);
 	const parts: Parts = {};
 	try {
-		const store = new Store(join(config.paths.dataDir, "coordinator.sqlite"), now);
+		const database = join(config.paths.dataDir, "coordinator.sqlite");
+		// Owner only, whatever the data dir's mode (the Pi group may traverse it under systemd isolation): created 0600
+		// before SQLite opens it (its -wal and -shm files take the database's mode), and tightened if it existed.
+		closeSync(openSync(database, "a", 0o600));
+		const store = new Store(database, now);
 		parts.store = store;
-		log.info("coordinator_starting", describeConfig(config));
-		const { engine, relay, outbox, poller } = await boot(setup, parts, store, now);
+		await makePrivate([database, `${database}-wal`, `${database}-shm`]);
+		log.info("coordinator_starting", { ...describeConfig(config), isolation: launcher.isolation });
+		const { engine, relay, outbox, poller } = await boot(setup, parts, store, now, launcher);
 		let stopping: Promise<void> | undefined;
 		return {
 			store,

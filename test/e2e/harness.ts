@@ -8,7 +8,9 @@
  * - the REAL Coordinator (`startCoordinator`): real commands, engine, relay, outbox, poller, git, GitHub client and
  *   the real Pi runner process per run. The sandbox is the test-only local sandbox by default (fsop.mjs on the host,
  *   and a "test" check that really runs `node --test` in the worktree); `sandbox: "docker"` uses the production
- *   Docker sandbox instead (opt-in, see dockerUnavailable()).
+ *   Docker sandbox instead (opt-in, see dockerUnavailable()). Pi processes are forked children ("process" isolation)
+ *   by default; `runner: "systemd"` uses the production systemd launcher with test stand-ins for systemd-run and
+ *   systemctl (test/helpers/systemd-shims.ts), `runner: "config"` injects no launcher at all (production wiring).
  *
  * Limits are DEMO_LIMITS unless a test overrides some (and says why). Debugging: E2E_LOG=1.
  */
@@ -22,8 +24,9 @@ import { type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordi
 import { type Coordinator, startCoordinator } from "../../src/coordinator/coordinator.ts";
 import { createGit, type Git } from "../../src/coordinator/git.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
-import type { Sandbox } from "../../src/coordinator/ports.ts";
+import type { RunLauncher, Sandbox } from "../../src/coordinator/ports.ts";
 import { createRunLauncher } from "../../src/coordinator/runner-launcher.ts";
+import { createSystemdRunLauncher } from "../../src/coordinator/runner-systemd.ts";
 import { createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
 import type { Row } from "../../src/coordinator/store.ts";
 import { createLogger, type Logger, silentLogger } from "../../src/runtime/log.ts";
@@ -31,6 +34,7 @@ import { FakeBotApi, type ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { sleep } from "../helpers/env.ts";
 import { createOriginRepo, FakeGitHub, originGit } from "../helpers/fake-github.ts";
 import { type FakeHandler, FakeModel, type FakeStep } from "../helpers/fake-model.ts";
+import { createSystemdShims, prepareSystemdLayout, type SystemdShims, testAccounts } from "../helpers/systemd-shims.ts";
 
 export const GROUP = -1001234567890;
 export const OWNER = 1001;
@@ -70,6 +74,13 @@ export type StackOptions = {
 	 * production Docker sandbox from the config (pi-durable-agent:demo / pi-durable-check:demo, this user's uid:gid).
 	 */
 	readonly sandbox?: "local" | "docker";
+	/**
+	 * Pi process launcher. "process" (default): forked children, PI_RUNNER_ISOLATION=process. "systemd": the production
+	 * systemd launcher (PI_RUNNER_ISOLATION=systemd) against systemd-run/systemctl stand-ins, with the host setup's data
+	 * directory layout. "config": no launcher injected, the Coordinator builds its own from the config (set the
+	 * PI_RUNNER_* variables in `env`).
+	 */
+	readonly runner?: "process" | "systemd" | "config";
 	/** Passed to startCoordinator as deps.onFatal (the CLI exits non-zero on it). */
 	readonly onFatal?: (reason: string, error: unknown) => void;
 	/**
@@ -151,6 +162,8 @@ function stackConfig(dir: string, urls: { bot: string; github: string; model: st
 			GITHUB_API_URL: urls.github,
 			PI_DATA_DIR: join(dir, "data"),
 			PI_TASK_DIR: join(dir, "tasks"),
+			// The same Pi process mode on every platform (the default is systemd on Linux); runner: "systemd" overrides it.
+			PI_RUNNER_ISOLATION: "process",
 			...env,
 		},
 		{ cwd: dir, home: dir, uid: 1000, gid: 1000 },
@@ -158,6 +171,36 @@ function stackConfig(dir: string, urls: { bot: string; github: string; model: st
 }
 
 export type Stack = Awaited<ReturnType<typeof startStack>>;
+
+/** deps.launcher for the chosen runner mode (none for "config": the Coordinator builds it from the config). */
+function stackLauncher(
+	runner: StackOptions["runner"],
+	config: CoordinatorConfig,
+	log: Logger,
+): { launcher?: RunLauncher } {
+	const testEnv = { PI_RUNNER_TEST_FAST_RETRY: "1" };
+	if (runner === "config") return {};
+	if (runner !== "systemd") return { launcher: createRunLauncher({ dataDir: config.paths.dataDir, log, testEnv }) };
+	return {
+		launcher: createSystemdRunLauncher({
+			dataDir: config.paths.dataDir,
+			log,
+			user: config.runner.user,
+			group: config.runner.group,
+			slice: config.runner.slice,
+			systemdRun: config.runner.systemdRunBin,
+			systemctl: config.runner.systemctlBin,
+			// TEST ONLY: the stand-ins play systemd on this host and hide no home directory; the Pi user and group are
+			// resolved as if the host setup had created them.
+			platform: "linux",
+			protectedHomes: [],
+			accounts: testAccounts(config.paths.dataDir, { user: config.runner.user, group: config.runner.group }),
+			testEnv,
+		}),
+	};
+}
+
+export type { SystemdShims };
 
 export async function startStack(options: StackOptions = {}) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-e2e-"));
@@ -170,7 +213,13 @@ export async function startStack(options: StackOptions = {}) {
 	if (options.model !== undefined) model.script(options.model);
 	const urls = { bot: await bot.start(), github: await github.start(), model: await model.start() };
 	const containerUser: Record<string, string> = options.sandbox === "docker" ? { CONTAINER_USER: hostUser() } : {};
-	const config: CoordinatorConfig = stackConfig(dir, urls, { ...containerUser, ...options.env });
+	const shims = options.runner === "systemd" ? await createSystemdShims(join(dir, "systemd")) : undefined;
+	const systemdEnv: Record<string, string> =
+		shims === undefined
+			? {}
+			: { PI_RUNNER_ISOLATION: "systemd", SYSTEMD_RUN_BIN: shims.systemdRun, SYSTEMCTL_BIN: shims.systemctl };
+	const config: CoordinatorConfig = stackConfig(dir, urls, { ...containerUser, ...systemdEnv, ...options.env });
+	if (shims !== undefined) await prepareSystemdLayout(config.paths.dataDir);
 	const log = stackLogger();
 	const limits: Limits = { ...DEMO_LIMITS, ...options.limits };
 	const local = (): Sandbox => {
@@ -201,7 +250,7 @@ export async function startStack(options: StackOptions = {}) {
 		remoteUrl: origin.bare,
 		...sandbox,
 		...wrappedGit,
-		launcher: createRunLauncher({ dataDir: config.paths.dataDir, log, testEnv: { PI_RUNNER_TEST_FAST_RETRY: "1" } }),
+		...stackLauncher(options.runner, config, log),
 		limits,
 		log,
 		// Test-only: a 1 s long poll (30 s in production) so stop() and restart() are quick.
@@ -254,6 +303,8 @@ export async function startStack(options: StackOptions = {}) {
 		model,
 		config,
 		origin,
+		/** The systemd-run / systemctl stand-ins (runner: "systemd" only). */
+		shims,
 		get coordinator(): Coordinator {
 			return current();
 		},

@@ -3,7 +3,8 @@
  * Coordinator restart"), before polling or dispatch, and again after the owner unfreezes a group (recheck):
  *
  *   1. Revoke all generations and close all run keys.
- *   2. Kill leftover Pi processes and every managed container; verify they are gone, else freeze.
+ *   2. Kill leftover Pi processes (those of the runs in progress, then every other one of this deployment) and every
+ *      managed container; verify they are gone, else freeze.
  *   3. Reconcile: runs in progress → failed "interrupted by restart" (never resubmitted), their conversations
  *      quarantined, their pending follow-ups expired "(interrupted)"; uncertain budget reservations kept as
  *      unknown; saved merge intents checked against GitHub (main already contains the head → merged, no second
@@ -20,6 +21,7 @@
  */
 import { agentQueuePosition } from "../admission.ts";
 import { requeuedAfterRestart, sha7 } from "../messages.ts";
+import type { RunnerRef } from "../ports.ts";
 import {
 	branchName,
 	type Ctx,
@@ -58,33 +60,65 @@ export type RecoveryJob =
 
 type IntentRow = { id: number; task_id: number; approval_id: number; head_commit: string };
 
-function killPid(pid: number): void {
-	for (const target of [-pid, pid]) {
-		try {
-			process.kill(target, "SIGKILL");
-		} catch {
-			// Not ours or already gone.
-		}
-	}
-}
+/** How long restart cleanup waits for killed Pi processes (or units) to be reported gone before it freezes. */
+const RUNNER_GONE_WAIT_MS = 5_000;
 
-function isRunner(ctx: Ctx, pid: number, onError: boolean): boolean {
+function isRunner(ctx: Ctx, ref: RunnerRef, onError: boolean): boolean {
 	try {
-		return ctx.launcher.isRunner(pid);
+		return ctx.launcher.isRunner(ref);
 	} catch {
 		return onError;
 	}
 }
 
-/** Kill the Pi processes recorded for runs in progress; true when none is left. */
+function killRunner(ctx: Ctx, ref: RunnerRef): void {
+	try {
+		ctx.launcher.killRunner(ref);
+	} catch (error) {
+		ctx.log.warn("recovery_runner_kill_failed", { run: ref.runId, error: describeError(error) });
+	}
+}
+
+/** Every Pi process of this deployment the launcher can find, whatever its run; undefined if it cannot tell. */
+function leftovers(ctx: Ctx): readonly RunnerRef[] | undefined {
+	try {
+		return ctx.launcher.leftovers();
+	} catch (error) {
+		ctx.log.warn("recovery_runner_list_failed", { error: describeError(error) });
+		return undefined;
+	}
+}
+
+/** Kill those of `refs` that may be alive, then wait (bounded) until each is reported gone. */
+async function killAndVerify(ctx: Ctx, refs: readonly RunnerRef[]): Promise<{ killed: number; left: number }> {
+	const alive = refs.filter((ref) => isRunner(ctx, ref, false));
+	for (const ref of alive) killRunner(ctx, ref);
+	const deadline = Date.now() + RUNNER_GONE_WAIT_MS;
+	let left = alive;
+	while (left.length > 0) {
+		await sleep(100);
+		left = left.filter((ref) => isRunner(ctx, ref, true));
+		if (Date.now() >= deadline) break;
+	}
+	return { killed: alive.length, left: left.length };
+}
+
+/**
+ * Kill the Pi processes of runs in progress, found by the launcher from the run's row (its pid and markers, or its
+ * systemd unit), then every other Pi process of this deployment (Deployment § Processes: everything in the slice),
+ * e.g. one whose stop was never confirmed before the group froze; true when none is left. Only while no run is live.
+ */
 async function killRunners(ctx: Ctx): Promise<{ killed: number; ok: boolean }> {
-	const leftovers = ctx.store.all<{ pid: number }>(
-		"SELECT pid FROM runs WHERE pid IS NOT NULL AND state IN ('starting', 'running', 'finalizing')",
+	const rows = ctx.store.all<{ id: number; generation: number; pid: number | null }>(
+		"SELECT id, generation, pid FROM runs WHERE generation IS NOT NULL AND state IN ('starting', 'running', 'finalizing')",
 	);
-	const alive = leftovers.filter((row) => isRunner(ctx, row.pid, false));
-	for (const row of alive) killPid(row.pid);
-	if (alive.length > 0) await sleep(200);
-	return { killed: alive.length, ok: !alive.some((row) => isRunner(ctx, row.pid, true)) };
+	const recorded = await killAndVerify(
+		ctx,
+		rows.map((row) => ({ runId: row.id, generation: row.generation, pid: row.pid })),
+	);
+	const others = leftovers(ctx);
+	const swept = others === undefined ? { killed: 0, left: 1 } : await killAndVerify(ctx, others);
+	return { killed: recorded.killed + swept.killed, ok: recorded.left === 0 && swept.left === 0 };
 }
 
 /** Kill every managed container and verify none is left. Returns the problem, if any. */
@@ -281,8 +315,10 @@ export async function reconcile(ctx: Ctx): Promise<RecoveryJob[]> {
 	// 1. Revoke every generation.
 	const closed = tx(ctx, () => closeAllRunKeys(ctx.store, ctx.now()));
 	// 2. Kill leftovers and verify they are gone.
-	// STUB(spec: deployment.md § Processes "On any Coordinator restart, the watchdog..."): no separate watchdog unit or
-	// Pi systemd slice; the Coordinator itself kills the runner pids it recorded and every labelled container.
+	// STUB(spec: deployment.md § Processes "On any Coordinator restart, the watchdog..."): no separate watchdog unit;
+	// the Coordinator itself kills the Pi processes of the runs in progress (their systemd unit, or their recorded pid
+	// carrying this deployment's and run's markers), then every other Pi process of this deployment (its units in the
+	// slice, or its marked processes), and every labelled container, and verifies they are gone.
 	const runners = await killRunners(ctx);
 	const containers = await killContainers(ctx);
 	const stopProblem = runners.ok ? containers : "leftover Pi processes could not be verified stopped";

@@ -1,7 +1,9 @@
 /**
- * IPC between the Coordinator and one Pi process (one process per run; Architecture § Pi Durable 1.5.0).
- * Messages travel over Node's `process.send` channel as plain JSON. The run key is NOT in any message: the child
- * reads it from its environment (OPENAI_API_KEY) and uses it only for requests to the relay.
+ * Messages between the Coordinator and one Pi process (one process per run; Architecture § Pi Durable 1.5.0), as
+ * plain JSON over one of two transports (src/runner/argv.ts): Node's `process.send` channel ("process" isolation),
+ * or newline-delimited frames on stdin/stdout (src/runner/frames.ts, "systemd" isolation). The run key is NOT in any
+ * of these messages: the child reads it from its environment (OPENAI_API_KEY, IPC) or from the key frame that
+ * precedes them on stdin (stdio), and uses it only for requests to the relay.
  */
 
 export type RunnerInput = {

@@ -1,11 +1,17 @@
 /**
- * Starts one Pi process per run (src/runner/main.ts) and talks to it over Node IPC (src/runner/protocol.ts).
+ * "process" isolation of Pi processes: the weaker LOCAL mode (macOS, development). Starts one Pi process per run
+ * (src/runner/main.ts) as a child of the Coordinator, as the Coordinator's own user, and talks to it over Node IPC
+ * (src/runner/protocol.ts). On Linux deployments the "systemd" isolation (runner-systemd.ts) is the default: its own
+ * unprivileged user, a dedicated slice, a per-unit IP filter. Here there is none of that: the only separation is the
+ * minimal environment, the private run home and the process group (docs/isolation.md).
  *
  * The child gets a minimal environment: PATH, HOME = `<dataDir>/run-home` (empty, mode 700), OPENAI_API_KEY = the run
- * key (its only secret), NODE_NO_WARNINGS=1; nothing else is inherited (no NODE_OPTIONS, no parent flags). It runs
- * detached in its own process group so `kill()` signals the whole group. Its stdout and stderr are drained here and
- * never forwarded as text: only `@pi-runner {json}` metadata lines are logged, with allowlisted primitive fields;
- * everything else is counted.
+ * key (its only secret), NODE_NO_WARNINGS=1; nothing else is inherited (no NODE_OPTIONS, no parent flags). Its argv
+ * carries the deployment and run markers (src/runner/argv.ts; no secrets), so it can be found again by `ps` after a
+ * restart: by its recorded pid, or by restart cleanup's deployment-wide listing (`leftovers()`). It runs detached in
+ * its own process group so `kill()` signals the whole group. Its stdout and stderr are
+ * drained here and never forwarded as text: only `@pi-runner {json}` metadata lines are logged, with allowlisted
+ * primitive fields; everything else is counted.
  */
 import { type ChildProcess, fork, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync } from "node:fs";
@@ -13,9 +19,19 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { deploymentId, hasRunnerMarkers, markedRunId, runnerArgv } from "../runner/argv.ts";
 import { isFromRunner, type RunnerStart, type ToRunner } from "../runner/protocol.ts";
 import { errorSummary, type Logger } from "../runtime/log.ts";
-import type { RunLauncher, RunnerExit, RunnerHandle } from "./ports.ts";
+import type { RunLauncher, RunnerExit, RunnerHandle, RunnerRef } from "./ports.ts";
+import {
+	checkTestEnv,
+	drainStderr,
+	FALLBACK_PATH,
+	logNote,
+	newOutputCounts,
+	type OutputCounts,
+	parseNoteJson,
+} from "./runner-common.ts";
 
 export type RunLauncherOptions = {
 	readonly dataDir: string;
@@ -29,11 +45,8 @@ export type RunLauncherOptions = {
 };
 
 const NOTE_PREFIX = "@pi-runner ";
-const NOTE_EVENT = /^[a-z][a-z0-9_]{0,47}$/;
-const NOTE_KEY = /^[a-zA-Z][a-zA-Z0-9_]{0,31}$/;
-const NOTE_VALUE = /^[\w.:-]{0,64}$/;
-/** At most this many metadata lines are logged per process; the rest are counted. */
-const MAX_NOTES = 200;
+/** The runner's entry in a Pi process's command line (src or dist). */
+const RUNNER_COMMAND = /runner[/\\]main\.(ts|js)\b/;
 
 /** The default runner entry next to this module. */
 export function defaultRunnerPath(): string {
@@ -45,28 +58,26 @@ export function createRunLauncher(options: RunLauncherOptions): RunLauncher {
 	const { dataDir, log } = options;
 	const runnerPath = options.runnerPath ?? defaultRunnerPath();
 	const execArgv = [...(options.execArgv ?? [])];
-	const testEnv: Record<string, string> = {};
-	for (const [name, value] of Object.entries(options.testEnv ?? {})) {
-		if (!/^PI_RUNNER_TEST_[A-Z0-9_]+$/.test(name))
-			throw new Error(`testEnv: ${name} is not a PI_RUNNER_TEST_ variable`);
-		testEnv[name] = value;
-	}
+	const testEnv = checkTestEnv(options.testEnv);
+	const deployment = deploymentId(dataDir);
+	const isRunner = (ref: RunnerRef): boolean => ref.pid !== null && isPiProcess(ref.pid, deployment, ref.runId);
 	return {
+		isolation: "process",
+		// Nothing to check: this mode is a plain child process (the sandbox check still gates execution).
+		available: async () => ({ ok: true }),
 		launch(start: RunnerStart, runKey: string, onMessage) {
 			const home = join(dataDir, "run-home");
 			mkdirSync(home, { recursive: true, mode: 0o700 });
 			chmodSync(home, 0o700);
 			const env: Record<string, string> = {
-				PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+				PATH: process.env.PATH ?? FALLBACK_PATH,
 				HOME: home,
 				OPENAI_API_KEY: runKey,
 				NODE_NO_WARNINGS: "1",
 				...testEnv,
 			};
-			// STUB(spec: deployment.md § Pi processes, § Watchdog): Pi processes should run as their own unprivileged user
-			// in a dedicated systemd slice (the watchdog kills the slice; the metadata server is firewalled for that user).
-			// Here they run as the Coordinator's user in their own process group, which kill() signals as a whole.
-			const child = fork(runnerPath, [], {
+			const args = runnerArgv({ transport: "ipc", conversationAccess: "private", deployment, runId: start.runId });
+			const child = fork(runnerPath, args, {
 				cwd: home,
 				env,
 				execArgv,
@@ -75,7 +86,7 @@ export function createRunLauncher(options: RunLauncherOptions): RunLauncher {
 				stdio: ["ignore", "pipe", "pipe", "ipc"],
 			});
 			const meta = { runId: start.runId, taskId: start.taskId, pid: child.pid };
-			const counts = { stdoutLines: 0, notes: 0, stderrBytes: 0, stderrLines: 0 };
+			const counts = newOutputCounts();
 			drainStdout(child.stdout, log, meta, counts);
 			drainStderr(child.stderr, counts);
 			let exitedFlag = false;
@@ -105,7 +116,7 @@ export function createRunLauncher(options: RunLauncherOptions): RunLauncher {
 					log.error("runner_message_handler_failed", { ...meta, type: message.type, error: errorSummary(error) });
 				}
 			});
-			log.info("runner_launched", { ...meta, fresh: start.fresh, steers: start.steers.length });
+			log.info("runner_launched", { ...meta, fresh: start.fresh, steers: start.steers.length, isolation: "process" });
 			const handle: RunnerHandle = {
 				pid: child.pid,
 				send: (message: ToRunner) => send(child, message, log, meta),
@@ -118,17 +129,55 @@ export function createRunLauncher(options: RunLauncherOptions): RunLauncher {
 			handle.send(start);
 			return handle;
 		},
-		isRunner(pid: number): boolean {
-			if (!Number.isInteger(pid) || pid <= 1) return false;
-			const result = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
-				encoding: "utf8",
-				timeout: 5000,
-				env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-			});
-			if (result.status !== 0 || typeof result.stdout !== "string") return false;
-			return /runner[/\\]main\.(ts|js)\b/.test(result.stdout);
+		isRunner,
+		leftovers: () => markedProcesses(deployment),
+		killRunner(ref: RunnerRef): void {
+			// Only a process that carries this deployment's and this run's markers (never a reused pid).
+			if (ref.pid === null || !isRunner(ref)) return;
+			for (const target of [-ref.pid, ref.pid]) {
+				try {
+					process.kill(target, "SIGKILL");
+				} catch {
+					// Not ours or already gone.
+				}
+			}
 		},
 	};
+}
+
+/** True if `pid` is a live Pi process of this deployment serving `runId` (by its command line). */
+function isPiProcess(pid: number, deployment: string, runId: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 1) return false;
+	const result = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
+		encoding: "utf8",
+		timeout: 5000,
+		env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+	});
+	if (result.status !== 0 || typeof result.stdout !== "string") return false;
+	return RUNNER_COMMAND.test(result.stdout) && hasRunnerMarkers(result.stdout, deployment, runId);
+}
+
+/**
+ * Restart cleanup, deployment-wide: every live Pi process (not this one) whose command line carries this deployment's
+ * markers, whatever run it served; undefined when `ps` cannot list the processes.
+ */
+function markedProcesses(deployment: string): RunnerRef[] | undefined {
+	const result = spawnSync("ps", ["-A", "-ww", "-o", "pid=,command="], {
+		encoding: "utf8",
+		timeout: 5000,
+		maxBuffer: 16 * 1024 * 1024,
+		env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+	});
+	if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") return undefined;
+	const refs: RunnerRef[] = [];
+	for (const line of result.stdout.split("\n")) {
+		const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+		const pid = Number(match?.[1]);
+		const command = match?.[2] ?? "";
+		const runId = RUNNER_COMMAND.test(command) ? markedRunId(command, deployment) : undefined;
+		if (runId !== undefined && pid !== process.pid) refs.push({ runId, generation: 0, pid });
+	}
+	return refs;
 }
 
 function send(child: ChildProcess, message: ToRunner, log: Logger, meta: Record<string, unknown>): void {
@@ -163,60 +212,12 @@ function killGroup(child: ChildProcess): void {
 	}
 }
 
-function drainStdout(
-	stream: Readable | null,
-	log: Logger,
-	meta: Record<string, unknown>,
-	counts: { stdoutLines: number; notes: number },
-): void {
+function drainStdout(stream: Readable | null, log: Logger, meta: Record<string, unknown>, counts: OutputCounts): void {
 	if (stream === null) return;
 	const lines = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
 	lines.on("line", (line) => {
-		const fields = line.startsWith(NOTE_PREFIX) ? parseNote(line.slice(NOTE_PREFIX.length)) : undefined;
-		if (fields === undefined || counts.notes >= MAX_NOTES) {
-			counts.stdoutLines++;
-			return;
-		}
-		counts.notes++;
-		const { event, ...rest } = fields;
-		log.info("runner_note", { ...meta, note: event, ...rest });
+		const fields = line.startsWith(NOTE_PREFIX) ? parseNoteJson(line.slice(NOTE_PREFIX.length)) : undefined;
+		logNote(log, meta, fields, counts);
 	});
 	lines.on("error", () => {});
-}
-
-function drainStderr(stream: Readable | null, counts: { stderrBytes: number; stderrLines: number }): void {
-	if (stream === null) return;
-	stream.on("data", (chunk: Buffer) => {
-		counts.stderrBytes += chunk.byteLength;
-		for (const byte of chunk) if (byte === 0x0a) counts.stderrLines++;
-	});
-	stream.on("error", () => {});
-}
-
-type NoteFields = { event: string } & Record<string, string | number | boolean>;
-
-/** A metadata line's fields, when it is one: an event name and allowlisted primitive values. */
-function parseNote(json: string): NoteFields | undefined {
-	let value: unknown;
-	try {
-		value = JSON.parse(json);
-	} catch {
-		return undefined;
-	}
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-	const record = value as Record<string, unknown>;
-	if (typeof record.event !== "string" || !NOTE_EVENT.test(record.event)) return undefined;
-	const fields: NoteFields = { event: record.event };
-	for (const [key, field] of Object.entries(record)) {
-		if (allowedNoteField(key, field)) fields[key] = field;
-	}
-	return fields;
-}
-
-/** Only short identifiers, numbers and booleans pass; the launcher's own fields cannot be overridden. */
-function allowedNoteField(key: string, field: unknown): field is string | number | boolean {
-	if (!NOTE_KEY.test(key) || ["event", "runId", "taskId", "pid"].includes(key)) return false;
-	if (typeof field === "number") return Number.isFinite(field);
-	if (typeof field === "boolean") return true;
-	return typeof field === "string" && NOTE_VALUE.test(field);
 }

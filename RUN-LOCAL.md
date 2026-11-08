@@ -3,8 +3,9 @@
 This page starts the Coordinator on a Mac against the real Telegram group (Smule Dev, bot `@smule_code_bot`), a real
 GitHub test repository and a real model, for the smoke and acceptance tests in [spec/build-plan.md](spec/build-plan.md)
 (items 7, 10 and 11). What runs: one Coordinator process (Telegram polling, relay, outbox, git and GitHub), one Pi
-process per run, and Docker containers with no network for file operations and checks. What does not exist yet is
-listed in [README.md](README.md#not-built-yet).
+process per run (as your own user on a Mac: the weaker local mode, see [docs/isolation.md](docs/isolation.md)), and
+Docker containers with no network for file operations and checks. What does not exist yet is listed in
+[README.md](README.md#not-built-yet).
 
 **Before you start:** stop every other process that polls with the same bot token, in particular the old bot started
 by Conductor's **Bot** run action (see [Conductor](#conductor)). Telegram allows one `getUpdates` poller per token.
@@ -227,7 +228,7 @@ Check that nothing is left behind:
 
 ```sh
 docker ps -a --filter label=pi-durable.managed=1     # no rows
-pgrep -fl runner/main                                 # no output
+pgrep -fl -- --pi-durable-deployment=                # no output (every Pi process carries this marker)
 ```
 
 ## Owner CLI
@@ -291,6 +292,13 @@ token: Telegram allows one poller per token.
 - Do not show `.env.local`, the `read -rs` step or the GitHub token page on screen while recording.
 - The model key is held by the relay inside the Coordinator; each Pi process gets only a run key that the relay
   accepts while that run is open. Only the Coordinator runs git and holds the GitHub token.
+- **Pi processes on the Mac run as your own user** (`PI_RUNNER_ISOLATION=process`, the default on macOS): a child
+  process of the Coordinator in its own process group, with a minimal environment and an empty private HOME, talking
+  over Node IPC. Unlike the Linux deployment there is no separate unprivileged user, no systemd slice, no per-unit
+  sandbox or IP filter and no metadata-server firewall; Pi processes are found again by the markers in their command
+  line (`--pi-durable-deployment=…`, `--pi-durable-run=…`), not by a slice. Pi still talks only to the relay on
+  127.0.0.1 and holds only its run key, but nothing on the Mac enforces the network part. What differs and what is
+  verified only on Linux: [docs/isolation.md](docs/isolation.md).
 - Containers get no network (`--network none`), no credentials and no environment secrets, only the task's worktree
   (its `.git` is masked), a read-only root filesystem, a non-root user and CPU, memory and process limits. There is no
   arbitrary shell: the model has `read`, `edit`, `write` and `run_check` with the fixed operations of the check image.

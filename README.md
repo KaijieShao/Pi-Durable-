@@ -77,11 +77,12 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 ## Not built yet
 
 Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; the separate watchdog systemd unit (an
-in-process watchdog, self-terminating containers and a self-exiting Pi process stand in); the systemd slice and a
-dedicated Pi user; the metadata-server firewall; GCP deploy scripts; the owner CLI's local socket and read-only
-inspection of quarantined conversations; reconciliation of uncertain file edits after a crash; task-disk-full
-handling beyond the free-space check; trial reset and the stress test. Measurements in the spec are planned, not
-results.
+in-process watchdog, self-terminating containers and a self-exiting Pi process stand in, and restart cleanup in the
+Coordinator kills every Pi process of the deployment, everything of it in the Pi slice); GCP deploy scripts; the
+owner CLI's local socket and read-only inspection of quarantined conversations; reconciliation of uncertain file
+edits after a crash; task-disk-full handling beyond the free-space check; trial reset and the stress test.
+Measurements in the spec are planned, not results. Pi processes run as their own user in a dedicated systemd slice on Linux, and as your own user
+on a Mac (the weaker local mode): see [docs/isolation.md](docs/isolation.md).
 
 ## Development
 

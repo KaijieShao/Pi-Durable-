@@ -1,15 +1,24 @@
 /**
- * Entry point of the Pi process: one process per run, forked by the Coordinator (src/coordinator/runner-launcher.ts)
- * with a minimal environment and a Node IPC channel (src/runner/protocol.ts). The run key arrives only as
- * OPENAI_API_KEY; it is captured and removed from the environment at once. Nothing is written to stdout except
- * `@pi-runner {json}` metadata lines; stderr only on a crash (the error's name, never its text).
+ * Entry point of the Pi process: one process per run, started by the Coordinator with a minimal environment. Two
+ * transports (src/runner/argv.ts `--transport=`):
  *
- * The process exits on its own: after `finished`, when the IPC channel to the Coordinator closes, and, independently of
- * the Coordinator's watchdog, `deadlineMs` + 30 s after the start message.
+ *   ipc    (default; "process" isolation, src/coordinator/runner-launcher.ts): a forked child with a Node IPC channel
+ *          (src/runner/protocol.ts). The run key arrives only as OPENAI_API_KEY; it is captured and removed from the
+ *          environment at once. Stdout carries only `@pi-runner {json}` metadata lines.
+ *   stdio  ("systemd" isolation, src/coordinator/runner-systemd.ts): newline-delimited JSON frames on stdin/stdout
+ *          (src/runner/frames.ts). The run key is the FIRST stdin frame, never argv or environment (an
+ *          OPENAI_API_KEY in the environment is removed and ignored). Stdout carries only frames: anything else
+ *          written to it is redirected to stderr.
  *
- * Environment: OPENAI_API_KEY (the run key), HOME (an empty private directory), PATH, NODE_NO_WARNINGS, and for tests
+ * Stderr only on a crash (the error's name, never its text). The process exits on its own: after `finished`, when
+ * the channel to the Coordinator closes (IPC disconnect, stdin end), and, independently of the Coordinator's
+ * watchdog, `deadlineMs` + 30 s after the start message.
+ *
+ * Environment: HOME (an empty private directory), PATH, NODE_NO_WARNINGS, OPENAI_API_KEY (ipc only), and for tests
  * only PI_RUNNER_TEST_FAST_RETRY=1 (Pi retry backoff 20 ms instead of 2 s).
  */
+import { parseRunnerArgv, type RunnerArgs } from "./argv.ts";
+import { encodeFrame, keyFromFrame, readFrames } from "./frames.ts";
 import type { RunController, RunnerIo } from "./harness.ts";
 import type { FromRunner, RunnerStart, ToRunner } from "./protocol.ts";
 
@@ -18,9 +27,27 @@ const SELF_EXIT_GRACE_MS = 30_000;
 /** Bound for the best-effort abort before a forced exit (disconnect, deadline, crash). */
 const FORCED_EXIT_ABORT_MS = 5_000;
 
-const apiKey = process.env.OPENAI_API_KEY;
+type NoteFields = Readonly<Record<string, string | number | boolean>>;
+
+/** How the process talks to the Coordinator. */
+type Transport = {
+	/** The run key, once received. */
+	key(): string | undefined;
+	send(message: FromRunner): Promise<void>;
+	note(event: string, fields?: NoteFields): void;
+	/** Deliver incoming messages; `onClose` when the Coordinator is gone; `onFatal` on a protocol violation. */
+	listen(onMessage: (message: unknown) => void, onClose: () => void, onFatal: (event: string) => void): void;
+};
+
+const envKey = process.env.OPENAI_API_KEY;
 delete process.env.OPENAI_API_KEY;
 const fastRetry = process.env.PI_RUNNER_TEST_FAST_RETRY === "1";
+const parsedArgs = parseRunnerArgv(process.argv.slice(2));
+if (typeof parsedArgs === "string") {
+	process.stderr.write(`pi-runner: ${parsedArgs}\n`);
+	process.exit(1);
+}
+const args: RunnerArgs = parsedArgs;
 
 let controller: RunController | undefined;
 let started = false;
@@ -30,23 +57,96 @@ let forcedCode: number | undefined;
 /** Messages that arrived before the run controller existed (Node delivers them once a listener is attached). */
 const early: ToRunner[] = [];
 
-const io: RunnerIo = {
-	send: (message: FromRunner) =>
+const transport: Transport = args.transport === "stdio" ? stdioTransport() : ipcTransport(envKey);
+const io: RunnerIo = { send: (message) => transport.send(message), note: (event, fields) => note(event, fields) };
+
+transport.listen(onMessage, onClose, (event) => {
+	note(event);
+	exit(1);
+});
+
+process.on("uncaughtException", (error) => crash(error));
+process.on("unhandledRejection", (error) => crash(error));
+
+function ipcTransport(apiKey: string | undefined): Transport {
+	return {
+		key: () => apiKey,
+		send: (message) =>
+			new Promise<void>((resolve) => {
+				if (!process.connected || process.send === undefined) {
+					resolve();
+					return;
+				}
+				try {
+					process.send(message, undefined, undefined, () => resolve());
+				} catch {
+					resolve();
+				}
+			}),
+		note(event, fields) {
+			try {
+				process.stdout.write(`@pi-runner ${JSON.stringify({ event, ...fields })}\n`);
+			} catch {
+				// stdout closed: metadata is optional.
+			}
+		},
+		listen(onIncoming, onGone) {
+			process.on("message", onIncoming);
+			process.on("disconnect", onGone);
+		},
+	};
+}
+
+function stdioTransport(): Transport {
+	const stdout = process.stdout;
+	const writeFrame = stdout.write.bind(stdout);
+	// Stdout carries only frames: anything else (a dependency's console.log) goes to stderr instead.
+	stdout.write = process.stderr.write.bind(process.stderr) as typeof stdout.write;
+	let apiKey: string | undefined;
+	let closed = false;
+	const frame = (value: object): Promise<void> =>
 		new Promise<void>((resolve) => {
-			if (!process.connected || process.send === undefined) {
+			if (closed) {
 				resolve();
 				return;
 			}
 			try {
-				process.send(message, undefined, undefined, () => resolve());
+				writeFrame(encodeFrame(value), () => resolve());
 			} catch {
 				resolve();
 			}
-		}),
-	note: (event, fields) => note(event, fields),
-};
+		});
+	return {
+		key: () => apiKey,
+		send: (message) => frame(message),
+		note(event, fields) {
+			void frame({ ...fields, type: "note", event });
+		},
+		listen(onIncoming, onGone, onFatal) {
+			stdout.on("error", () => {
+				closed = true;
+				onGone();
+			});
+			let keyed = false;
+			readFrames(process.stdin, {
+				frame(value) {
+					if (keyed) {
+						onIncoming(value);
+						return;
+					}
+					// The first frame is the run key and nothing else.
+					keyed = true;
+					apiKey = keyFromFrame(value);
+					if (apiKey === undefined) onFatal("runner_missing_key");
+				},
+				invalid: (kind) => note("runner_bad_frame", { kind }),
+				end: () => onGone(),
+			});
+		},
+	};
+}
 
-process.on("message", (message: unknown) => {
+function onMessage(message: unknown): void {
 	if (typeof message !== "object" || message === null || typeof (message as { type?: unknown }).type !== "string") {
 		note("runner_bad_message");
 		return;
@@ -63,17 +163,14 @@ process.on("message", (message: unknown) => {
 	}
 	if (controller === undefined) early.push(typed);
 	else dispatch(controller, typed);
-});
+}
 
-process.on("disconnect", () => {
+function onClose(): void {
 	// The Coordinator is gone: nobody serves tool calls or receives reports. Stop and exit; recovery takes over.
 	if (exiting) return;
 	note("runner_disconnected");
 	void forcedExit("coordinator disconnected", 1);
-});
-
-process.on("uncaughtException", (error) => crash(error));
-process.on("unhandledRejection", (error) => crash(error));
+}
 
 async function begin(raw: unknown): Promise<void> {
 	const start = parseStart(raw);
@@ -89,7 +186,11 @@ async function begin(raw: unknown): Promise<void> {
 	}, start.limits.deadlineMs + SELF_EXIT_GRACE_MS);
 	deadline.unref();
 	const { RunController } = await import("./harness.ts");
-	const run = new RunController(start, io, { apiKey, fastRetry });
+	const run = new RunController(start, io, {
+		apiKey: transport.key(),
+		fastRetry,
+		sharedStore: args.conversationAccess === "group",
+	});
 	controller = run;
 	for (const message of early.splice(0)) dispatch(run, message);
 	const code = await run.run();
@@ -150,13 +251,9 @@ function exit(code: number): void {
 	setImmediate(() => process.exit(final));
 }
 
-/** One metadata line: `@pi-runner {"event":...}` with primitive fields only. */
-function note(event: string, fields?: Readonly<Record<string, string | number | boolean>>): void {
-	try {
-		process.stdout.write(`@pi-runner ${JSON.stringify({ event, ...fields })}\n`);
-	} catch {
-		// stdout closed: metadata is optional.
-	}
+/** One metadata line (ipc) or note frame (stdio) with primitive fields only. */
+function note(event: string, fields?: NoteFields): void {
+	transport.note(event, fields);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -175,6 +272,7 @@ const isInput = (value: Loose): boolean => isObject(value) && isString(value.con
 /** Shape rules of the start message, in order; the first that fails names the problem. */
 const START_RULES: readonly (readonly [(start: Loose) => boolean, string])[] = [
 	[(start) => isCount(start.runId, 0) && isCount(start.taskId, 0), "invalid run or task id"],
+	[(start) => args.runId === undefined || start.runId === args.runId, "run id does not match the process marker"],
 	[
 		(start) => isString(start.conversationPath) && start.conversationPath.startsWith("/"),
 		"conversationPath must be absolute",

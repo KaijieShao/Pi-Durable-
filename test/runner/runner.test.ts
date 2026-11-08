@@ -4,13 +4,15 @@
  */
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import type { RunLauncher, RunnerExit, RunnerHandle } from "../../src/coordinator/ports.ts";
+import type { RunLauncher, RunnerExit, RunnerHandle, RunnerRef } from "../../src/coordinator/ports.ts";
 import { createRunLauncher } from "../../src/coordinator/runner-launcher.ts";
+import { deploymentId } from "../../src/runner/argv.ts";
 import { confinePath } from "../../src/runner/policy.ts";
 import type { FromRunner, RunnerInput, RunnerStart, ToolResult } from "../../src/runner/protocol.ts";
 import { type LogFields, silentLogger } from "../../src/runtime/log.ts";
@@ -53,6 +55,8 @@ type Run = {
 	readonly exited: Promise<RunnerExit>;
 	readonly worktree: string;
 	waitFor(predicate: (message: FromRunner) => boolean, what: string): Promise<FromRunner>;
+	/** The run start as restart cleanup sees it. */
+	ref(): RunnerRef;
 };
 
 let counter = 0;
@@ -93,18 +97,23 @@ async function launch(options: {
 		resolveFinished = resolve;
 	});
 	let run: Run | undefined;
-	const handle = launcher.launch(start, RUN_KEY, (message) => {
-		messages.push(message);
-		if (message.type === "finished") resolveFinished(message);
-		if (message.type === "tool") {
-			tools.push(message);
-			void (async () => {
-				const custom = run === undefined ? undefined : await options.onTool?.(message, run);
-				const result = custom ?? (await executeTool(worktree, message));
-				handle.send({ type: "tool_result", id: message.id, result });
-			})();
-		}
-	});
+	const handle = launcher.launch(
+		start,
+		RUN_KEY,
+		(message) => {
+			messages.push(message);
+			if (message.type === "finished") resolveFinished(message);
+			if (message.type === "tool") {
+				tools.push(message);
+				void (async () => {
+					const custom = run === undefined ? undefined : await options.onTool?.(message, run);
+					const result = custom ?? (await executeTool(worktree, message));
+					handle.send({ type: "tool_result", id: message.id, result });
+				})();
+			}
+		},
+		{ generation: 1 },
+	);
 	const created: Run = {
 		requestId: start.input.requestId,
 		conversation,
@@ -116,6 +125,7 @@ async function launch(options: {
 		worktree,
 		waitFor: (predicate, what) =>
 			waitFor(() => messages.find(predicate), { what, timeoutMs: 20_000 }) as Promise<FromRunner>,
+		ref: () => ({ runId: start.runId, generation: 1, pid: handle.pid ?? null }),
 	};
 	run = created;
 	return created;
@@ -455,13 +465,13 @@ describe("Pi runner process", { timeout: 120_000 }, () => {
 		script(() => ({ hang: true }));
 		const run = await launch({ input: "think forever" });
 		await fake.waitForRequests(1);
-		assert.ok(run.handle.pid !== undefined && launcher.isRunner(run.handle.pid));
+		assert.ok(launcher.isRunner(run.ref()));
 		run.handle.send({ type: "abort", reason: "cancelled by user" });
 		const { finished, exit } = await settle(run);
 		assert.equal(finished.outcome, "aborted");
 		assert.equal(finished.reason, "cancelled by user");
 		assert.equal(exit.code, 0);
-		assert.equal(launcher.isRunner(run.handle.pid ?? 0), false);
+		assert.equal(launcher.isRunner(run.ref()), false);
 		// A follow-up after the stop is refused, never accepted.
 		assert.equal(run.messages.filter((message) => message.type === "finished").length, 1);
 	});
@@ -562,6 +572,51 @@ describe("Pi runner process", { timeout: 120_000 }, () => {
 		assert.equal(fake.requests.length, 0);
 	});
 
+	it("carries the deployment and run markers in argv (never the key); restart cleanup kills only a marked process", async () => {
+		script(() => ({ hang: true }));
+		const run = await launch({ input: "hang for the markers" });
+		await fake.waitForRequests(1);
+		const pid = run.handle.pid ?? 0;
+		const command = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout;
+		const deployment = deploymentId(join(root, "data"));
+		assert.ok(command.includes(`--pi-durable-deployment=${deployment}`), command);
+		assert.ok(command.includes(`--pi-durable-run=${run.ref().runId}`), command);
+		assert.ok(command.includes("--transport=ipc"), command);
+		assert.ok(!command.includes(RUN_KEY), "the run key is not in argv");
+		// Another run's id, another deployment, or a process without markers (this test) is never taken for it.
+		assert.equal(launcher.isRunner({ ...run.ref(), runId: run.ref().runId + 1000 }), false);
+		const other = createRunLauncher({ dataDir: join(root, "other-data"), log: silentLogger });
+		assert.equal(other.isRunner(run.ref()), false);
+		// Restart cleanup's deployment-wide listing: this deployment's marked process, never another deployment's.
+		assert.deepEqual(
+			launcher.leftovers()?.filter((ref) => ref.pid === pid),
+			[{ runId: run.ref().runId, generation: 0, pid }],
+		);
+		assert.equal(
+			other.leftovers()?.some((ref) => ref.pid === pid),
+			false,
+		);
+		assert.equal(
+			launcher.leftovers()?.some((ref) => ref.pid === process.pid),
+			false,
+			"never this process",
+		);
+		other.killRunner(run.ref());
+		assert.equal(launcher.isRunner({ runId: run.ref().runId, generation: 1, pid: process.pid }), false);
+		launcher.killRunner({ runId: run.ref().runId, generation: 1, pid: process.pid });
+		assert.equal(launcher.isRunner(run.ref()), true, "still running: nothing above killed it");
+		launcher.killRunner(run.ref());
+		const exit = await withTimeout(run.exited, 10_000, "exit");
+		assert.equal(exit.signal, "SIGKILL");
+		assert.equal(launcher.isRunner(run.ref()), false);
+		assert.equal(
+			launcher.leftovers()?.some((ref) => ref.pid === pid),
+			false,
+		);
+		assert.equal(launcher.isolation, "process");
+		assert.deepEqual(await launcher.available(), { ok: true });
+	});
+
 	it("kill() ends the whole process group", async () => {
 		script(() => ({ hang: true }));
 		const run = await launch({ input: "hang" });
@@ -569,6 +624,6 @@ describe("Pi runner process", { timeout: 120_000 }, () => {
 		run.handle.kill();
 		const exit = await withTimeout(run.exited, 10_000, "exit");
 		assert.equal(exit.signal, "SIGKILL");
-		assert.equal(launcher.isRunner(run.handle.pid ?? 0), false);
+		assert.equal(launcher.isRunner(run.ref()), false);
 	});
 });

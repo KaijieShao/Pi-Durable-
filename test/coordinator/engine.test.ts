@@ -358,6 +358,8 @@ function createFakeLauncher(onAbort: (run: FakeRun) => void) {
 	const runs: FakeRun[] = [];
 	const control = { script: workScript() as Script };
 	const launcher: RunLauncher = {
+		isolation: "process",
+		available: async () => ({ ok: true }),
 		launch(start, key, onMessage): RunnerHandle {
 			let resolveExit: (exit: RunnerExit) => void = () => {};
 			const exited = new Promise<RunnerExit>((resolve) => {
@@ -410,6 +412,8 @@ function createFakeLauncher(onAbort: (run: FakeRun) => void) {
 			};
 		},
 		isRunner: () => false,
+		killRunner: () => {},
+		leftovers: () => [],
 	};
 	return { launcher, runs, control };
 }

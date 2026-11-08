@@ -298,3 +298,73 @@ test(".env.example parses once secrets and ids are filled in, and names only var
 		assert.ok(source.includes(`"${name}"`) || source.includes(`env.${name}`), `${name} is not read by config.ts`);
 	}
 });
+
+test("Pi process isolation: systemd by default on Linux, the local process mode elsewhere; names validated", () => {
+	const linux = parse({}, { ...DEFAULTS, platform: "linux", username: "pi-coordinator" });
+	assert.deepEqual(linux.runner, {
+		isolation: "systemd",
+		user: "pi-runner",
+		group: "pi-durable",
+		slice: "pi-durable-runs.slice",
+		systemdRunBin: "systemd-run",
+		systemctlBin: "systemctl",
+	});
+	assert.equal(parse({}, { ...DEFAULTS, platform: "darwin" }).runner.isolation, "process");
+	const explicit = parse(
+		{
+			PI_RUNNER_ISOLATION: "process",
+			PI_RUNNER_USER: "pi_run-2",
+			PI_RUNNER_GROUP: "pi-shared",
+			PI_RUNNER_SLICE: "pi-runs.slice",
+			SYSTEMD_RUN_BIN: "/usr/bin/systemd-run",
+			SYSTEMCTL_BIN: "/usr/bin/systemctl",
+		},
+		{ ...DEFAULTS, platform: "linux" },
+	);
+	assert.deepEqual(explicit.runner, {
+		isolation: "process",
+		user: "pi_run-2",
+		group: "pi-shared",
+		slice: "pi-runs.slice",
+		systemdRunBin: "/usr/bin/systemd-run",
+		systemctlBin: "/usr/bin/systemctl",
+	});
+	const bad: [string, string][] = [
+		["PI_RUNNER_ISOLATION", "none"],
+		["PI_RUNNER_ISOLATION", "docker"],
+		["PI_RUNNER_USER", "root"],
+		["PI_RUNNER_USER", "Pi"],
+		["PI_RUNNER_USER", "pi runner"],
+		["PI_RUNNER_USER", "../pi"],
+		["PI_RUNNER_GROUP", "root"],
+		["PI_RUNNER_GROUP", "pi:durable"],
+		["PI_RUNNER_SLICE", "-.slice"],
+		["PI_RUNNER_SLICE", "pi--runs.slice"],
+		["PI_RUNNER_SLICE", "pi-runs.service"],
+		["PI_RUNNER_SLICE", "system.slice extra"],
+		["SYSTEMD_RUN_BIN", "bin/systemd-run"],
+		["SYSTEMD_RUN_BIN", "/usr/bin/systemd run"],
+		["SYSTEMCTL_BIN", "/usr/bin/systemctl'"],
+		["SYSTEMCTL_BIN", "$HOME/systemctl"],
+	];
+	for (const [name, value] of bad) {
+		assert.deepEqual(variables({ ...VALID, [name]: value }), [name], `${name}=${value}`);
+	}
+});
+
+test("systemd isolation refuses the Coordinator's own user as the Pi user", () => {
+	const own = { ...DEFAULTS, platform: "linux" as const, username: "pi-coordinator" };
+	assert.deepEqual(
+		problems({ ...VALID, PI_RUNNER_USER: "pi-coordinator" }, own).map((problem) => problem.variable),
+		["PI_RUNNER_USER"],
+	);
+	// The local process mode runs as the Coordinator's user by definition.
+	assert.equal(
+		parse({ PI_RUNNER_ISOLATION: "process", PI_RUNNER_USER: "pi-coordinator" }, own).runner.user,
+		"pi-coordinator",
+	);
+	const summary = describeConfig(parse({}, own));
+	assert.equal(summary.runner_isolation, "systemd");
+	assert.equal(summary.runner_user, "pi-runner");
+	assert.equal(summary.runner_slice, "pi-durable-runs.slice");
+});

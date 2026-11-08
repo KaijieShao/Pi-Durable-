@@ -32,7 +32,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { loadProvider } from "../agent/providers.ts";
-import { makePrivate } from "../runtime/private-dir.ts";
+import { makeGroupShared, makePrivate } from "../runtime/private-dir.ts";
 import { type AllowedCall, describeCall } from "./policy.ts";
 import type { FromRunner, RunnerOutcome, RunnerStart, SteerStatus, ToolResult } from "./protocol.ts";
 import { createRunnerExtension } from "./tools.ts";
@@ -76,6 +76,11 @@ export type RunnerEnvironment = {
 	readonly apiKey: string | undefined;
 	/** PI_RUNNER_TEST_FAST_RETRY=1: tests shrink Pi's retry backoff (20 ms base) to keep 5xx tests quick. */
 	readonly fastRetry: boolean;
+	/**
+	 * `--conversation-access=group` (systemd isolation): the conversation's files are 0660, readable by the Pi user and,
+	 * through the shared group, the Coordinator user only; otherwise 0600 (owner only, the local mode).
+	 */
+	readonly sharedStore?: boolean;
 };
 
 type Track = {
@@ -308,7 +313,7 @@ export class RunController {
 			}),
 		);
 		const storage = await openNodeSqliteStorage(path);
-		await makePrivate([path, `${path}-wal`, `${path}-shm`]);
+		await restrictStore(path, this.#env.sharedStore === true);
 		this.#harness = await Harness.open(
 			storage,
 			{
@@ -658,7 +663,13 @@ export class RunController {
 	}
 }
 
-/** Auth for pi-ai: only the run key, from the captured environment; no ambient credential files. */
+/** The conversation's files: owner only (0600), or owner and the shared group (0660) under systemd isolation. */
+async function restrictStore(path: string, shared: boolean): Promise<void> {
+	const files = [path, `${path}-wal`, `${path}-shm`];
+	await (shared ? makeGroupShared(files) : makePrivate(files));
+}
+
+/** Auth for pi-ai: only the run key (from the environment or the key frame); no ambient credential files. */
 function runKeyAuth(apiKey: string | undefined): AuthContext {
 	return {
 		env: async (name) => (name === "OPENAI_API_KEY" ? apiKey : undefined),

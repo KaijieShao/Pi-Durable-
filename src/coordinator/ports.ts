@@ -1,7 +1,8 @@
 /**
  * Interfaces between the Coordinator core and the outside world. Production implementations:
  * Telegram → src/coordinator/telegram/api.ts, GitHub → src/coordinator/github.ts, git → src/coordinator/git.ts,
- * containers → src/coordinator/sandbox/docker.ts, Pi processes → src/coordinator/runner-launcher.ts.
+ * containers → src/coordinator/sandbox/docker.ts, Pi processes → src/coordinator/runner-systemd.ts (Linux) or
+ * src/coordinator/runner-launcher.ts (local).
  * Tests swap in fakes (fake Bot API over HTTP, fake GitHub over HTTP, local test sandbox).
  */
 import type { Update } from "grammy/types";
@@ -178,24 +179,56 @@ export interface Sandbox {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Pi processes: one per run (src/runner/main.ts), talking to the Coordinator over Node IPC.
+// Pi processes: one per run (src/runner/main.ts). Two isolations (Deployment § Processes):
+//   "systemd" (src/coordinator/runner-systemd.ts): a transient unit as the Pi user in the Pi slice, stdio frames;
+//   "process" (src/coordinator/runner-launcher.ts): a child of the Coordinator as its own user, Node IPC (local mode).
 
 export type RunnerExit = { readonly code: number | null; readonly signal: NodeJS.Signals | null };
 
+export type Availability = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
 export interface RunnerHandle {
+	/** The process the Coordinator started: the Pi process itself, or the systemd-run client of its unit. */
 	readonly pid: number | undefined;
 	send(message: ToRunner): void;
-	/** SIGKILL the process (and its group). */
+	/** SIGKILL the Pi process (its process group, or every process of its unit). */
 	kill(): void;
+	/** Resolves once the Pi process is gone (for a unit: the unit is inactive, not only its client). */
 	readonly exited: Promise<RunnerExit>;
 }
 
+/** One start of a run, as recorded in its row: enough to find its Pi process again after a restart. */
+export type RunnerRef = {
+	readonly runId: number;
+	/** The start's generation (systemd units are named by it; the process mode does not use it: 0 from leftovers()). */
+	readonly generation: number;
+	/** The pid recorded at launch (RunnerHandle.pid), if any. */
+	readonly pid: number | null;
+};
+
 export interface RunLauncher {
+	readonly isolation: "systemd" | "process";
+	/** Fails closed: if this launcher's isolation is unusable, no execution starts (with Sandbox.available()). */
+	available(): Promise<Availability>;
 	/**
-	 * Start a Pi process for one run. `runKey` reaches the child only through its environment (OPENAI_API_KEY);
-	 * the child gets no other secret.
+	 * Start a Pi process for one start of a run (`generation` of the dispatch). `runKey` is its only secret: it reaches
+	 * the process through its environment (process) or its first stdin frame (systemd), never argv.
 	 */
-	launch(start: RunnerStart, runKey: string, onMessage: (message: FromRunner) => void): RunnerHandle;
-	/** True if `pid` is still a live runner process (for restart cleanup). */
-	isRunner(pid: number): boolean;
+	launch(
+		start: RunnerStart,
+		runKey: string,
+		onMessage: (message: FromRunner) => void,
+		run: { readonly generation: number },
+	): RunnerHandle;
+	/** Restart cleanup: true if the Pi process of this start may still be alive. */
+	isRunner(ref: RunnerRef): boolean;
+	/** Restart cleanup: SIGKILL the Pi process of this start, if it is still there. */
+	killRunner(ref: RunnerRef): void;
+	/**
+	 * Restart cleanup, deployment-wide (Deployment § Processes: the watchdog "kills everything in the slice"): every Pi
+	 * process of this deployment that may still be there, whatever run it served (by unit name under systemd, by the
+	 * argv markers in the process mode), for isRunner/killRunner; undefined when they cannot be listed. Called only
+	 * while this Coordinator has no live run (recovery at startup and its recheck after an unfreeze).
+	 */
+	leftovers(): readonly RunnerRef[] | undefined;
 }

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseEnv } from "node:util";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -73,6 +73,22 @@ export type CoordinatorConfig = {
 		/** 127.0.0.1 port; 0 = ephemeral. */
 		readonly port: number;
 	};
+	/** Pi processes (Deployment § Processes): how each run's process is isolated. */
+	readonly runner: {
+		/**
+		 * "systemd" (default on Linux): a transient unit per run as `user`/`group` in `slice`, with a per-unit sandbox and
+		 * IP filter. "process" (default elsewhere): a child process as the Coordinator's own user, the weaker local mode.
+		 */
+		readonly isolation: "systemd" | "process";
+		/** The Pi user (never root, never the Coordinator's user). */
+		readonly user: string;
+		/** The group the Pi user shares with the Coordinator for the conversations directory. */
+		readonly group: string;
+		readonly slice: string;
+		/** systemd-run and systemctl: absolute paths or names looked up on PATH. */
+		readonly systemdRunBin: string;
+		readonly systemctlBin: string;
+	};
 	/** Repository path (relative to the worktree root) of the checked-in setup script; run if present. */
 	readonly setupScript: string;
 	readonly logLevel: "debug" | "info" | "warn" | "error";
@@ -94,6 +110,13 @@ export type Env = Readonly<Record<string, string | undefined>>;
 type Collector = { readonly problems: ConfigProblem[]; add(variable: string, message: string): void };
 
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const ISOLATIONS = ["systemd", "process"] as const;
+/** A POSIX user or group name (as systemd accepts it for User= / Group=). */
+const ACCOUNT = /^[a-z_][a-z0-9_-]{0,31}$/;
+/** A slice name: dash-separated parts (systemd reads them as the slice hierarchy), never the root slice. */
+const SLICE = /^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*\.slice$/;
+/** A command: an absolute path, or a name looked up on PATH. */
+const COMMAND = /^(\/[\w./@+-]+|[\w.+-]+)$/;
 const BOT_TOKEN = /^\d{5,}:[A-Za-z0-9_-]{30,}$/;
 const AGENT_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -112,11 +135,20 @@ export function loadCoordinatorConfig(options: { envFile?: string; env?: NodeJS.
 	return parseCoordinatorConfig(env);
 }
 
-type Defaults = { cwd: string; home: string; uid?: number; gid?: number };
+type Defaults = {
+	cwd: string;
+	home: string;
+	uid?: number;
+	gid?: number;
+	/** The platform the isolation default is chosen for (default process.platform). */
+	platform?: NodeJS.Platform;
+	/** The Coordinator's own user name (the Pi user must differ); default os.userInfo(). */
+	username?: string;
+};
 
 export function parseCoordinatorConfig(
 	env: Env,
-	defaults: Defaults = { cwd: process.cwd(), home: homedir(), ...uidGid() },
+	defaults: Defaults = { cwd: process.cwd(), home: homedir(), ...uidGid(), ...currentUser() },
 ): CoordinatorConfig {
 	const out: Collector = {
 		problems: [],
@@ -129,8 +161,9 @@ export function parseCoordinatorConfig(
 	const model = parseModel(env, out);
 	const github = parseGitHub(env, out);
 	const local = parseLocal(env, out, defaults);
+	const runner = parseRunner(env, out, defaults);
 	if (out.problems.length > 0) throw new ConfigError(out.problems);
-	return { telegram, agents, model, ...github, ...local };
+	return { telegram, agents, model, ...github, ...local, runner };
 }
 
 function parseTelegram(env: Env, out: Collector): CoordinatorConfig["telegram"] {
@@ -210,6 +243,41 @@ function parseLocal(
 	};
 }
 
+function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorConfig["runner"] {
+	const platform = defaults.platform ?? process.platform;
+	const isolation = (nonEmpty(env.PI_RUNNER_ISOLATION) ?? (platform === "linux" ? "systemd" : "process")) as
+		| "systemd"
+		| "process";
+	if (!(ISOLATIONS as readonly string[]).includes(isolation)) out.add("PI_RUNNER_ISOLATION", "systemd or process");
+	const user = parseAccount(env, "PI_RUNNER_USER", "pi-runner", out);
+	if (isolation === "systemd" && user === defaults.username)
+		out.add("PI_RUNNER_USER", "must not be the Coordinator's own user");
+	const group = parseAccount(env, "PI_RUNNER_GROUP", "pi-durable", out);
+	const slice = nonEmpty(env.PI_RUNNER_SLICE) ?? "pi-durable-runs.slice";
+	if (!SLICE.test(slice) || slice.length > 128)
+		out.add("PI_RUNNER_SLICE", "a slice name such as pi-durable-runs.slice (letters, digits, _ and single dashes)");
+	return {
+		isolation,
+		user,
+		group,
+		slice,
+		systemdRunBin: parseCommand(env, "SYSTEMD_RUN_BIN", "systemd-run", out),
+		systemctlBin: parseCommand(env, "SYSTEMCTL_BIN", "systemctl", out),
+	};
+}
+
+function parseAccount(env: Env, name: string, fallback: string, out: Collector): string {
+	const value = nonEmpty(env[name]) ?? fallback;
+	if (!ACCOUNT.test(value) || value === "root") out.add(name, "a user or group name (lower case, not root)");
+	return value;
+}
+
+function parseCommand(env: Env, name: string, fallback: string, out: Collector): string {
+	const value = nonEmpty(env[name]) ?? fallback;
+	if (!COMMAND.test(value)) out.add(name, "an absolute path or a command name, without spaces or quotes");
+	return value;
+}
+
 /** A secret-free summary for the startup log. */
 export function describeConfig(config: CoordinatorConfig): Record<string, unknown> {
 	return {
@@ -224,12 +292,24 @@ export function describeConfig(config: CoordinatorConfig): Record<string, unknow
 		tasks: config.paths.taskDir,
 		agent_image: config.docker.agentImage,
 		check_image: config.docker.checkImage,
+		runner_isolation: config.runner.isolation,
+		...(config.runner.isolation === "systemd"
+			? { runner_user: config.runner.user, runner_group: config.runner.group, runner_slice: config.runner.slice }
+			: {}),
 	};
 }
 
 /** Thinking levels the configured model supports, for a startup check against the pi-ai catalog. */
 export function supportedThinking(model: Parameters<typeof getSupportedThinkingLevels>[0]): readonly string[] {
 	return model.reasoning ? getSupportedThinkingLevels(model) : ["off"];
+}
+
+function currentUser(): { username?: string } {
+	try {
+		return { username: userInfo().username };
+	} catch {
+		return {};
+	}
 }
 
 function uidGid(): { uid?: number; gid?: number } {

@@ -10,6 +10,7 @@
  * reminders, the merge worker, and dispatch.
  */
 
+import type { Logger } from "../runtime/log.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import { processCancels } from "./engine/cancel.ts";
 import {
@@ -37,6 +38,7 @@ import {
 	sendPendingSteers,
 } from "./engine/runs.ts";
 import { rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
+import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
 
 export type { EngineOptions } from "./engine/context.ts";
@@ -239,19 +241,41 @@ async function runRecoveryJobs(ctx: Ctx, state: EngineState): Promise<void> {
 	}
 }
 
-/** Fail closed: no execution starts while sandbox enforcement is unavailable (re-checked every 30 s). */
+export type Enforcement =
+	| { readonly ok: true }
+	/** `containers`: the sandbox (Docker, images); `isolation`: the Pi process isolation (systemd slice and user). */
+	| { readonly ok: false; readonly reason: string; readonly kind: "containers" | "isolation" };
+
+/**
+ * Execution enforcement (Architecture § Fails closed): the sandbox's containers, then the launcher's Pi process
+ * isolation. A failing check counts as unavailable. Logged here, metadata only.
+ */
+export async function enforcementAvailable(sandbox: Sandbox, launcher: RunLauncher, log: Logger): Promise<Enforcement> {
+	const box = await sandbox.available().catch((): Availability => ({ ok: false, reason: "sandbox check failed" }));
+	if (!box.ok) {
+		log.error("sandbox_unavailable", { reason: box.reason });
+		return { ok: false, reason: box.reason, kind: "containers" };
+	}
+	const isolation = await launcher
+		.available()
+		.catch((): Availability => ({ ok: false, reason: "the Pi process isolation check failed" }));
+	if (!isolation.ok) {
+		log.error("runner_isolation_unavailable", { isolation: launcher.isolation, reason: isolation.reason });
+		return { ok: false, reason: isolation.reason, kind: "isolation" };
+	}
+	return { ok: true };
+}
+
+/** Fail closed: no execution starts while enforcement is unavailable (re-checked every 30 s). */
 function checkEnforcement(ctx: Ctx, state: EngineState): void {
 	const current = ctx.enforcement;
 	if (state.enforcementChecking || current?.ok === true) return;
 	if (current !== undefined && ctx.now() - current.checkedAt < ENFORCEMENT_RECHECK_MS) return;
 	flagged(ctx, state, "enforcementChecking", undefined, async () => {
-		const result = await ctx.sandbox
-			.available()
-			.catch((): { ok: false; reason: string } => ({ ok: false, reason: "sandbox check failed" }));
+		const result = await enforcementAvailable(ctx.sandbox, ctx.launcher, ctx.log);
 		const reason = result.ok ? undefined : result.reason;
 		ctx.enforcement = { ok: result.ok, reason, checkedAt: ctx.now() };
-		if (!result.ok) ctx.log.error("sandbox_unavailable", { reason });
-		else if (current !== undefined) ctx.log.info("sandbox_available");
+		if (result.ok && current !== undefined) ctx.log.info("sandbox_available");
 	});
 }
 

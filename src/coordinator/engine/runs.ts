@@ -489,7 +489,9 @@ function launch(ctx: Ctx, active: ActiveRun, prepared: Prepared): void {
 		...prepared.start,
 		steers: steers.map((row) => ({ content: row.text, requestId: String(row.update_id) })),
 	};
-	const handle = ctx.launcher.launch(start, prepared.key, (message) => onRunnerMessage(ctx, active, message));
+	const handle = ctx.launcher.launch(start, prepared.key, (message) => onRunnerMessage(ctx, active, message), {
+		generation: active.generation,
+	});
 	active.handle = handle;
 	handle.exited.then(
 		(exit) => {
@@ -514,8 +516,9 @@ function launch(ctx: Ctx, active: ActiveRun, prepared: Prepared): void {
 		},
 	);
 	// STUB(spec: architecture.md § Watchdog; deployment.md § Processes): there is no separate watchdog unit. The
-	// 10-minute deadline is this in-process timer, backed by the agent container's own lifetime (deadline + 60 s) and
-	// the runner's independent self-exit (deadline + 30 s), so a crashed Coordinator still leaves nothing running long.
+	// 10-minute deadline is this in-process timer, backed by the agent container's own lifetime (deadline + 60 s),
+	// the runner's independent self-exit (deadline + 30 s) and, under systemd isolation, the Pi unit's RuntimeMaxSec
+	// (deadline + 60 s), so a crashed Coordinator still leaves nothing running long.
 	active.deadline = setTimeout(() => {
 		if (active.decision !== undefined) return;
 		decide(ctx, active, { kind: "failed", reason: deadlineText(ctx.limits.runDeadlineMs), cause: "limit" });

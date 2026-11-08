@@ -20,6 +20,16 @@
   the `postinstall` patch of Pi Durable's 401 retry (Pi Durable 1.5.0 is used unmodified; upstream 400/401 responses
   end the run instead of being retried). Existing private-chat SQLite data is not migrated.
 
+- Pi processes run as their own unprivileged user in a dedicated systemd slice on Linux (`PI_RUNNER_ISOLATION=systemd`,
+  the default there): one sandboxed transient unit per run with loopback-only network, the run key passed as the
+  first stdin frame, and no run started unless systemd, the slice and the host setup are in place. macOS keeps the
+  child-process mode as your own user (`process`, the weaker local mode). New `PI_RUNNER_USER`, `PI_RUNNER_GROUP`,
+  `PI_RUNNER_SLICE`, `SYSTEMD_RUN_BIN`, `SYSTEMCTL_BIN`; deploy files for the slice, a polkit rule and the
+  metadata-server firewall rule; see [docs/isolation.md](docs/isolation.md). Restart cleanup (and the recheck after an
+  unfreeze) now kills and verifies every Pi process of the deployment, whatever run it served (its units in the
+  slice, or its marked processes locally), not only those of the runs recorded in progress; the Coordinator database
+  is created owner-only (0600).
+
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 
