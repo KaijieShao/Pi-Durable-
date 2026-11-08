@@ -13,3 +13,4 @@ coverage/
 .DS_Store
 .context/
 .claude/hooks/
+.claude/scheduled_tasks.lock

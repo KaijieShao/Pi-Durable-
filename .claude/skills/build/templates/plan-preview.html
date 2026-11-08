@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ystack · /build preview · {{FEATURE_TITLE}}</title>
+  <style>
+    :root {
+      --c-bg: #f8fafc;
+      --c-canvas: #ffffff;
+      --c-border: #cbd5e1;
+      --c-border-strong: #94a3b8;
+      --c-text-main: #0f172a;
+      --c-text-sub: #64748b;
+      --c-soft: #f1f5f9;
+      --c-ink: #111827;
+      --font-ui: Helvetica, Arial, sans-serif;
+      --font-mono: Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      padding: 28px;
+      background: var(--c-bg);
+      color: var(--c-text-main);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .page {
+      max-width: 1160px;
+      margin: 0 auto;
+    }
+
+    .canvas {
+      border: 1px solid var(--c-border);
+      background: var(--c-canvas);
+    }
+
+    .header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: end;
+      padding: 24px 26px 18px;
+      border-bottom: 1px solid var(--c-border);
+    }
+
+    .eyebrow,
+    .section-label,
+    .data-label {
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .title {
+      margin-top: 5px;
+      font-size: 22px;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+
+    .subtitle {
+      margin-top: 8px;
+      max-width: 760px;
+      color: var(--c-text-sub);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .badge {
+      border: 1px solid var(--c-border);
+      padding: 4px 8px;
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .badge-solid {
+      border-color: var(--c-ink);
+      background: var(--c-ink);
+      color: var(--c-canvas);
+    }
+
+    .summary-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 26px;
+      border-bottom: 1px solid var(--c-border);
+      background: var(--c-canvas);
+    }
+
+    .summary-strip .data-label {
+      margin-right: 4px;
+    }
+
+    .summary-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--c-border);
+      background: var(--c-soft);
+      padding: 4px 8px;
+      color: var(--c-text-main);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .summary-chip b {
+      color: var(--c-text-main);
+      font-weight: 600;
+    }
+
+    .content {
+      padding: 22px 26px 26px;
+    }
+
+    .tabs {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      gap: 0;
+      margin-bottom: 16px;
+      border: 1px solid var(--c-border);
+      border-bottom: 0;
+      background: var(--c-soft);
+    }
+
+    .tab-button {
+      appearance: none;
+      border: 0;
+      border-right: 1px solid var(--c-border);
+      background: transparent;
+      color: var(--c-text-sub);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      padding: 10px 12px;
+      text-transform: uppercase;
+    }
+
+    .tab-button.is-active {
+      background: var(--c-canvas);
+      color: var(--c-text-main);
+      font-weight: 500;
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.is-active { display: block; }
+
+    .section {
+      margin-top: 20px;
+      border: 1px solid var(--c-border);
+    }
+
+    .section:first-child { margin-top: 0; }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--c-border);
+      background: var(--c-soft);
+    }
+
+    .section-body { padding: 14px; }
+
+    .overview-grid,
+    .side-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .summary {
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0;
+      margin-top: 14px;
+      border-top: 1px solid var(--c-border);
+      border-left: 1px solid var(--c-border);
+    }
+
+    .fact {
+      min-width: 0;
+      padding: 10px;
+      border-right: 1px solid var(--c-border);
+      border-bottom: 1px solid var(--c-border);
+    }
+
+    .fact-value {
+      margin-top: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .mono { font-family: var(--font-mono); }
+
+    pre {
+      overflow: auto;
+      border: 1px solid var(--c-border);
+      background: var(--c-soft);
+      padding: 12px;
+      color: var(--c-text-main);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.55;
+      white-space: pre;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--c-border);
+      padding: 10px 8px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    th {
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    td {
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      gap: 16px;
+    }
+
+    .num-col {
+      width: 42px;
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+    }
+
+    .check-col {
+      width: 38px;
+      text-align: center;
+    }
+
+    .check-box {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border: 1px solid var(--c-border-strong);
+      background: var(--c-canvas);
+      vertical-align: -2px;
+    }
+
+    .criteria-text {
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    .impact-stack,
+    .task-stack {
+      display: grid;
+      gap: 14px;
+    }
+
+    .impact-section,
+    .task-card,
+    .markdown-task {
+      border: 1px solid var(--c-border);
+    }
+
+    .impact-section.is-critical { border-color: var(--c-border-strong); }
+
+    .impact-head,
+    .task-card-head,
+    .markdown-task h3 {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--c-border);
+      background: var(--c-soft);
+    }
+
+    .impact-section.is-critical .impact-head {
+      background: var(--c-ink);
+      color: var(--c-canvas);
+    }
+
+    .impact-title,
+    .task-id {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .impact-badge {
+      border: 1px solid var(--c-border);
+      background: var(--c-canvas);
+      padding: 3px 7px;
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .impact-section.is-critical .impact-badge {
+      border-color: rgba(255,255,255,0.45);
+      background: transparent;
+      color: var(--c-canvas);
+    }
+
+    .impact-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 0.58fr);
+      gap: 14px;
+      padding: 12px;
+    }
+
+    .impact-copy {
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .task-flow {
+      display: grid;
+      grid-template-columns: 38px minmax(0, 1fr);
+      gap: 0 12px;
+    }
+
+    .rail {
+      position: relative;
+      display: flex;
+      justify-content: center;
+    }
+
+    .rail::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: var(--c-border);
+    }
+
+    .rail-dot {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      place-items: center;
+      width: 25px;
+      height: 25px;
+      border: 1px solid var(--c-border-strong);
+      background: var(--c-canvas);
+      color: var(--c-text-sub);
+      font-family: var(--font-mono);
+      font-size: 10px;
+    }
+
+    .task-card { margin-bottom: 14px; }
+    .task-card:last-child { margin-bottom: 0; }
+
+    .task-title {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+
+    .task-card-body { padding: 12px; }
+
+    .task-row {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 12px;
+      padding: 7px 0;
+      border-bottom: 1px solid var(--c-border);
+    }
+
+    .task-row:first-child { padding-top: 0; }
+    .task-row:last-child { padding-bottom: 0; border-bottom: 0; }
+
+    .task-row > div {
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .task-row > .data-label {
+      font-size: 10px;
+      line-height: 1.4;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .chip {
+      max-width: 100%;
+      border: 1px solid var(--c-border);
+      background: var(--c-canvas);
+      padding: 3px 6px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      overflow-wrap: anywhere;
+    }
+
+    .markdown-render {
+      border: 1px solid var(--c-border);
+      background: var(--c-canvas);
+    }
+
+    .markdown-toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      min-height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--c-border);
+      background: var(--c-soft);
+    }
+
+    .markdown-body {
+      max-width: 820px;
+      padding: 20px 22px 24px;
+    }
+
+    .markdown-body h1 {
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--c-border);
+      font-size: 22px;
+      font-weight: 600;
+      line-height: 1.25;
+    }
+
+    .markdown-body h2 {
+      margin-top: 22px;
+      margin-bottom: 9px;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+
+    .markdown-body h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+
+    .markdown-body p,
+    .markdown-body li {
+      color: var(--c-text-main);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .markdown-body ul {
+      display: grid;
+      gap: 6px;
+      margin-left: 18px;
+    }
+
+    .markdown-body code {
+      border: 1px solid var(--c-border);
+      background: var(--c-soft);
+      padding: 1px 4px;
+      font-family: var(--font-mono);
+      font-size: 0.92em;
+    }
+
+    .markdown-task { margin-top: 14px; }
+    .markdown-task-content { display: grid; gap: 8px; padding: 12px; }
+
+    .footer-note {
+      margin-top: 18px;
+      padding-top: 12px;
+      border-top: 1px solid var(--c-border);
+      color: var(--c-text-sub);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 900px) {
+      body { padding: 14px; }
+      .header,
+      .overview-grid,
+      .side-grid,
+      .matrix,
+      .impact-body {
+        grid-template-columns: 1fr;
+      }
+      .badges { justify-content: flex-start; }
+      .summary-strip { padding: 10px 14px; }
+      .tabs { position: static; overflow-x: auto; }
+      .tab-button { flex: 0 0 auto; }
+      .facts { grid-template-columns: 1fr; }
+      .task-row { grid-template-columns: 1fr; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <article class="canvas">
+      <header class="header">
+        <div>
+          <div class="eyebrow">ystack · /build preview</div>
+          <h1 class="title">{{FEATURE_TITLE}}</h1>
+          <p class="subtitle">{{FEATURE_SUMMARY}}</p>
+        </div>
+        <div class="badges">
+          <span class="badge badge-solid">{{APPROVAL_STATE}}</span>
+          <span class="badge">Source: PLAN.md</span>
+          <span class="badge">Disposable HTML</span>
+        </div>
+      </header>
+
+      {{SUMMARY_CHIPS}}
+
+      <div class="content">
+        <div class="tabs" role="tablist" aria-label="Plan preview tabs">
+          <button class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-visual" data-tab="tab-visual">Visual Review</button>
+          <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-decisions" data-tab="tab-decisions">DECISIONS.md</button>
+          <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-plan" data-tab="tab-plan">PLAN.md</button>
+        </div>
+
+        <section class="tab-panel is-active" id="tab-visual" role="tabpanel">
+          {{CONTEXT_SECTION}}
+          {{DECISIONS_AND_CRITERIA_SECTION}}
+          {{IMPACT_SECTIONS}}
+          {{TASKS_SECTION}}
+          {{FOOTER_NOTE}}
+        </section>
+
+        <section class="tab-panel" id="tab-decisions" role="tabpanel" hidden>
+          <div class="markdown-render">
+            <div class="markdown-toolbar">
+              <span class="section-label">Rendered Markdown / DECISIONS.md</span>
+              <span class="badge">generated from markdown</span>
+            </div>
+            <div class="markdown-body">
+              {{DECISIONS_MARKDOWN_HTML}}
+            </div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-plan" role="tabpanel" hidden>
+          <div class="markdown-render">
+            <div class="markdown-toolbar">
+              <span class="section-label">Rendered Markdown / PLAN.md</span>
+              <span class="badge">generated from markdown</span>
+            </div>
+            <div class="markdown-body">
+              {{PLAN_MARKDOWN_HTML}}
+            </div>
+          </div>
+        </section>
+      </div>
+    </article>
+  </main>
+
+  <script>
+    const tabButtons = document.querySelectorAll('[data-tab]');
+    const tabPanels = document.querySelectorAll('.tab-panel');
+
+    tabButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const target = button.dataset.tab;
+
+        tabButtons.forEach((item) => {
+          const isActive = item === button;
+          item.classList.toggle('is-active', isActive);
+          item.setAttribute('aria-selected', String(isActive));
+        });
+
+        tabPanels.forEach((panel) => {
+          const isActive = panel.id === target;
+          panel.classList.toggle('is-active', isActive);
+          panel.hidden = !isActive;
+        });
+      });
+    });
+  </script>
+</body>
+</html>

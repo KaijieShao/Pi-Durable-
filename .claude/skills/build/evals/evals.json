@@ -1,0 +1,41 @@
+{
+  "skill_name": "build",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "build a user authentication feature with email/password login for the auth module",
+      "expected_output": "A PLAN.md in .context/ with success criteria, tasks with dependencies, and documented assumptions/decisions. Should reference the auth module from .ystack/config.json.",
+      "assertions": [
+        "A PLAN.md file is created in a .context/ subdirectory",
+        "The plan includes goal-backward success criteria",
+        "The plan has numbered tasks with clear descriptions",
+        "The plan references the correct module from .ystack/config.json",
+        "Assumptions are surfaced and documented",
+        "The plan does NOT contain any implementation code"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/build add Stripe webhook handling to the payments module",
+      "expected_output": "A PLAN.md scoped to the payments module with tasks covering webhook endpoint, signature verification, and event routing. Should identify dependencies on existing payment code.",
+      "assertions": [
+        "A PLAN.md file is created",
+        "Tasks cover webhook endpoint setup and signature verification",
+        "The plan identifies dependencies on existing payments code",
+        "Success criteria are measurable and verifiable",
+        "The plan includes a DECISIONS.md or decisions section"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I want to build a search feature. Users should be able to search across all docs by keyword.",
+      "expected_output": "A PLAN.md that handles the vague request by asking clarifying questions or making documented assumptions about scope, then produces a structured plan.",
+      "assertions": [
+        "A PLAN.md file is created",
+        "Ambiguity in the request is addressed via assumptions or clarifying questions",
+        "The plan scopes the feature to specific modules",
+        "Tasks have clear ordering and dependencies"
+      ]
+    }
+  ]
+}

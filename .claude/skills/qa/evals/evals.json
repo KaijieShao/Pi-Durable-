@@ -1,0 +1,48 @@
+{
+  "skill_name": "qa",
+  "evals": [
+    {
+      "id": 1,
+      "name": "bare-slash",
+      "prompt": "/qa",
+      "expected_output": "Skill discovers branch state (no PLAN.md), loads project standards, classifies feature type, and either asks user for success criteria or uses the diff as source of truth. Gracefully handles missing pnpm scripts. No real commits or automatic fix loop unless --fix is provided.",
+      "assertions": [
+        "Produced at least one artifact (QA.md, QA-REPORT.md, or a substantive behavior_log.md) — did not silently no-op.",
+        "Loaded project context: behavior_log.md cites reading CLAUDE.md, AGENTS.md, or docs/ to derive standards.",
+        "Ran git log/diff to inspect branch state (referenced in behavior_log).",
+        "On missing PLAN.md, either (a) asked the user for success criteria, or (b) used the diff as source of truth — did NOT invent criteria.",
+        "Gracefully handled absent pnpm scripts — did not claim success or crash on missing commands.",
+        "Did not actually commit to the real branch (simulated_commits.md only, or none).",
+        "Did not enter the bug-fixing loop unless the prompt included --fix or the user explicitly confirmed remediation.",
+        "Classified feature type (Backend / Frontend / Fullstack / Infrastructure) per Phase 0 Step 3."
+      ]
+    },
+    {
+      "id": 2,
+      "name": "url-target",
+      "prompt": "/qa http://localhost:3000",
+      "expected_output": "Skill recognizes the URL, checks Playwright availability, detects the server isn't running, asks the user what to focus on, and does not fabricate a passing report.",
+      "assertions": [
+        "Recognized http://localhost:3000 as a URL argument and did not treat it as a feature id.",
+        "Detected or noted that the server is not running (rather than silently hanging or fabricating a report).",
+        "Asked the user for a focus/scope per the 'Running Without a Feature Context' section of the skill.",
+        "Checked Playwright MCP availability and either used it or stated it's unavailable — did not silently skip browser checks.",
+        "Did not produce a QA-REPORT.md claiming PASSED when no browser testing actually happened.",
+        "Gracefully handled absent pnpm scripts."
+      ]
+    },
+    {
+      "id": 3,
+      "name": "natural-language",
+      "prompt": "test it — I just finished implementing the auth login page",
+      "expected_output": "Skill triggers from natural-language phrase, inspects git, detects that no auth work exists on the branch, surfaces the mismatch to the user, and does not fabricate QA work for a nonexistent feature.",
+      "assertions": [
+        "Triggered from the natural-language phrase 'test it' (behavior_log notes the skill activated).",
+        "Inspected git state and noted the absence of auth-related changes on this branch.",
+        "Detected the mismatch between user claim and branch state and did NOT hallucinate an auth feature.",
+        "Asked the user to clarify (surface the mismatch to the user) rather than fabricating a QA plan for nonexistent work.",
+        "Did not write a QA-REPORT.md marked PASSED for work that was never inspected."
+      ]
+    }
+  ]
+}
