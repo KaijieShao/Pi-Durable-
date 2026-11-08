@@ -13,6 +13,7 @@ import type { Update } from "grammy/types";
 import { admitRun } from "../../src/coordinator/admission.ts";
 import { ConfigError, type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { startCoordinator } from "../../src/coordinator/coordinator.ts";
+import type { WatchdogOptions } from "../../src/coordinator/engine/context.ts";
 import { INTERRUPTED_NOTE } from "../../src/coordinator/engine/review.ts";
 import { createEngine, type Engine } from "../../src/coordinator/engine.ts";
 import { type Git, GitError } from "../../src/coordinator/git.ts";
@@ -35,6 +36,7 @@ import { Store } from "../../src/coordinator/store.ts";
 import type { FromRunner, RunnerStart, ToRunner } from "../../src/runner/protocol.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
 import { sleep, waitFor } from "../helpers/env.ts";
+import { sandboxReaper, startTestWatchdog, verifiedWatchdog } from "../helpers/watchdog.ts";
 
 const CHAT = -1001;
 const OWNER = 42;
@@ -475,6 +477,10 @@ function testConfig(dir: string): CoordinatorConfig {
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
+/** Not about the watchdog unless a test passes one: every sweep is verified at once, the heartbeat always fresh. */
+const watchdogOf = (options: { readonly watchdog?: WatchdogOptions }): WatchdogOptions =>
+	options.watchdog ?? verifiedWatchdog();
+
 async function harness(
 	t: TestContext,
 	options: {
@@ -487,6 +493,8 @@ async function harness(
 		now?: () => number;
 		/** Wraps the local sandbox (e.g. to report a leftover container). */
 		sandbox?: (sandbox: Sandbox) => Sandbox;
+		/** The watchdog link and timings (default: every sweep verified at once, the heartbeat always fresh). */
+		watchdog?: WatchdogOptions;
 	} = {},
 ) {
 	const dir = options.dir ?? (await mkdtemp(join(tmpdir(), "engine-test-")));
@@ -525,9 +533,14 @@ async function harness(
 		log: silentLogger,
 		retryDelayMs: 5,
 		freeBytes: async () => 1e12,
+		// Not about the watchdog: every sweep is verified at once (its own tests: test/watchdog/, test/e2e/watchdog).
+		watchdog: watchdogOf(options),
 		...(options.now === undefined ? {} : { now: options.now }),
 	});
 	engine.setRelayUrl("http://127.0.0.1:9/v1");
+	// A fresh store: the Coordinator's startup recovery (nothing to recover) opens the watchdog gate, as at startup.
+	// A restart test's second engine runs recover() itself, at the point it is testing.
+	if (options.store === undefined) await engine.recover();
 	if (options.store === undefined) {
 		t.after(async () => {
 			await engine.stop();
@@ -1208,6 +1221,43 @@ test("the run deadline fails the task, closes nothing it lacks and archives the 
 	assert.equal(h.fake.runs[0]?.keyStateAtAbort, "closed");
 	assert.equal(slotCount(h), 0);
 	assert.match(messages(h, "task_final")[0]?.text ?? "", /failed: 300 ms run deadline\. Branch task\/\d+ kept\./);
+});
+
+test("restart recovery: the interrupted task's review step (a check container) waits for a fresh watchdog heartbeat, like dispatch", async (t) => {
+	const h1 = await harness(t);
+	h1.fake.control.script = holdScript();
+	const taskId = submitTask(h1, "alpha", "original task text");
+	h1.engine.kick();
+	await waitFor(() => h1.fake.runs[0]?.received.some((m) => m.type === "tool_result"), { what: "tool result" });
+	await h1.engine.stop();
+	const queuedOther = submitTask(h1, "beta", "queued elsewhere");
+
+	// The restart sweep is verified, then the watchdog dies: its heartbeat is stale.
+	const verified = verifiedWatchdog();
+	let heartbeatAgeMs = verified.heartbeatMaxAgeMs + 1;
+	const watchdog: WatchdogOptions = { ...verified, link: { ...verified.link, heartbeatAgeMs: () => heartbeatAgeMs } };
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, watchdog });
+	h2.fake.control.script = workScript("src/other.js", "export const other = true;\n");
+	await h2.engine.recover();
+	assert.deepEqual(verified.requests, ["coordinator_start"]);
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(runsOf(h2, taskId)[0]?.state, "failed", "step 3 ran: the run is failed as interrupted");
+	assert.notEqual(taskRow(h2, taskId).state, "review", "the review step has not run");
+	assert.equal(h2.world.remote.get(`task/${taskId}`), undefined, "nothing tested, committed or pushed");
+	assert.equal(h2.fake.runs.length, 0, "nothing dispatched either");
+	assert.equal(messages(h2, "watchdog_unavailable").length, 1, "the group is told execution is paused");
+
+	heartbeatAgeMs = 0;
+	h2.engine.kick();
+	await waitFor(() => taskRow(h2, taskId).state === "review", { what: "the review step once the watchdog is back" });
+	await h2.engine.idle();
+	assert.equal(h2.world.files(h2.world.remote.get(`task/${taskId}`) as string).get("wip.txt"), "work in progress\n");
+	assert.deepEqual(
+		h2.fake.runs.map((run) => run.start.taskId),
+		[queuedOther],
+	);
+	assert.equal(messages(h2, "watchdog_unavailable").length, 1, "told once");
 });
 
 test("restart recovery: running run failed as interrupted, conversation quarantined, steer expired; no resume; a follow-up starts a fresh conversation", async (t) => {
@@ -1931,17 +1981,25 @@ test("startCoordinator wires recovery, relay, poller, engine and outbox; /task f
 	const telegram = fakeTelegram();
 	const fake = createFakeLauncher(() => {});
 	const limits: Limits = { ...DEMO_LIMITS, stopGraceMs: 300, checkDeadlineMs: 3000, minFreeDiskBytes: 0 };
+	const sandbox = createLocalSandbox({ taskDir: config.paths.taskDir });
 	const deps = {
 		telegram: telegram.api,
 		github: world.github,
 		git: world.git,
-		sandbox: createLocalSandbox({ taskDir: config.paths.taskDir }),
+		sandbox,
 		launcher: fake.launcher,
 		limits,
 		log: silentLogger,
 		pollTimeoutSeconds: 1,
 		retryDelayMs: 5,
 	};
+	// The real watchdog core, in process: recovery waits for its verified sweep before anything is dispatched.
+	const watchdog = startTestWatchdog({
+		dataDir: config.paths.dataDir,
+		chatId: CHAT,
+		containers: sandboxReaper(sandbox),
+	});
+	t.after(() => watchdog.stop());
 	const coordinator = await startCoordinator(config, deps);
 	let stopped = false;
 	t.after(async () => {

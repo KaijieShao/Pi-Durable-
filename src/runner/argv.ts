@@ -98,3 +98,26 @@ export function markedRunId(command: string, deployment: string): number | undef
 	const [only] = runs;
 	return runs.length === 1 && only !== undefined && RUN_ID.test(only) ? Number(only) : undefined;
 }
+
+/** The runner's entry in a Pi process's command line (src or dist). */
+export const RUNNER_ENTRY = /runner[/\\]main\.(ts|js)\b/;
+
+/**
+ * The Pi processes of `deployment` in a `ps -A -ww -o pid=,command=` listing: the runner's entry and this deployment's
+ * marker with one run marker, never `selfPid`. Shared by the launcher's restart cleanup and the watchdog.
+ */
+export function markedProcesses(
+	listing: string,
+	deployment: string,
+	selfPid: number,
+): { readonly pid: number; readonly runId: number }[] {
+	const found: { pid: number; runId: number }[] = [];
+	for (const line of listing.split("\n")) {
+		const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+		const pid = Number(match?.[1]);
+		const command = match?.[2] ?? "";
+		const runId = RUNNER_ENTRY.test(command) ? markedRunId(command, deployment) : undefined;
+		if (runId !== undefined && pid !== selfPid && pid > 1) found.push({ pid, runId });
+	}
+	return found;
+}

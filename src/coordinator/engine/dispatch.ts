@@ -62,7 +62,13 @@ function reserve(ctx: Ctx, c: Candidate, now: number): Reservation {
 	);
 	const generation =
 		ctx.store.get<{ generation: number }>("SELECT generation FROM tasks WHERE id = ?", c.task_id)?.generation ?? 0;
-	ctx.store.run("UPDATE runs SET state = 'starting', generation = ? WHERE id = ?", generation, c.run_id);
+	// dispatched_at: the watchdog's deadline clock for a run that is still starting (src/watchdog/watchdog.ts).
+	ctx.store.run(
+		"UPDATE runs SET state = 'starting', generation = ?, dispatched_at = ? WHERE id = ?",
+		generation,
+		now,
+		c.run_id,
+	);
 	return { runId: c.run_id, taskId: c.task_id, chatId: c.chat_id, agentId: c.agent_id, generation, slotId };
 }
 

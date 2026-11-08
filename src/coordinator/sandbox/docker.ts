@@ -18,8 +18,8 @@
  * Deviation from the design text: the agent container is started with --rm (it disappears by itself when its
  * lifetime ends); the check container is not, so its exit state (OOMKilled) can be read before it is removed.
  * STUB(spec: agent-execution.md § Containers, Evaluator column): no evaluator container (sealing is not built).
- * STUB(spec: deployment.md § Processes, watchdog unit): no separate watchdog; containers end by themselves (agent:
- * `sleep <lifetime>`; check: the launcher's own deadline) and recovery removes every labelled container.
+ * Containers also end by themselves (agent: `sleep <lifetime>`; check: the launcher's own deadline); recovery and the
+ * watchdog (src/watchdog/reapers.ts, by the pi-durable.managed label) remove every labelled container.
  */
 import { spawn } from "node:child_process";
 import { lstat, realpath, stat } from "node:fs/promises";

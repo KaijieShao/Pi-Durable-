@@ -40,7 +40,7 @@ async function tempDir(): Promise<{ dir: string; cleanup(): Promise<void> }> {
 	return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
-test("argv: run, owner status|unfreeze|failed-events, help, version; login is gone", () => {
+test("argv: run, watchdog, owner status|unfreeze|failed-events, help, version; login is gone", () => {
 	assert.deepEqual(parseArgs([]), { command: "help" });
 	assert.deepEqual(parseArgs(["--help"]), { command: "help" });
 	assert.deepEqual(parseArgs(["run", "-h"]), { command: "help" });
@@ -48,6 +48,8 @@ test("argv: run, owner status|unfreeze|failed-events, help, version; login is go
 	assert.deepEqual(parseArgs(["run"]), { command: "run" });
 	assert.deepEqual(parseArgs(["run", "--env-file", "/e"]), { command: "run", envFile: "/e" });
 	assert.deepEqual(parseArgs(["--env-file=/e", "run"]), { command: "run", envFile: "/e" });
+	assert.deepEqual(parseArgs(["watchdog"]), { command: "watchdog" });
+	assert.deepEqual(parseArgs(["watchdog", "--env-file", "/w.env"]), { command: "watchdog", envFile: "/w.env" });
 	assert.deepEqual(parseArgs(["owner", "status"]), { command: "owner", action: "status" });
 	assert.deepEqual(parseArgs(["owner", "unfreeze", "--env-file", ".env.local"]), {
 		command: "owner",
@@ -65,6 +67,7 @@ test("argv: run, owner status|unfreeze|failed-events, help, version; login is go
 		["owner", "freeze"],
 		["owner", "status", "extra"],
 		["run", "now"],
+		["watchdog", "now"],
 		["run", "--env-file"],
 		["run", "--env-file="],
 		["run", "--debug"],
@@ -73,6 +76,7 @@ test("argv: run, owner status|unfreeze|failed-events, help, version; login is go
 		assert.equal(parseArgs(argv).command, "invalid", argv.join(" "));
 	}
 	assert.match(USAGE, /owner status/);
+	assert.match(USAGE, /watchdog \[--env-file <path>\]/);
 	assert.doesNotMatch(USAGE, /login/);
 });
 
@@ -285,6 +289,51 @@ test("owner status, unfreeze and failed-events read and change the Coordinator d
 		store.run("UPDATE groups SET state = 'sealing', recheck_required = 0 WHERE chat_id = ?", GROUP);
 		assert.equal(ownerUnfreeze(store, GROUP).ok, false);
 		assert.equal(store.groupState(GROUP).state, "sealing");
+	} finally {
+		store.close();
+		await cleanup();
+	}
+});
+
+test("owner status shows the watchdog's heartbeat age and its last sweep", async () => {
+	const { dir, cleanup } = await tempDir();
+	const store = new Store(join(dir, COORDINATOR_DB));
+	try {
+		const before = ownerStatus(store, GROUP);
+		assert.match(before, /\nWatchdog: no heartbeat yet \(is it running\? no run is dispatched without it\)\n/);
+		assert.match(before, /\nLast watchdog sweep: none\nPending sweep requests: 0/);
+		const now = Date.now();
+		store.tx(() => {
+			store.setMeta("watchdog_heartbeat_at", String(now - 2_000));
+			store.setMeta("watchdog_pid", "4321");
+			store.run(
+				`INSERT INTO watchdog_sweeps(reason, state, requester_pid, verified, processes_killed, containers_killed,
+				   processes_left, containers_left, requested_at, finished_at)
+				 VALUES ('coordinator_start', 'done', 77, 1, 1, 2, 0, 0, ?, ?)`,
+				now,
+				now,
+			);
+			store.run(
+				`INSERT INTO watchdog_sweeps(reason, state, run_id, task_id, generation, verified, processes_killed,
+				   containers_killed, processes_left, containers_left, detail, requested_at, finished_at)
+				 VALUES ('deadline', 'done', 5, 3, 2, 0, 1, 0, 1, 0, 'processes_left', ?, ?)`,
+				now,
+				now,
+			);
+			store.run("INSERT INTO watchdog_sweeps(reason, state, requested_at) VALUES ('recheck', 'pending', ?)", now);
+		});
+		const status = ownerStatus(store, GROUP);
+		assert.match(status, /\nWatchdog: last heartbeat 2 s ago \(pid 4321\)\n/);
+		assert.match(
+			status,
+			/\nLast watchdog sweep: #2 deadline run 5 \(task 3, generation 2\): NOT verified \(processes_left\); killed 1 Pi processes and 0 containers at \d{4}-/,
+		);
+		assert.match(status, /\nPending sweep requests: 1/);
+		store.tx(() => store.setMeta("watchdog_heartbeat_at", String(now - 60_000)));
+		assert.match(
+			ownerStatus(store, GROUP),
+			/last heartbeat 60 s ago \(pid 4321\); stale: no new run starts until it is back/,
+		);
 	} finally {
 		store.close();
 		await cleanup();

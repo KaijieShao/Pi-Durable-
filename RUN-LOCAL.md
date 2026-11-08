@@ -3,9 +3,10 @@
 This page starts the Coordinator on a Mac against the real Telegram group (Smule Dev, bot `@smule_code_bot`), a real
 GitHub test repository and a real model, for the smoke and acceptance tests in [spec/build-plan.md](spec/build-plan.md)
 (items 7, 10 and 11). What runs: one Coordinator process (Telegram polling, relay, outbox, git and GitHub), one Pi
-process per run (as your own user on a Mac: the weaker local mode, see [docs/isolation.md](docs/isolation.md)), and
-Docker containers with no network for file operations and checks. What does not exist yet is listed in
-[README.md](README.md#not-built-yet).
+process per run (as your own user on a Mac: the weaker local mode, see [docs/isolation.md](docs/isolation.md)),
+Docker containers with no network for file operations and checks, and the **watchdog**, a second process that is the
+independent stop path (it kills leftover Pi processes and containers and verifies they are gone, and enforces each
+run's deadline). What does not exist yet is listed in [README.md](README.md#not-built-yet).
 
 **Before you start:** stop every other process that polls with the same bot token, in particular the old bot started
 by Conductor's **Bot** run action (see [Conductor](#conductor)). Telegram allows one `getUpdates` poller per token.
@@ -129,11 +130,38 @@ configuration file; if you run from there, use another ignored name such as `.en
 
 ## 6. Start
 
-Run from the sources (Node 22 strips the TypeScript types; nothing to build, and `dist/` stays untouched):
+Run from the sources (Node 22 strips the TypeScript types; nothing to build, and `dist/` stays untouched).
+
+**First the watchdog, in its own terminal**, and leave it running:
+
+```sh
+node src/cli/main.ts watchdog --env-file .env.local
+```
+
+It reads only `PI_DATA_DIR`, `TELEGRAM_GROUP_CHAT_ID`, `DOCKER_BIN`, `PI_RUNNER_ISOLATION`, `PI_RUNNER_SLICE`,
+`SYSTEMCTL_BIN` and `LOG_LEVEL` from the file; every other line, the tokens and the model key included, is dropped
+before it is parsed, and it needs none of them (a file with only `PI_DATA_DIR` and `TELEGRAM_GROUP_CHAT_ID` works
+too). Its log shows `watchdog_started`, and `watchdog_waiting_for_database` until the Coordinator has started once.
+On the Mac it finds the Pi processes by their command-line markers and the containers by their
+`pi-durable.managed=1` label (on the Docker daemon you configured: it removes every such container there whenever the
+Coordinator restarts or is gone, so do not run another deployment or the Docker test suites against the same daemon
+while it runs). Run one watchdog per data directory: a second one only logs `watchdog_standby` and waits until the
+first one is gone.
+
+**Then the Coordinator, in a second terminal:**
 
 ```sh
 node src/cli/main.ts run --env-file .env.local
 ```
+
+At every start the Coordinator asks the watchdog to kill and verify every leftover Pi process and labelled container,
+and dispatches nothing until the watchdog has answered "verified" (the log shows `watchdog_sweep_answered
+verified=true`). **If the watchdog is not running**, the Coordinator waits 30 seconds for it, then starts anyway in a
+paused state: commands are still saved, acknowledged and queued, `/status` works, but no task starts, and the group
+gets one message: "Task execution is paused: the watchdog (the independent stop path) is not answering, so no run
+starts." Start the watchdog then and the queued tasks start by themselves, no restart needed. If the watchdog stops
+while the Coordinator runs, runs in progress go on but no new one starts once its heartbeat is older than 15
+seconds (the group is told once); start it again to resume.
 
 Or from a build: `npm run build && node dist/cli/main.js run --env-file .env.local`. Building replaces `dist/`, which
 the old Conductor actions use; prefer the source form locally.
@@ -148,6 +176,9 @@ tokens or URLs with secrets):
 - the container check (Docker and both images available; otherwise task dispatch is disabled and the reason is
   logged), the git fetch of `main`, restart recovery, the relay on `127.0.0.1`, and polling started;
 - `info coordinator_running group=-100… agents=2`.
+
+The watchdog's terminal shows `info watchdog_database_open`, then for this start `info watchdog_sweep request=…
+reason=coordinator_start verified=true processes_killed=0 containers_killed=0`.
 
 A Node `ExperimentalWarning` about SQLite is expected. Exit codes: 2 = configuration problem or a rejected bot token
 (each problem is printed, never a value), 3 = the data directory is locked by another running Coordinator, 1 = any
@@ -215,7 +246,8 @@ How to check:
 
 ## Stop
 
-Press **Ctrl-C** (SIGINT; SIGTERM does the same). The Coordinator logs `shutdown reason=SIGINT`, stops polling and
+Stop the Coordinator first, then the watchdog. Press **Ctrl-C** in the Coordinator's terminal (SIGINT; SIGTERM does
+the same). The Coordinator logs `shutdown reason=SIGINT`, stops polling and
 dispatch, stops running runs and their containers, and closes the relay, the database and its lock. A run stopped
 this way is **not** resumed: on the next start it is marked "interrupted by restart", its work is checkpointed and
 pushed, and the task waits in review until someone replies (a fresh conversation). A run still starting (its run key
@@ -223,6 +255,11 @@ not opened and its Pi process not launched yet) is queued again instead, in the 
 first run's worktree is kept only if its setup finished and nothing changed it, otherwise it is recreated from the
 latest main. After 3 such returns the next restart fails the task. A second Ctrl-C exits at once; a shutdown that
 takes longer than 30 seconds exits with code 1.
+
+While the watchdog still runs, it notices that no Coordinator holds the data directory's lock any more and removes
+whatever is left (log: `watchdog_coordinator_gone`, then `watchdog_sweep reason=coordinator_dead …`); the same
+happens after a crash or `kill -9` of the Coordinator, within a few seconds. Then press Ctrl-C in the watchdog's
+terminal too.
 
 Check that nothing is left behind:
 
@@ -237,15 +274,20 @@ Run with the same env file, in a second terminal while the Coordinator runs or w
 Coordinator's SQLite database directly; the owner socket from the docs is not built yet):
 
 ```sh
-node src/cli/main.ts owner status --env-file .env.local          # group state, execution slots, tasks and PRs
+node src/cli/main.ts owner status --env-file .env.local          # group state, slots, the watchdog, tasks and PRs
 node src/cli/main.ts owner failed-events --env-file .env.local   # Telegram messages that could not be delivered
 node src/cli/main.ts owner unfreeze --env-file .env.local        # frozen group back to normal, recovery rechecked
 ```
 
-A group **freezes** when the Coordinator cannot confirm a stop or the outcome of a GitHub change. Resolve the cause
+`owner status` also shows the watchdog: its last heartbeat ("stale" when older than 15 s: no new run starts), its
+last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it.
+
+A group **freezes** when the Coordinator or the watchdog cannot confirm a stop, or the Coordinator the outcome of a
+GitHub change. Resolve the cause
 first (no leftover containers or Pi processes, see above; GitHub branch and pull request state as expected), then
-unfreeze. Unfreezing sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery checks
-before it dispatches queued work again. Nothing that was cancelled resumes.
+unfreeze. Unfreezing sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery checks,
+including a new watchdog sweep (`reason=recheck`), before it dispatches queued work again. Nothing that was cancelled
+resumes.
 
 ## Where the data lives
 
@@ -256,11 +298,14 @@ before it dispatches queued work again. Nothing that was cancelled resumes.
 - `PI_TASK_DIR` (default `<PI_DATA_DIR>/tasks`): `repo.git` (the Coordinator's clone), `worktrees/task-<id>` (one per
   open task; deleted when the task is archived, the branch stays on GitHub), `scratch/` (check scratch space, wiped
   after each check).
-- Logs: stdout and stderr of the Coordinator only.
+- `coordinator.sqlite` is shared with the watchdog (its own connection): sweep requests and answers
+  (`watchdog_sweeps`) and its heartbeat. The watchdog creates nothing in `PI_DATA_DIR`.
+- Logs: stdout and stderr of the Coordinator and of the watchdog.
 
 ## Reset a local test
 
-1. Stop the Coordinator (Ctrl-C) and check nothing is left behind (see [Stop](#stop)); remove leftovers with
+1. Stop the Coordinator (Ctrl-C), let the watchdog clean up, stop the watchdog, and check nothing is left behind
+   (see [Stop](#stop)); remove leftovers with
    `docker rm -f $(docker ps -aq --filter label=pi-durable.managed=1)`.
 2. Delete the data and task folders: `rm -rf ~/.local/state/pi-durable-coordinator` (or your `PI_DATA_DIR` and
    `PI_TASK_DIR`).

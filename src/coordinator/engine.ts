@@ -6,8 +6,9 @@
  * The engine reads the Coordinator SQLite store: commands.ts records commands (tasks, follow-ups, cancels,
  * approvals) and kicks the engine, which then acts. Every engine write is one synchronous `store.tx()`; network,
  * git, container and IPC work happens outside transactions. A tick (on kick, every second, and after each piece of
- * work) runs, in order: frozen-group cancels, the post-unfreeze recheck, recovery jobs, cancels, steers, review
- * reminders, the merge worker, and dispatch.
+ * work) runs, in order: frozen-group cancels, the post-unfreeze recheck, the watchdog's late answer, recovery jobs,
+ * cancels, steers, review reminders, the merge worker, and dispatch. Recovery jobs, merges and dispatch wait for
+ * this Coordinator's verified watchdog sweep and a fresh watchdog heartbeat (engine/watchdog.ts).
  */
 
 import type { Logger } from "../runtime/log.ts";
@@ -37,6 +38,7 @@ import {
 	runLifecycle,
 	sendPendingSteers,
 } from "./engine/runs.ts";
+import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
 import { rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
 import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
@@ -56,7 +58,10 @@ export type Engine = {
 	onCapReached(runId: number): void;
 	/** Look at the store now (after a command was saved). */
 	kick(): void;
-	/** Restart recovery steps 1–3; call before the relay, the poller and start(). */
+	/**
+	 * Restart recovery steps 1–3, step 2 with the watchdog's sweep (it waits for the answer, bounded); call before the
+	 * relay, the poller and start().
+	 */
 	recover(): Promise<void>;
 	/** Periodic ticks (dispatch every second, reminders every minute). */
 	start(): void;
@@ -188,7 +193,7 @@ function maybeRecheck(ctx: Ctx, state: EngineState, group: GroupState): boolean 
 }
 
 async function recheck(ctx: Ctx, state: EngineState): Promise<void> {
-	const jobs = await reconcile(ctx);
+	const jobs = await reconcile(ctx, "recheck");
 	addRecoveryJobs(ctx, state, jobs);
 	tx(ctx, () => {
 		ctx.store.run(
@@ -212,7 +217,8 @@ function addRecoveryJobs(ctx: Ctx, state: EngineState, jobs: readonly RecoveryJo
 
 function maybeRecoveryJobs(ctx: Ctx, state: EngineState, group: GroupState): boolean {
 	if (state.recoveryJobs.length === 0 || state.recoveryRunning || state.recheckRunning) return false;
-	if (group.state === "frozen" || group.recheck) return false;
+	// Their checks run in containers: like merges and dispatch, they wait for the watchdog (verified, heartbeat fresh).
+	if (group.state === "frozen" || group.recheck || !watchdogReady(ctx)) return false;
 	return flagged(ctx, state, "recoveryRunning", undefined, () => runRecoveryJobs(ctx, state));
 }
 
@@ -360,13 +366,14 @@ function tickOnce(ctx: Ctx, state: EngineState): boolean {
 	const did = [
 		cancelFrozenRuns(ctx, state, group),
 		maybeRecheck(ctx, state, group),
+		pollWatchdog(ctx),
 		maybeRecoveryJobs(ctx, state, group),
 		processCancels(ctx),
 	];
 	sendPendingSteers(ctx);
 	reminders(ctx, state);
-	// Merges first: a merge waiting for a check slot gets the next free one before new runs.
-	if (dispatchOpen(ctx, state)) did.push(maybeMerge(ctx, state), dispatchAll(ctx, state));
+	// Merges first: a merge waiting for a check slot gets the next free one before new runs. Both need the watchdog.
+	if (dispatchOpen(ctx, state) && watchdogReady(ctx)) did.push(maybeMerge(ctx, state), dispatchAll(ctx, state));
 	return did.some(Boolean);
 }
 
@@ -455,6 +462,8 @@ export function createEngine(options: EngineOptions): Engine {
 		retryDelayMs: options.retryDelayMs ?? 1000,
 		freeBytes: options.freeBytes ?? defaultFreeBytes,
 		onOutbox: options.onOutbox ?? (() => {}),
+		watchdog: options.watchdog,
+		watchdogGate: newWatchdogGate(),
 		stopped: false,
 		relayUrl: undefined,
 		active: new Map<number, ActiveRun>(),
@@ -490,7 +499,7 @@ export function createEngine(options: EngineOptions): Engine {
 		},
 		kick,
 		async recover(): Promise<void> {
-			addRecoveryJobs(ctx, state, await reconcile(ctx));
+			addRecoveryJobs(ctx, state, await reconcile(ctx, "coordinator_start"));
 		},
 		start(): void {
 			if (state.interval !== undefined || ctx.stopped) return;

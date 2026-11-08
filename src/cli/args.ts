@@ -4,12 +4,16 @@ export const OWNER_ACTIONS: readonly OwnerAction[] = ["status", "unfreeze", "fai
 
 export type CliArgs =
 	| { readonly command: "run"; readonly envFile?: string }
+	| { readonly command: "watchdog"; readonly envFile?: string }
 	| { readonly command: "owner"; readonly action: OwnerAction; readonly envFile?: string }
 	| { readonly command: "help" }
 	| { readonly command: "version" }
 	| { readonly command: "invalid"; readonly message: string };
 
-/** Parse `run [--env-file p]`, `owner status|unfreeze|failed-events [--env-file p]`, `--help`, `--version`. */
+/**
+ * Parse `run [--env-file p]`, `watchdog [--env-file p]`, `owner status|unfreeze|failed-events [--env-file p]`,
+ * `--help`, `--version`.
+ */
 export function parseArgs(argv: readonly string[]): CliArgs {
 	const rest = [...argv];
 	if (rest.length === 0 || rest.includes("--help") || rest.includes("-h")) return { command: "help" };
@@ -24,6 +28,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 function parseCommand(rest: readonly string[], withFile: { envFile?: string }): CliArgs {
 	const [command, ...positional] = rest;
 	if (command === "run" && positional.length === 0) return { command: "run", ...withFile };
+	if (command === "watchdog" && positional.length === 0) return { command: "watchdog", ...withFile };
 	if (command === "owner") {
 		const action = OWNER_ACTIONS.find((each) => each === positional[0]);
 		if (action !== undefined && positional.length === 1) return { command: "owner", action, ...withFile };
@@ -50,6 +55,7 @@ export const USAGE = `pi-durable-telegram: a multi-user Telegram group Coordinat
 
 Usage:
   pi-durable-telegram run [--env-file <path>]                    run the Coordinator (long polling)
+  pi-durable-telegram watchdog [--env-file <path>]               run the watchdog (start it before the Coordinator)
   pi-durable-telegram owner status [--env-file <path>]           group state, tasks and execution slots
   pi-durable-telegram owner unfreeze [--env-file <path>]         unfreeze the group after you resolved the cause
   pi-durable-telegram owner failed-events [--env-file <path>]    Telegram messages that could not be delivered

@@ -2,8 +2,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DEMO_LIMITS } from "../coordinator/limits.ts";
 import { Store } from "../coordinator/store.ts";
+import { createStoreWatchdogLink, WATCHDOG_HEARTBEAT_MAX_AGE_MS } from "../coordinator/watchdog-link.ts";
 import { errorSummary } from "../runtime/log.ts";
 import { redact } from "../runtime/redact.ts";
+import { type SweepRow, WATCHDOG_PID_KEY } from "../watchdog/protocol.ts";
 import type { OwnerAction } from "./args.ts";
 import { readConfig } from "./run.ts";
 
@@ -71,7 +73,7 @@ const RECENT_TERMINAL = 10;
 
 /** Group state, execution slots, open tasks and the most recent finished ones. Metadata only: no task text. */
 export function ownerStatus(store: Store, chatId: number): string {
-	const lines = [groupLine(store, chatId), ...slotLines(store)];
+	const lines = [groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
 	const queued = store.get<Count>("SELECT COUNT(*) AS n FROM runs WHERE state = 'queued'")?.n ?? 0;
 	lines.push(`Queued runs: ${queued}`);
 	const open = store.all<TaskRow>(
@@ -108,6 +110,35 @@ function slotLines(store: Store): string[] {
 			return `  ${slot.kind} task ${slot.task_id}${run}${agent} since ${new Date(slot.acquired_at).toISOString()}`;
 		}),
 	];
+}
+
+/** The watchdog's heartbeat age and pid, its last sweep, and how many requests wait for it. */
+export function watchdogLines(store: Store): string[] {
+	const age = createStoreWatchdogLink(store).heartbeatAgeMs();
+	const pid = store.getMeta(WATCHDOG_PID_KEY);
+	const heartbeat =
+		age === undefined
+			? "Watchdog: no heartbeat yet (is it running? no run is dispatched without it)"
+			: `Watchdog: last heartbeat ${Math.round(age / 1000)} s ago${pid === undefined ? "" : ` (pid ${pid})`}${
+					age > WATCHDOG_HEARTBEAT_MAX_AGE_MS ? "; stale: no new run starts until it is back" : ""
+				}`;
+	const last = store.get<SweepRow>("SELECT * FROM watchdog_sweeps WHERE state = 'done' ORDER BY id DESC LIMIT 1");
+	const pending = store.get<Count>("SELECT COUNT(*) AS n FROM watchdog_sweeps WHERE state = 'pending'")?.n ?? 0;
+	return [
+		heartbeat,
+		last === undefined ? "Last watchdog sweep: none" : sweepLine(last),
+		`Pending sweep requests: ${pending}`,
+	];
+}
+
+function sweepLine(row: SweepRow): string {
+	const scope = row.run_id === null ? "" : ` run ${row.run_id} (task ${row.task_id}, generation ${row.generation})`;
+	const outcome = row.verified === 1 ? "verified" : `NOT verified (${row.detail ?? "unknown"})`;
+	const at = row.finished_at === null ? "" : ` at ${new Date(row.finished_at).toISOString()}`;
+	return (
+		`Last watchdog sweep: #${row.id} ${row.reason}${scope}: ${outcome}; killed ${row.processes_killed ?? 0} ` +
+		`Pi processes and ${row.containers_killed ?? 0} containers${at}`
+	);
 }
 
 function taskLine(task: TaskRow): string {
@@ -154,8 +185,9 @@ export function ownerUnfreeze(store: Store, chatId: number): OwnerResult {
 			text: [
 				`Group ${chatId} unfrozen${reason}.`,
 				"Set state=normal and recheck_required=1: the Coordinator repeats recovery steps 1-4 (close run keys,",
-				"verify no leftover Pi processes or containers, reconcile GitHub effects, restore the relay) before it",
-				"dispatches queued work again. Tasks cancelled by the freeze stay cancelled; nothing resumes on its own.",
+				"the watchdog's sweep of leftover Pi processes and containers, reconcile GitHub effects, restore the relay)",
+				"before it dispatches queued work again (not before the watchdog answers). Tasks cancelled by the freeze",
+				"stay cancelled; nothing resumes on its own.",
 			].join("\n"),
 		};
 	});

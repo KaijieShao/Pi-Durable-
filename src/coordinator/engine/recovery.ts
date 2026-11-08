@@ -3,8 +3,12 @@
  * Coordinator restart"), before polling or dispatch, and again after the owner unfreezes a group (recheck):
  *
  *   1. Revoke all generations and close all run keys.
- *   2. Kill leftover Pi processes (those of the runs in progress, then every other one of this deployment) and every
- *      managed container; verify they are gone, else freeze.
+ *   2. The watchdog kills leftover processes and containers and verifies they're gone: the Coordinator first kills
+ *      what it can itself (defense in depth: the Pi processes of the runs in progress, then every other one of this
+ *      deployment, and every managed container, verified), then asks the watchdog, the separate unit, for a sweep of
+ *      everything in the slice and every labelled container and waits for its answer (engine/watchdog.ts). Either
+ *      one unverified → freeze. No answer → the watchdog is unavailable: recovery goes on, but nothing is dispatched
+ *      until it answers (fails closed).
  *   3. Reconcile: runs in progress → failed "interrupted by restart" (never resubmitted), their conversations
  *      quarantined, their pending follow-ups expired "(interrupted)"; uncertain budget reservations kept as
  *      unknown; saved merge intents checked against GitHub (main already contains the head → merged, no second
@@ -19,6 +23,8 @@
  *      for this, so nothing of such a run is pushed). Follow-up and conflict runs keep their worktree.
  *   (4. relay and 5. dispatch are opened by the caller.)
  */
+
+import { UNVERIFIED_SWEEP } from "../../watchdog/protocol.ts";
 import { agentQueuePosition } from "../admission.ts";
 import { requeuedAfterRestart, sha7 } from "../messages.ts";
 import type { RunnerRef } from "../ports.ts";
@@ -46,6 +52,7 @@ import { archiveTask, effectFailed, ghRead, terminalText } from "./effects.ts";
 import { expireFollowup, expireFollowups } from "./finalize.ts";
 import { closeAllRunKeys } from "./keys.ts";
 import { reviewStep } from "./review.ts";
+import { watchdogSweep } from "./watchdog.ts";
 
 export const INTERRUPTED_REASON = "interrupted by restart";
 
@@ -310,18 +317,21 @@ function reconcileDatabase(ctx: Ctx, verified: boolean, jobs: RecoveryJob[]): { 
 	});
 }
 
-/** Steps 1–3. Returns the review/archive jobs to run before dispatch reopens. */
-export async function reconcile(ctx: Ctx): Promise<RecoveryJob[]> {
+/**
+ * Steps 1–3 (`reason`: the start of this Coordinator, or the recheck after an unfreeze). Returns the review/archive
+ * jobs to run before dispatch reopens.
+ */
+export async function reconcile(ctx: Ctx, reason: "coordinator_start" | "recheck"): Promise<RecoveryJob[]> {
 	// 1. Revoke every generation.
 	const closed = tx(ctx, () => closeAllRunKeys(ctx.store, ctx.now()));
-	// 2. Kill leftovers and verify they are gone.
-	// STUB(spec: deployment.md § Processes "On any Coordinator restart, the watchdog..."): no separate watchdog unit;
-	// the Coordinator itself kills the Pi processes of the runs in progress (their systemd unit, or their recorded pid
-	// carrying this deployment's and run's markers), then every other Pi process of this deployment (its units in the
-	// slice, or its marked processes), and every labelled container, and verifies they are gone.
+	// 2. Kill leftovers and verify they are gone: the Coordinator's own kills (the Pi processes of the runs in progress
+	// by their systemd unit or their recorded pid with this deployment's and run's markers, then every other Pi process
+	// of this deployment, and every labelled container), then the watchdog's sweep, which gates admission.
 	const runners = await killRunners(ctx);
 	const containers = await killContainers(ctx);
-	const stopProblem = runners.ok ? containers : "leftover Pi processes could not be verified stopped";
+	const ownProblem = runners.ok ? containers : "leftover Pi processes could not be verified stopped";
+	const sweep = await watchdogSweep(ctx, reason);
+	const stopProblem = ownProblem ?? (sweep === "unverified" ? UNVERIFIED_SWEEP : undefined);
 	if (stopProblem !== undefined) freezeGroup(ctx, stopProblem);
 	// 3. Reconcile the database, then saved merge intents against GitHub (never merge twice).
 	const jobs: RecoveryJob[] = [];
@@ -337,6 +347,7 @@ export async function reconcile(ctx: Ctx): Promise<RecoveryJob[]> {
 	ctx.log.info("recovery_reconciled", {
 		keys_closed: closed,
 		killed: runners.killed,
+		watchdog: sweep,
 		in_progress: summary.inProgress,
 		unknown_reservations: summary.unknown,
 		intents: intents.length,

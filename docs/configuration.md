@@ -3,8 +3,9 @@
 The Coordinator reads its configuration from the environment, optionally loaded from a file with
 `--env-file <path>` (variables already set in the environment win over the file). Every invalid or missing value
 stops it at start with one line per problem and exit code 2; values are never printed. The same file serves the
-owner CLI (`owner status|unfreeze|failed-events --env-file <path>`). Start from [.env.example](../.env.example); the
-local walkthrough is [RUN-LOCAL.md](../RUN-LOCAL.md).
+owner CLI (`owner status|unfreeze|failed-events --env-file <path>`). The watchdog (`watchdog --env-file <path>`)
+reads only its own few variables, see [Watchdog](#watchdog). Start from [.env.example](../.env.example); the local
+walkthrough is [RUN-LOCAL.md](../RUN-LOCAL.md).
 
 Secrets (marked below) are held only in the Coordinator's memory: after reading the configuration it removes them
 from its environment, the model key goes only to its relay, and the GitHub token only to its git and GitHub calls.
@@ -50,9 +51,10 @@ Pi processes and containers never receive them.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`, mode 600), one Pi SQLite file per conversation, lock; mode 700 (0710 with systemd isolation: the Pi group may only traverse it) |
+| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | Coordinator SQLite (`coordinator.sqlite`, mode 600; 660 with `PI_STATE_GROUP`), one Pi SQLite file per conversation, lock; mode 700 (0710 with systemd isolation: the Pi group may only traverse it) |
 | `PI_TASK_DIR` | no | `<PI_DATA_DIR>/tasks` | The task disk: git repository, one worktree per open task, check scratch space |
 | `PI_REQUIRE_TASK_MOUNT` | no | off | `1`: refuse to start unless `PI_TASK_DIR` is a mount point (a separate task disk on a server) |
+| `PI_STATE_GROUP` | no | unset (owner-only) | A group (name, or gid) the Coordinator hands its database (0660) and lock file (0640) to at every start, so the watchdog can run as its own user (production: `pi-watchdog`, [security.md](security.md#the-watchdog)). Never `PI_RUNNER_GROUP` or root's; the Coordinator must be a member and the Pi user must not, else it refuses to start |
 
 Relative paths are resolved from the current directory.
 
@@ -78,6 +80,26 @@ How each run's Pi process is isolated; see [isolation.md](isolation.md) for both
 | `PI_RUNNER_GROUP` | no | `pi-durable` | Group shared by the Pi user and the Coordinator user for `<PI_DATA_DIR>/conversations` |
 | `PI_RUNNER_SLICE` | no | `pi-durable-runs.slice` | The slice of the Pi units ([deploy/systemd](../deploy/systemd/pi-durable-runs.slice)); must be installed |
 | `SYSTEMD_RUN_BIN`, `SYSTEMCTL_BIN` | no | `systemd-run`, `systemctl` | The systemd CLIs: absolute paths or names on `PATH` |
+
+## Watchdog
+
+The watchdog (`pi-durable-telegram watchdog [--env-file <path>]`, [security.md](security.md#the-watchdog)) reads only
+these variables, from the environment or the env file (the environment wins). Every other variable is ignored,
+whatever its value, and an env file's other lines (secrets included) are dropped before they are parsed. It needs
+no secret at all; any secret variable in its environment is removed at start. Problems exit with code 2.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | The Coordinator's data directory, resolved exactly as the Coordinator resolves it (so the deployment marker of the Pi processes is the same) |
+| `TELEGRAM_GROUP_CHAT_ID` | yes | | The group it freezes when a stop cannot be verified |
+| `DOCKER_BIN` | no | `docker` | The Docker CLI it lists and removes the labelled containers with |
+| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | Where it looks for Pi processes: the Pi slice's cgroup tree (and marked processes), or marked processes only. Use the Coordinator's value |
+| `PI_RUNNER_SLICE`, `SYSTEMCTL_BIN` | no | `pi-durable-runs.slice`, `systemctl` | The Pi slice, and the systemctl that shows its control group |
+| `LOG_LEVEL` | no | `info` | As for the Coordinator |
+
+Fixed, not configurable: a pass every second, its heartbeat every second, a run's deadline enforced 60 s after the
+10-minute limit; the Coordinator waits 30 s for the watchdog's answer at start and dispatches only while the heartbeat
+is younger than 15 s.
 
 ## Logs
 

@@ -225,10 +225,31 @@ export interface RunLauncher {
 	/** Restart cleanup: SIGKILL the Pi process of this start, if it is still there. */
 	killRunner(ref: RunnerRef): void;
 	/**
-	 * Restart cleanup, deployment-wide (Deployment § Processes: the watchdog "kills everything in the slice"): every Pi
+	 * Restart cleanup, deployment-wide (the Coordinator's own defense in depth before it asks the watchdog, which kills
+	 * everything in the slice: src/watchdog/reapers.ts): every Pi
 	 * process of this deployment that may still be there, whatever run it served (by unit name under systemd, by the
 	 * argv markers in the process mode), for isRunner/killRunner; undefined when they cannot be listed. Called only
 	 * while this Coordinator has no live run (recovery at startup and its recheck after an unfreeze).
 	 */
 	leftovers(): readonly RunnerRef[] | undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The watchdog (Deployment § Processes: a separate unit, the independent stop path; src/watchdog/). The Coordinator
+// talks to it through rows of its own SQLite file (src/coordinator/watchdog-link.ts); tests may pass another link.
+
+/** A sweep request's answer so far. */
+export type SweepAnswer =
+	| { readonly kind: "pending" }
+	/** Every Pi process and labelled container is verified gone. */
+	| { readonly kind: "verified" }
+	/** The stop could not be confirmed: the watchdog froze the group. */
+	| { readonly kind: "unverified" };
+
+export interface WatchdogLink {
+	/** Ask the watchdog to kill and verify every leftover Pi process and labelled container; returns the request id. */
+	request(reason: "coordinator_start" | "recheck"): number;
+	answer(id: number): SweepAnswer;
+	/** Milliseconds since the watchdog's last heartbeat; undefined if it never wrote one. */
+	heartbeatAgeMs(): number | undefined;
 }

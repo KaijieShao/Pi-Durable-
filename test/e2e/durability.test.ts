@@ -637,9 +637,13 @@ async function killMidRun(t: TestContext, options: { docker: boolean }): Promise
 	assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).pid, child.pid);
 	const requestsBefore = stack.model.requests.length;
 
+	// The watchdog (in this process) is held for the moment of the kill, so the leftover can be observed first: once it
+	// runs again it sweeps what the dead Coordinator left (test/e2e/watchdog.test.ts covers that part).
+	await stack.watchdog.stop();
 	await killProcess(child);
-	// The agent container does not die with the Coordinator (Docker): recovery has to kill it and verify it gone.
+	// The agent container does not die with the Coordinator (Docker): the watchdog / recovery has to kill it.
 	if (options.docker) assert.ok(running.container !== null && containerRunning(running.container), "container left");
+	stack.watchdog.start();
 	stack.bot.delays.delete("sendMessage");
 	await stack.restart();
 	assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).pid, process.pid, "the stale lock was taken over");

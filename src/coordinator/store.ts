@@ -10,9 +10,16 @@ import { splitTelegramText } from "./telegram/split.ts";
  * it is never written to logs (Deployment § Logs: metadata only).
  */
 
-export const SCHEMA_VERSION = 1;
+/**
+ * Schema versions: 1 is the original schema (SCHEMA_V1, frozen: never edit it), each later version is one entry of
+ * MIGRATIONS. A new database runs SCHEMA_V1 and then every migration, so a fresh and an upgraded database are the
+ * same. The Coordinator and the watchdog open this file each with their own connection; whichever comes first
+ * migrates, inside one `BEGIN IMMEDIATE` transaction (the other waits, then finds the current version).
+ */
+export const SCHEMA_VERSION = 2;
 
-const SCHEMA = `
+/** Version 1 of the schema, exactly as it shipped (exported for the upgrade test). */
+export const SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- Group-level holds (Architecture § States). Only the owner CLI moves a frozen group back to normal.
@@ -215,6 +222,37 @@ CREATE TABLE IF NOT EXISTS task_messages (
 );
 `;
 
+/** MIGRATIONS[i] upgrades version i + 1 to version i + 2. */
+const MIGRATIONS: readonly string[] = [
+	// 1 → 2: the watchdog, a separate stop path (Deployment § Processes; src/watchdog/). Sweep requests from the
+	// Coordinator and the watchdog's answers and own records (restart, recheck, a dead Coordinator, a run's
+	// deadline), metadata only; the heartbeat lives in meta. runs.dispatched_at: when the slot was reserved, so the
+	// watchdog can enforce the run deadline of a run that is still starting.
+	`
+CREATE TABLE watchdog_sweeps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reason TEXT NOT NULL CHECK (reason IN ('coordinator_start','recheck','coordinator_dead','deadline')),
+  state TEXT NOT NULL CHECK (state IN ('pending','done')),
+  requester_pid INTEGER,                        -- the Coordinator that asked; for coordinator_dead the dead one
+  run_id INTEGER,                               -- deadline: the overdue run, its task and generation
+  task_id INTEGER,
+  generation INTEGER,
+  verified INTEGER CHECK (verified IN (0, 1)),  -- NULL while pending
+  processes_killed INTEGER,
+  containers_killed INTEGER,
+  processes_left INTEGER,                       -- NULL when they could not be listed
+  containers_left INTEGER,
+  detail TEXT,                                  -- a fixed word, never free text
+  requested_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER
+);
+CREATE INDEX watchdog_sweeps_state ON watchdog_sweeps(state, id);
+CREATE INDEX watchdog_sweeps_run ON watchdog_sweeps(run_id, generation);
+ALTER TABLE runs ADD COLUMN dispatched_at INTEGER;
+`,
+];
+
 export type Row = Record<string, SQLInputValue>;
 
 /** Outbox kinds that are required (sent before progress). Everything else passed with priority 1 is progress. */
@@ -237,14 +275,36 @@ export class Store {
 	constructor(path: string, now: () => number = Date.now) {
 		this.db = new DatabaseSync(path);
 		this.now = now;
-		this.db.exec("PRAGMA journal_mode = WAL");
-		this.db.exec("PRAGMA synchronous = FULL");
-		this.db.exec("PRAGMA foreign_keys = ON");
-		this.db.exec("PRAGMA busy_timeout = 5000");
-		this.db.exec(SCHEMA);
-		const version = this.getMeta("schema_version");
-		if (version === undefined) this.setMeta("schema_version", String(SCHEMA_VERSION));
-		else if (Number(version) !== SCHEMA_VERSION) throw new Error(`unsupported coordinator schema ${version}`);
+		try {
+			// First: another connection (the watchdog, the owner CLI) may hold a lock while this one sets up.
+			this.db.exec("PRAGMA busy_timeout = 5000");
+			this.db.exec("PRAGMA journal_mode = WAL");
+			this.db.exec("PRAGMA synchronous = FULL");
+			this.db.exec("PRAGMA foreign_keys = ON");
+			this.tx(() => this.#migrate());
+		} catch (error) {
+			this.db.close();
+			throw error;
+		}
+	}
+
+	/** Create or upgrade the schema to SCHEMA_VERSION. Inside one transaction. */
+	#migrate(): void {
+		const hasMeta =
+			this.get("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'meta'") !== undefined;
+		// No meta table: a new database. A meta table without a version: a version-1 database whose first start
+		// stopped before it saved one (the version-1 code created the tables, then the version).
+		if (!hasMeta || this.getMeta("schema_version") === undefined) {
+			this.db.exec(SCHEMA_V1);
+			this.setMeta("schema_version", "1");
+		}
+		const raw = this.getMeta("schema_version") ?? "";
+		const version = /^[1-9]\d{0,5}$/.test(raw) ? Number(raw) : Number.NaN;
+		if (!(version >= 1 && version <= SCHEMA_VERSION)) throw new Error(`unsupported coordinator schema ${raw}`);
+		for (let next = version; next < SCHEMA_VERSION; next++) {
+			this.db.exec(MIGRATIONS[next - 1] ?? "");
+			this.setMeta("schema_version", String(next + 1));
+		}
 	}
 
 	/**

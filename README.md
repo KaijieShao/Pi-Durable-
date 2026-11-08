@@ -53,13 +53,22 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
   its conversation is quarantined, and a later follow-up starts a fresh conversation. A run that had not reached Pi
   yet (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop
   or a GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
+- **The watchdog**, a separate process, is the stop path that survives the Coordinator: it kills and verifies every
+  leftover Pi process and container before dispatch reopens after any restart, removes what a crashed Coordinator
+  left, and enforces each run's deadline on its own; an unconfirmed stop freezes the group.
 
 ## Command line
 
 ```sh
+pi-durable-telegram watchdog [--env-file <path>]
 pi-durable-telegram run [--env-file <path>]
 pi-durable-telegram owner status|unfreeze|failed-events [--env-file <path>]
 ```
+
+`watchdog` is the independent stop path, its own process (its own systemd unit and user in production): start it
+first. It needs no secret. At every Coordinator start it kills and verifies every leftover Pi process and labelled
+container before anything is dispatched, cleans up after a crashed Coordinator, and enforces the run deadline; without
+it the Coordinator queues commands but starts no run ([security.md](docs/security.md#the-watchdog)).
 
 From the sources: `node src/cli/main.ts …` (Node 22 strips the types). `owner` opens the Coordinator's database
 directly and may run next to a live Coordinator.
@@ -76,9 +85,7 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 
 ## Not built yet
 
-Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; the separate watchdog systemd unit (an
-in-process watchdog, self-terminating containers and a self-exiting Pi process stand in, and restart cleanup in the
-Coordinator kills every Pi process of the deployment, everything of it in the Pi slice); GCP deploy scripts; the
+Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; the
 owner CLI's local socket and read-only inspection of quarantined conversations; reconciliation of uncertain file
 edits after a crash; task-disk-full handling beyond the free-space check; trial reset and the stress test.
 Measurements in the spec are planned, not results. Pi processes run as their own user in a dedicated systemd slice on Linux, and as your own user

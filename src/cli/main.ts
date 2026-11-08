@@ -20,6 +20,12 @@ async function main(argv: readonly string[]): Promise<number | undefined> {
 			const { runOwnerCommand } = await import("./owner.ts");
 			return runOwnerCommand(args.action, { envFile: args.envFile });
 		}
+		case "watchdog": {
+			// Its own minimal configuration: no Coordinator configuration and no secret is ever loaded here.
+			const { runWatchdogCli } = await import("./watchdog.ts");
+			const result = await runWatchdogCli({ envFile: args.envFile });
+			return typeof result === "number" ? result : undefined;
+		}
 		default: {
 			// Loaded on demand, after the configuration parsed: --help and the owner CLI never load the runtime.
 			const start: StartCoordinator = async (config, deps) =>

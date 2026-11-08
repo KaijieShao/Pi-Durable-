@@ -3,6 +3,19 @@ import { homedir, userInfo } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseEnv } from "node:util";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import {
+	COMMAND_NAME,
+	ConfigError,
+	type ConfigProblem,
+	dataDirFrom,
+	type Env,
+	ISOLATIONS,
+	isolationFrom,
+	nonEmpty,
+	SLICE_NAME,
+} from "../config/shared.ts";
+
+export { ConfigError, type ConfigProblem, type Env };
 
 /**
  * Coordinator configuration, from the environment (and an optional env file loaded into it first).
@@ -61,6 +74,12 @@ export type CoordinatorConfig = {
 		readonly taskDir: string;
 		/** If set, refuse to start unless `taskDir` is a mount point (GCP task disk). */
 		readonly requireTaskMount: boolean;
+		/**
+		 * PI_STATE_GROUP: a group (name or gid) the database and the lock file are shared with, read-write and read-only
+		 * (0660 / 0640), so the watchdog can run as its own user (deploy/systemd/pi-durable-watchdog.service). Unset:
+		 * both stay owner-only (the watchdog runs as the Coordinator's user, e.g. on a Mac).
+		 */
+		readonly stateGroup: string | undefined;
 	};
 	readonly docker: {
 		readonly bin: string;
@@ -94,29 +113,11 @@ export type CoordinatorConfig = {
 	readonly logLevel: "debug" | "info" | "warn" | "error";
 };
 
-export type ConfigProblem = { readonly variable: string; readonly message: string };
-
-/** Every problem found, one per line; never carries a secret value. */
-export class ConfigError extends Error {
-	readonly problems: readonly ConfigProblem[];
-	constructor(problems: readonly ConfigProblem[]) {
-		super(problems.map((p) => `${p.variable}: ${p.message}`).join("\n"));
-		this.name = "ConfigError";
-		this.problems = problems;
-	}
-}
-
-export type Env = Readonly<Record<string, string | undefined>>;
 type Collector = { readonly problems: ConfigProblem[]; add(variable: string, message: string): void };
 
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const ISOLATIONS = ["systemd", "process"] as const;
 /** A POSIX user or group name (as systemd accepts it for User= / Group=). */
 const ACCOUNT = /^[a-z_][a-z0-9_-]{0,31}$/;
-/** A slice name: dash-separated parts (systemd reads them as the slice hierarchy), never the root slice. */
-const SLICE = /^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*\.slice$/;
-/** A command: an absolute path, or a name looked up on PATH. */
-const COMMAND = /^(\/[\w./@+-]+|[\w.+-]+)$/;
 const BOT_TOKEN = /^\d{5,}:[A-Za-z0-9_-]{30,}$/;
 const AGENT_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -221,16 +222,18 @@ function parseLocal(
 	out: Collector,
 	defaults: Defaults,
 ): Pick<CoordinatorConfig, "paths" | "docker" | "relay" | "setupScript" | "logLevel"> {
-	const dataDir = resolvePath(
-		nonEmpty(env.PI_DATA_DIR) ?? join(defaults.home, ".local", "state", "pi-durable-coordinator"),
-		defaults.cwd,
-	);
+	const dataDir = dataDirFrom(env.PI_DATA_DIR, defaults);
 	const taskDir = resolvePath(nonEmpty(env.PI_TASK_DIR) ?? join(dataDir, "tasks"), defaults.cwd);
 	const user = parseContainerUser(env, out, defaults);
 	const setupScript = parseSetupScript(env, out);
 	const logLevel = parseLogLevel(env, out);
 	return {
-		paths: { dataDir, taskDir, requireTaskMount: env.PI_REQUIRE_TASK_MOUNT === "1" },
+		paths: {
+			dataDir,
+			taskDir,
+			requireTaskMount: env.PI_REQUIRE_TASK_MOUNT === "1",
+			stateGroup: parseStateGroup(env, out),
+		},
 		docker: {
 			bin: nonEmpty(env.DOCKER_BIN) ?? "docker",
 			agentImage: nonEmpty(env.AGENT_IMAGE) ?? "pi-durable-agent:demo",
@@ -245,16 +248,14 @@ function parseLocal(
 
 function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorConfig["runner"] {
 	const platform = defaults.platform ?? process.platform;
-	const isolation = (nonEmpty(env.PI_RUNNER_ISOLATION) ?? (platform === "linux" ? "systemd" : "process")) as
-		| "systemd"
-		| "process";
+	const isolation = isolationFrom(env.PI_RUNNER_ISOLATION, platform) as "systemd" | "process";
 	if (!(ISOLATIONS as readonly string[]).includes(isolation)) out.add("PI_RUNNER_ISOLATION", "systemd or process");
 	const user = parseAccount(env, "PI_RUNNER_USER", "pi-runner", out);
 	if (isolation === "systemd" && user === defaults.username)
 		out.add("PI_RUNNER_USER", "must not be the Coordinator's own user");
 	const group = parseAccount(env, "PI_RUNNER_GROUP", "pi-durable", out);
 	const slice = nonEmpty(env.PI_RUNNER_SLICE) ?? "pi-durable-runs.slice";
-	if (!SLICE.test(slice) || slice.length > 128)
+	if (!SLICE_NAME.test(slice) || slice.length > 128)
 		out.add("PI_RUNNER_SLICE", "a slice name such as pi-durable-runs.slice (letters, digits, _ and single dashes)");
 	return {
 		isolation,
@@ -266,6 +267,16 @@ function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorC
 	};
 }
 
+function parseStateGroup(env: Env, out: Collector): string | undefined {
+	const value = nonEmpty(env.PI_STATE_GROUP);
+	if (value === undefined) return undefined;
+	if (!(ACCOUNT.test(value) || /^[1-9]\d{0,9}$/.test(value)) || value === "root")
+		out.add("PI_STATE_GROUP", "a group name or a gid (not root's)");
+	else if (value === (nonEmpty(env.PI_RUNNER_GROUP) ?? "pi-durable"))
+		out.add("PI_STATE_GROUP", "must not be PI_RUNNER_GROUP: the Pi user must not read the Coordinator's database");
+	return value;
+}
+
 function parseAccount(env: Env, name: string, fallback: string, out: Collector): string {
 	const value = nonEmpty(env[name]) ?? fallback;
 	if (!ACCOUNT.test(value) || value === "root") out.add(name, "a user or group name (lower case, not root)");
@@ -274,7 +285,7 @@ function parseAccount(env: Env, name: string, fallback: string, out: Collector):
 
 function parseCommand(env: Env, name: string, fallback: string, out: Collector): string {
 	const value = nonEmpty(env[name]) ?? fallback;
-	if (!COMMAND.test(value)) out.add(name, "an absolute path or a command name, without spaces or quotes");
+	if (!COMMAND_NAME.test(value)) out.add(name, "an absolute path or a command name, without spaces or quotes");
 	return value;
 }
 
@@ -290,6 +301,7 @@ export function describeConfig(config: CoordinatorConfig): Record<string, unknow
 		base: config.github.baseBranch,
 		data: config.paths.dataDir,
 		tasks: config.paths.taskDir,
+		...(config.paths.stateGroup === undefined ? {} : { state_group: config.paths.stateGroup }),
 		agent_image: config.docker.agentImage,
 		check_image: config.docker.checkImage,
 		runner_isolation: config.runner.isolation,
@@ -316,11 +328,6 @@ function uidGid(): { uid?: number; gid?: number } {
 	return typeof process.getuid === "function" && typeof process.getgid === "function"
 		? { uid: process.getuid(), gid: process.getgid() }
 		: {};
-}
-
-function nonEmpty(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	return trimmed === undefined || trimmed === "" ? undefined : trimmed;
 }
 
 function required(env: Env, name: string, out: Collector, hint: string): string {

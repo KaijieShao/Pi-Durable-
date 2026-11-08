@@ -17,8 +17,10 @@ import {
 	type RunLauncher,
 	type RunnerHandle,
 	type Sandbox,
+	type WatchdogLink,
 } from "../ports.ts";
 import type { OutboxMessage, Store } from "../store.ts";
+import type { WatchdogTimings } from "../watchdog-link.ts";
 
 export type TaskState = "queued" | "running" | "review" | "merging" | "merged" | "failed" | "cancelled";
 export type RunState = "queued" | "starting" | "running" | "finalizing" | "finished" | "failed" | "cancelled";
@@ -169,6 +171,22 @@ export type EngineOptions = {
 	readonly retryDelayMs?: number;
 	/** Free bytes of the task disk; defaults to statfs. */
 	readonly freeBytes?: (path: string) => Promise<number>;
+	/** The watchdog: its link (the Coordinator's SQLite in production) and how long to wait for it. */
+	readonly watchdog: WatchdogOptions;
+};
+
+export type WatchdogOptions = { readonly link: WatchdogLink } & WatchdogTimings;
+
+/** This Coordinator's standing with the watchdog (src/coordinator/engine/watchdog.ts). */
+export type WatchdogGate = {
+	/** A sweep this Coordinator asked for was verified (since the last request). */
+	verified: boolean;
+	/** The request not answered yet, if any. */
+	pending: number | undefined;
+	/** Recovery stopped waiting for `pending`: the watchdog is unavailable until it answers. */
+	gaveUp: boolean;
+	/** The heartbeat was last seen too old. */
+	stale: boolean;
 };
 
 export type Ctx = {
@@ -185,6 +203,8 @@ export type Ctx = {
 	readonly retryDelayMs: number;
 	readonly freeBytes: (path: string) => Promise<number>;
 	readonly onOutbox: () => void;
+	readonly watchdog: WatchdogOptions;
+	readonly watchdogGate: WatchdogGate;
 	stopped: boolean;
 	relayUrl: string | undefined;
 	/** Dispatched runs by run id. */

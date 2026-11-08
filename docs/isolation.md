@@ -46,8 +46,10 @@ modes. It kills the Pi process of every run the database shows in progress, then
 deployment, whatever run it served: under systemd every unit named `pi-run-<deployment>-*` (in practice everything in
 the slice), in the process mode every process carrying this deployment's markers. It verifies each one is gone; if
 that cannot be confirmed, or the units or processes cannot be listed, the group freezes. Another deployment's units
-or processes are never touched. Doing this from a separate watchdog unit that survives the Coordinator is not built
-yet.
+or processes are never touched by this Coordinator-side cleanup. It is defense in depth: the gate is the watchdog, a
+separate unit that survives the Coordinator ([security.md](security.md#the-watchdog)). Asked by the Coordinator at
+every start and recheck, it kills everything in the slice (every process in its control group, so a child that left
+its session is caught too) and every labelled container, verifies both are empty, and only then is dispatch reopened.
 
 ## What is verified where
 
@@ -133,8 +135,9 @@ itself (GCP) is not covered here.
 5. The Coordinator's own service runs as `User=pi-coordinator`, with `pi-durable` among its groups (step 1, or
    `SupplementaryGroups=pi-durable`) and `UMask=0077`. Its environment has `PI_DATA_DIR=/var/lib/pi-durable` and
    `PI_TASK_DIR=/mnt/pi-durable-tasks`; leave `PI_RUNNER_ISOLATION` unset (it defaults to `systemd` on Linux). The
-   Coordinator talks to systemd over D-Bus, so do not sandbox `AF_UNIX` away from its unit. A unit file for the
-   Coordinator and the watchdog unit are not part of this change.
+   Coordinator talks to systemd over D-Bus, so do not sandbox `AF_UNIX` away from its unit. The unit files are
+   `deploy/systemd/pi-durable-coordinator.service` and `deploy/systemd/pi-durable-watchdog.service`; the watchdog's
+   user, the shared group and the data-directory ACL are in [security.md](security.md#the-watchdog).
 
 ## Verify at deployment
 

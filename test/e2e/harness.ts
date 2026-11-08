@@ -11,13 +11,21 @@
  *   Docker sandbox instead (opt-in, see dockerUnavailable()). Pi processes are forked children ("process" isolation)
  *   by default; `runner: "systemd"` uses the production systemd launcher with test stand-ins for systemd-run and
  *   systemctl (test/helpers/systemd-shims.ts), `runner: "config"` injects no launcher at all (production wiring).
+ * - the REAL watchdog core (src/watchdog/watchdog.ts) in this process by default, on its own Store connection to the
+ *   same database: it answers the Coordinator's sweep requests, keeps its heartbeat, reaps after a dead Coordinator
+ *   and enforces run deadlines, killing this deployment's marked Pi processes (the production marker scan) and the
+ *   stack's containers (the local sandbox's live()/killAll(), or the Docker CLI's). `watchdog: "none"` runs none
+ *   (tests then start the CLI watchdog as its own process). The Docker variants (`sandbox: "docker"`) get a DOCKER_BIN
+ *   wrapper that labels this stack's containers and filters every `docker ps` by that label, so neither the
+ *   Coordinator's recovery nor the watchdog's sweeps ever see another run's containers on a shared daemon.
  *
  * Limits are DEMO_LIMITS unless a test overrides some (and says why). Debugging: E2E_LOG=1.
  */
 import "../helpers/env.ts";
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
@@ -29,12 +37,16 @@ import { createRunLauncher } from "../../src/coordinator/runner-launcher.ts";
 import { createSystemdRunLauncher } from "../../src/coordinator/runner-systemd.ts";
 import { createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
 import type { Row } from "../../src/coordinator/store.ts";
+import type { WatchdogTimings } from "../../src/coordinator/watchdog-link.ts";
 import { createLogger, type Logger, silentLogger } from "../../src/runtime/log.ts";
+import { dockerContainerReaper, type Reaper } from "../../src/watchdog/reapers.ts";
+import type { Watchdog } from "../../src/watchdog/watchdog.ts";
 import { FakeBotApi, type ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { sleep } from "../helpers/env.ts";
 import { createOriginRepo, FakeGitHub, originGit } from "../helpers/fake-github.ts";
 import { type FakeHandler, FakeModel, type FakeStep } from "../helpers/fake-model.ts";
 import { createSystemdShims, prepareSystemdLayout, type SystemdShims, testAccounts } from "../helpers/systemd-shims.ts";
+import { sandboxReaper, startTestWatchdog } from "../helpers/watchdog.ts";
 
 export const GROUP = -1001234567890;
 export const OWNER = 1001;
@@ -88,6 +100,17 @@ export type StackOptions = {
 	 * hold one step of a run's start. The wrapped objects go in as deps.git / deps.sandbox and survive restart().
 	 */
 	readonly wrap?: { readonly git?: (git: Git) => Git; readonly sandbox?: (sandbox: Sandbox) => Sandbox };
+	/** "in-process" (default): the real watchdog core in this process. "none": no watchdog runs. */
+	readonly watchdog?: "in-process" | "none";
+	/** Coordinator-side watchdog timings (deps.watchdog; production: 30 s answer, 15 s heartbeat). */
+	readonly watchdogTimings?: Partial<WatchdogTimings>;
+	/** In-process watchdog: the grace after the run deadline (production 60 s). */
+	readonly watchdogDeadlineGraceMs?: number;
+	/**
+	 * In-process watchdog: the run deadline it enforces (default the stack's runDeadlineMs). Shorter than the
+	 * Coordinator's own, it shows the watchdog stopping a run on its own.
+	 */
+	readonly watchdogRunDeadlineMs?: number;
 };
 
 export type BotMatch = RegExp | ((message: ServerMessage) => boolean);
@@ -128,9 +151,10 @@ function hostUser(): string {
 }
 
 /**
- * Why the Docker variant does not run, or false. Opt-in with E2E_DOCKER=1: the Coordinator's restart recovery kills
- * EVERY container labelled pi-durable.managed=1 on this Docker daemon (production behaviour on a dedicated VM), which
- * would also kill containers of other test runs sharing the daemon.
+ * Why the Docker variant does not run, or false. Opt-in with E2E_DOCKER=1 (slow; real containers). The Coordinator's
+ * restart recovery and the watchdog kill EVERY container labelled pi-durable.managed=1 on their Docker daemon
+ * (production behaviour on a dedicated VM); here the stack's DOCKER_BIN wrapper (scopedDockerBin) limits "every" to
+ * this stack's own containers, so other test runs sharing the daemon are never touched.
  */
 export function dockerUnavailable(): string | false {
 	if (process.env.E2E_DOCKER !== "1") return "set E2E_DOCKER=1 to run the e2e path on the real Docker sandbox";
@@ -140,6 +164,34 @@ export function dockerUnavailable(): string | false {
 	});
 	if (images.error !== undefined) return "docker is not installed";
 	return images.status === 0 ? false : "docker or the demo images (scripts/build-images.sh) are unavailable";
+}
+
+/** The label the Docker variants' wrapper adds to this stack's containers (and filters every `docker ps` by). */
+export const SCOPE_LABEL = "pi-durable.e2e-scope";
+
+/**
+ * DOCKER_BIN for one stack (TEST ONLY): the real docker CLI, except that `docker run` adds `<SCOPE_LABEL>=<scope>` and
+ * `docker ps` filters by it, so "every managed container" (the Coordinator's recovery, the watchdog's sweeps) means
+ * this stack's containers only. Undefined when no docker CLI is found (the Docker variants are skipped then).
+ */
+export async function scopedDockerBin(dir: string, scope: string): Promise<string | undefined> {
+	const found = spawnSync("sh", ["-c", "command -v docker"], { encoding: "utf8", timeout: 10_000 });
+	const docker = String(found.stdout ?? "").trim();
+	if (found.status !== 0 || !docker.startsWith("/") || `${docker}${dir}`.includes("'")) return undefined;
+	await mkdir(dir, { recursive: true });
+	const bin = join(dir, "docker-scoped");
+	const label = `${SCOPE_LABEL}=${scope}`;
+	const script = [
+		"#!/bin/sh",
+		'case "$1" in',
+		`run) shift; exec '${docker}' run --label '${label}' "$@" ;;`,
+		`ps) shift; exec '${docker}' ps --filter 'label=${label}' "$@" ;;`,
+		`*) exec '${docker}' "$@" ;;`,
+		"esac",
+		"",
+	].join("\n");
+	await writeFile(bin, script, { mode: 0o700 });
+	return bin;
 }
 
 function stackConfig(dir: string, urls: { bot: string; github: string; model: string }, env: StackOptions["env"]) {
@@ -171,6 +223,69 @@ function stackConfig(dir: string, urls: { bot: string; github: string; model: st
 }
 
 export type Stack = Awaited<ReturnType<typeof startStack>>;
+
+/** `{ [key]: value }`, or nothing when the value is undefined (an optional dependency). */
+function optional<K extends string, V>(key: K, value: V | undefined): { [P in K]?: V } {
+	return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
+}
+
+/**
+ * CONTAINER_USER, and the scoped DOCKER_BIN unless the test brings its own, for the Docker variants. Never the plain
+ * docker CLI: without the scope, recovery and the watchdog would remove every managed container on the daemon.
+ */
+async function dockerVariantEnv(options: StackOptions, dir: string): Promise<Record<string, string>> {
+	if (options.sandbox !== "docker") return {};
+	const env: Record<string, string> = { CONTAINER_USER: hostUser() };
+	if (options.env?.DOCKER_BIN !== undefined) return env;
+	const scoped = await scopedDockerBin(join(dir, "bin"), `stack-${randomBytes(6).toString("hex")}`);
+	if (scoped === undefined)
+		throw new Error("cannot scope the docker CLI for this stack (not found, or a quote in a path)");
+	return { ...env, DOCKER_BIN: scoped };
+}
+
+export type InProcessWatchdog = {
+	start(): void;
+	stop(): Promise<void>;
+	readonly running: boolean;
+	/** Starts a pass now and resolves when it is complete (at once when it is stopped). */
+	nextLoop(): Promise<void>;
+};
+
+/**
+ * The real watchdog core in this process: this deployment's marked Pi processes, and the local sandbox's containers
+ * (or, for the Docker variants, the stack's labelled containers through its DOCKER_BIN).
+ */
+function inProcessWatchdog(
+	config: CoordinatorConfig,
+	localSandbox: Sandbox | undefined,
+	context: { readonly log: Logger; readonly limits: Limits; readonly options: StackOptions },
+): InProcessWatchdog {
+	const containers: Reaper =
+		localSandbox === undefined ? dockerContainerReaper({ bin: config.docker.bin }) : sandboxReaper(localSandbox);
+	const grace = context.options.watchdogDeadlineGraceMs;
+	let current: Watchdog | undefined;
+	return {
+		start(): void {
+			current ??= startTestWatchdog({
+				dataDir: config.paths.dataDir,
+				chatId: config.telegram.groupChatId,
+				containers,
+				log: context.log,
+				runDeadlineMs: context.options.watchdogRunDeadlineMs ?? context.limits.runDeadlineMs,
+				...(grace === undefined ? {} : { deadlineGraceMs: grace }),
+			});
+		},
+		async stop(): Promise<void> {
+			const running = current;
+			current = undefined;
+			await running?.stop();
+		},
+		get running(): boolean {
+			return current !== undefined;
+		},
+		nextLoop: (): Promise<void> => current?.nextLoop() ?? Promise.resolve(),
+	};
+}
 
 /** deps.launcher for the chosen runner mode (none for "config": the Coordinator builds it from the config). */
 function stackLauncher(
@@ -212,7 +327,7 @@ export async function startStack(options: StackOptions = {}) {
 	const model = new FakeModel();
 	if (options.model !== undefined) model.script(options.model);
 	const urls = { bot: await bot.start(), github: await github.start(), model: await model.start() };
-	const containerUser: Record<string, string> = options.sandbox === "docker" ? { CONTAINER_USER: hostUser() } : {};
+	const containerUser = await dockerVariantEnv(options, dir);
 	const shims = options.runner === "systemd" ? await createSystemdShims(join(dir, "systemd")) : undefined;
 	const systemdEnv: Record<string, string> =
 		shims === undefined
@@ -229,7 +344,8 @@ export async function startStack(options: StackOptions = {}) {
 		});
 		return options.wrap?.sandbox?.(created) ?? created;
 	};
-	const sandbox = options.sandbox === "docker" ? {} : { sandbox: local() };
+	const localSandbox = options.sandbox === "docker" ? undefined : local();
+	const watchdog = inProcessWatchdog(config, localSandbox, { log, limits, options });
 	const wrapGit = options.wrap?.git;
 	const wrappedGit =
 		wrapGit === undefined
@@ -248,7 +364,7 @@ export async function startStack(options: StackOptions = {}) {
 				};
 	const deps = {
 		remoteUrl: origin.bare,
-		...sandbox,
+		...optional("sandbox", localSandbox),
 		...wrappedGit,
 		...stackLauncher(options.runner, config, log),
 		limits,
@@ -257,12 +373,16 @@ export async function startStack(options: StackOptions = {}) {
 		pollTimeoutSeconds: 1,
 		// Test-only: 50 ms base delay between GitHub/push retries (1 s in production).
 		retryDelayMs: 50,
-		...(options.onFatal === undefined ? {} : { onFatal: options.onFatal }),
+		...optional("onFatal", options.onFatal),
+		...optional("watchdog", options.watchdogTimings),
 	};
 	const stopFakes = async (): Promise<void> => {
+		await watchdog.stop();
 		await Promise.allSettled([model.stop(), github.stop(), bot.stop()]);
 		await rm(dir, { recursive: true, force: true });
 	};
+	// The watchdog runs before the Coordinator (as its unit does): recovery waits for its verified sweep.
+	if (options.watchdog !== "none") watchdog.start();
 	let coordinator: Coordinator | undefined;
 	try {
 		coordinator = await startCoordinator(config, deps);
@@ -305,6 +425,8 @@ export async function startStack(options: StackOptions = {}) {
 		origin,
 		/** The systemd-run / systemctl stand-ins (runner: "systemd" only). */
 		shims,
+		/** The in-process watchdog (stop it to see the Coordinator fail closed; start it again). */
+		watchdog,
 		get coordinator(): Coordinator {
 			return current();
 		},

@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { deploymentId, hasRunnerMarkers, markedRunId, runnerArgv } from "../runner/argv.ts";
+import { deploymentId, hasRunnerMarkers, markedProcesses, RUNNER_ENTRY, runnerArgv } from "../runner/argv.ts";
 import { isFromRunner, type RunnerStart, type ToRunner } from "../runner/protocol.ts";
 import { errorSummary, type Logger } from "../runtime/log.ts";
 import type { RunLauncher, RunnerExit, RunnerHandle, RunnerRef } from "./ports.ts";
@@ -45,8 +45,6 @@ export type RunLauncherOptions = {
 };
 
 const NOTE_PREFIX = "@pi-runner ";
-/** The runner's entry in a Pi process's command line (src or dist). */
-const RUNNER_COMMAND = /runner[/\\]main\.(ts|js)\b/;
 
 /** The default runner entry next to this module. */
 export function defaultRunnerPath(): string {
@@ -130,7 +128,7 @@ export function createRunLauncher(options: RunLauncherOptions): RunLauncher {
 			return handle;
 		},
 		isRunner,
-		leftovers: () => markedProcesses(deployment),
+		leftovers: () => deploymentProcesses(deployment),
 		killRunner(ref: RunnerRef): void {
 			// Only a process that carries this deployment's and this run's markers (never a reused pid).
 			if (ref.pid === null || !isRunner(ref)) return;
@@ -154,14 +152,14 @@ function isPiProcess(pid: number, deployment: string, runId: number): boolean {
 		env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
 	});
 	if (result.status !== 0 || typeof result.stdout !== "string") return false;
-	return RUNNER_COMMAND.test(result.stdout) && hasRunnerMarkers(result.stdout, deployment, runId);
+	return RUNNER_ENTRY.test(result.stdout) && hasRunnerMarkers(result.stdout, deployment, runId);
 }
 
 /**
  * Restart cleanup, deployment-wide: every live Pi process (not this one) whose command line carries this deployment's
  * markers, whatever run it served; undefined when `ps` cannot list the processes.
  */
-function markedProcesses(deployment: string): RunnerRef[] | undefined {
+function deploymentProcesses(deployment: string): RunnerRef[] | undefined {
 	const result = spawnSync("ps", ["-A", "-ww", "-o", "pid=,command="], {
 		encoding: "utf8",
 		timeout: 5000,
@@ -169,15 +167,11 @@ function markedProcesses(deployment: string): RunnerRef[] | undefined {
 		env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
 	});
 	if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") return undefined;
-	const refs: RunnerRef[] = [];
-	for (const line of result.stdout.split("\n")) {
-		const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-		const pid = Number(match?.[1]);
-		const command = match?.[2] ?? "";
-		const runId = RUNNER_COMMAND.test(command) ? markedRunId(command, deployment) : undefined;
-		if (runId !== undefined && pid !== process.pid) refs.push({ runId, generation: 0, pid });
-	}
-	return refs;
+	return markedProcesses(result.stdout, deployment, process.pid).map(({ pid, runId }) => ({
+		runId,
+		generation: 0,
+		pid,
+	}));
 }
 
 function send(child: ChildProcess, message: ToRunner, log: Logger, meta: Record<string, unknown>): void {

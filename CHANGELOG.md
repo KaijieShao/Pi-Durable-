@@ -30,6 +30,22 @@
   slice, or its marked processes locally), not only those of the runs recorded in progress; the Coordinator database
   is created owner-only (0600).
 
+- The watchdog, the independent stop path, as its own process: `pi-durable-telegram watchdog [--env-file p]` and
+  `deploy/systemd/pi-durable-watchdog.service` (its own user, CAP_KILL, the Docker socket, no network, no secret; it
+  reads only `PI_DATA_DIR`, `TELEGRAM_GROUP_CHAT_ID`, `DOCKER_BIN`, `PI_RUNNER_ISOLATION`, `PI_RUNNER_SLICE`,
+  `SYSTEMCTL_BIN`, `LOG_LEVEL`). At every Coordinator start and every recheck after an unfreeze it kills everything in
+  the Pi slice (by cgroup membership: escaped children too) or every marked Pi process, and every container labelled
+  `pi-durable.managed=1`, verifies both are empty, and only then does the Coordinator dispatch. It also cleans up
+  after a dead Coordinator (stale or missing lock) and enforces each run's deadline independently; any unverified
+  stop freezes the group with a notice (for a run's deadline, the run's own group). **Breaking for running the
+  Coordinator:** it dispatches nothing (no run, merge or recovery check) until the watchdog has verified its start
+  sweep, and nothing new while the watchdog's heartbeat is older than 15 s (without a watchdog it waits 30 s at
+  start, then queues commands and tells the group once). Store schema v2 (a real
+  v1 → v2 migration: the `watchdog_sweeps` table and `runs.dispatched_at`); `owner status` shows the watchdog's
+  heartbeat and last sweep. New `PI_STATE_GROUP` shares the database and lock with the watchdog's user;
+  `deploy/systemd/pi-durable-coordinator.service` (after the watchdog, `RequiresMountsFor=` the task disk) and a
+  Docker drop-in for the task disk.
+
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 

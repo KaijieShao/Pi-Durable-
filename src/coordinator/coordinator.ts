@@ -5,7 +5,9 @@
  *
  *   private dirs → data-dir lock → Store → getMe (username must match; log can_read_all_group_messages) →
  *   sandbox.available() + launcher.available() (fail closed: no execution starts, logged and posted once) →
- *   git.ensureRepo + fetchBase → recovery (steps 1–3) → relay (step 4) → outbox → poller → engine ticks (step 5).
+ *   git.ensureRepo + fetchBase → recovery (steps 1–3; step 2 waits for the watchdog's verified sweep, see
+ *   engine/watchdog.ts) → relay (step 4) → outbox → poller → engine ticks (step 5: dispatch only once the watchdog
+ *   verified this Coordinator's sweep and while its heartbeat is fresh).
  *
  * Secrets stay in `config` (memory only) and go only to the relay (model key), git/GitHub (GitHub token) and the
  * Telegram client (bot token); each Pi process gets only its run key. Production defaults: Docker sandbox, Pi
@@ -26,14 +28,21 @@ import { createGit, type Git } from "./git.ts";
 import { createGitHub } from "./github.ts";
 import { DEMO_LIMITS, type Limits } from "./limits.ts";
 import { type OutboxSender, startOutbox } from "./outbox.ts";
-import type { GitHubApi, RunLauncher, Sandbox, TelegramApi } from "./ports.ts";
+import type { GitHubApi, RunLauncher, Sandbox, TelegramApi, WatchdogLink } from "./ports.ts";
 import { startRelay } from "./relay.ts";
 import { createRunLauncher } from "./runner-launcher.ts";
 import { createSystemdRunLauncher } from "./runner-systemd.ts";
 import { createDockerSandbox } from "./sandbox/docker.ts";
+import { shareState } from "./state-share.ts";
 import { Store } from "./store.ts";
 import { createTelegramApi } from "./telegram/api.ts";
 import { type Poller, startPoller } from "./telegram/poller.ts";
+import {
+	createStoreWatchdogLink,
+	WATCHDOG_ANSWER_TIMEOUT_MS,
+	WATCHDOG_HEARTBEAT_MAX_AGE_MS,
+	type WatchdogTimings,
+} from "./watchdog-link.ts";
 
 export type CoordinatorDeps = {
 	readonly telegram?: TelegramApi;
@@ -59,6 +68,11 @@ export type CoordinatorDeps = {
 	 * and exits non-zero so systemd (or the operator) sees it (Requirements § Availability: restarts automatically).
 	 */
 	readonly onFatal?: (reason: string, error: unknown) => void;
+	/**
+	 * Tests only: a shorter wait for the watchdog's answer (30 s in production) or heartbeat age (15 s), or another
+	 * link. Production always talks to the watchdog through the Coordinator's SQLite file (watchdog-link.ts).
+	 */
+	readonly watchdog?: Partial<WatchdogTimings> & { readonly link?: WatchdogLink };
 };
 
 export type Coordinator = {
@@ -319,9 +333,14 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 		now,
 		onOutbox: () => outboxKick(),
 		...(deps.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs }),
+		watchdog: {
+			link: deps.watchdog?.link ?? createStoreWatchdogLink(store),
+			answerTimeoutMs: deps.watchdog?.answerTimeoutMs ?? WATCHDOG_ANSWER_TIMEOUT_MS,
+			heartbeatMaxAgeMs: deps.watchdog?.heartbeatMaxAgeMs ?? WATCHDOG_HEARTBEAT_MAX_AGE_MS,
+		},
 	});
 	parts.engine = engine;
-	// Recovery steps 1–3 before the relay (step 4), polling or dispatch (step 5).
+	// Recovery steps 1–3 before the relay (step 4), polling or dispatch (step 5). Step 2 waits for the watchdog.
 	await engine.recover();
 	const relay = await startRelayFor(setup, store, engine);
 	parts.relay = relay;
@@ -354,6 +373,15 @@ export async function startCoordinator(config: CoordinatorConfig, deps: Coordina
 		const store = new Store(database, now);
 		parts.store = store;
 		await makePrivate([database, `${database}-wal`, `${database}-shm`]);
+		// PI_STATE_GROUP: the watchdog, as its own user, shares the database and reads the lock (state-share.ts).
+		const { stateGroup } = config.paths;
+		if (stateGroup !== undefined) {
+			await shareState(
+				config.paths.dataDir,
+				stateGroup,
+				launcher.isolation === "systemd" ? config.runner.user : undefined,
+			);
+		}
 		log.info("coordinator_starting", { ...describeConfig(config), isolation: launcher.isolation });
 		const { engine, relay, outbox, poller } = await boot(setup, parts, store, now, launcher);
 		let stopping: Promise<void> | undefined;

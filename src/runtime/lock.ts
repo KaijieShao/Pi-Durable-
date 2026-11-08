@@ -56,6 +56,30 @@ export function acquireDataDirLock(dir: string, probe: LockProbe = defaultProbe(
 	return { path, release: () => releaseIfOurs(path, probe.pid) };
 }
 
+/**
+ * Who holds a data directory's lock, as another process sees it (the watchdog: is a Coordinator running?): `absent`
+ * (no lock file: none started, or it stopped and released it), `dead` (its owner's pid is gone, or now belongs to a
+ * process with another start time), `alive` (also a live pid of another user), `unknown` (unreadable, being written,
+ * or owned on another host: never treated as dead).
+ */
+export function lockPresence(
+	dir: string,
+	probe: LockProbe = defaultProbe(),
+): { readonly state: "absent" | "alive" | "dead" | "unknown"; readonly pid?: number } {
+	const path = join(dir, "owner.lock");
+	try {
+		statSync(path);
+	} catch (error) {
+		// Only a lock file that is really not there means no Coordinator; any other error (permissions) is unknown.
+		return { state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown" };
+	}
+	const owner = readOwner(path);
+	if (owner === undefined || owner.host !== probe.host) return { state: "unknown" };
+	const alive = isAlive(owner.pid, probe);
+	if (alive === "dead" || pidReused(owner, probe)) return { state: "dead", pid: owner.pid };
+	return { state: "alive", pid: owner.pid };
+}
+
 function claimMarker(marker: string, owner: LockOwner, probe: LockProbe): boolean {
 	if (tryCreate(marker, owner)) return true;
 	// An old marker was left by a process that crashed mid-takeover (a takeover takes microseconds).
