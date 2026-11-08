@@ -6,7 +6,7 @@
  */
 import { openTaskCount } from "../admission.ts";
 import { projectTokensSpent } from "../relay.ts";
-import { type Ctx, groupHeld, slotsInUse } from "./context.ts";
+import { type Ctx, enqueueTask, groupHeld, loadTask, slotsInUse, taskRef } from "./context.ts";
 
 export type Reservation = {
 	readonly runId: number;
@@ -99,6 +99,33 @@ export function dispatchOnce(ctx: Ctx): Reservation | undefined {
 		const first = candidates.find(
 			(c) => !candidateBlocked(ctx, c, now) && (c.worktree_path !== null || open < ctx.limits.openTasksPerGroup),
 		);
+		if (first === undefined) noteWaitingForReviews(ctx, candidates, now, open);
 		return first === undefined ? undefined : reserve(ctx, first, now);
 	});
+}
+
+/**
+ * Capacity § Waiting: "the bot tells the user when it is waiting for reviews to finish". A first run that only the
+ * open-task limit holds (its agent is idle and a slot is free) is told once, unless the task was told already (its
+ * acknowledgement carried the same note when it was accepted while the group was full). Inside the dispatch tx.
+ */
+function noteWaitingForReviews(ctx: Ctx, candidates: readonly Candidate[], now: number, open: number): void {
+	if (open < ctx.limits.openTasksPerGroup) return;
+	for (const c of candidates) {
+		if (c.worktree_path !== null || candidateBlocked(ctx, c, now)) continue;
+		const told = count(
+			ctx,
+			"SELECT COUNT(*) AS n FROM outbox WHERE task_id = ? AND text LIKE '%waiting for open reviews to finish%'",
+			c.task_id,
+		);
+		if (told > 0) continue;
+		enqueueTask(
+			ctx,
+			loadTask(ctx, c.task_id),
+			"task_waiting",
+			`${taskRef(c.task_id)} is waiting for open reviews to finish (${open} open tasks); it starts once a task in ` +
+				"review is merged or cancelled.",
+		);
+		ctx.onOutbox();
+	}
 }
