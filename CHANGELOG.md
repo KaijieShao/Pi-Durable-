@@ -63,6 +63,19 @@
   once there is room (measured again every 30 s and when a worktree is archived). Follow-up runs are not held.
   `owner status` shows both disks, the limits and what the database and Pi's stores take.
 
+- Uncertain file edits are reconciled (Agent Execution § Uncertain Effects). Before an `edit` or `write` runs in the
+  agent container, its intent (the file, its hash before, the intended hash) is saved in the new `effect_intents`
+  table (store schema v3); a `run_check` is saved too. An answer that leaves the outcome unknown (a timed-out file
+  operation) stops the run; after a restart, or once a run's Pi process and containers are verified gone, every
+  intent still pending is reconciled by hashing the file on the host (no symlink followed, confined to the worktree):
+  the intended result is "applied", the content before "currently unchanged", a `run_check` is reported failed, and
+  anything else freezes the group, naming the task and the file (never its content). Dispatch waits for this, and
+  nothing archives, reviews or pushes the task's worktree before it. The owner's unfreeze records the resolution;
+  `owner status` lists the files waiting for review. **Changed:** a run interrupted by a restart is no longer
+  tested, checkpointed and pushed at recovery. Its changes since the last checkpoint stay uncommitted in the worktree,
+  the bot lists them, `/approve` is refused, and only a reply (a fresh run seeded with them, untracked files included
+  in its diff) or `/cancel` (the final checkpoint) moves them on.
+
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 

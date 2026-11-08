@@ -1,8 +1,9 @@
 /**
  * The Store's schema versions (src/coordinator/store.ts): a new database is created at the current version; an
- * existing version-1 database (the schema as it shipped, SCHEMA_V1) upgrades to version 2 in place, keeping every row,
- * with the watchdog's table and runs.dispatched_at; a newer version is refused; the Coordinator and the watchdog may
- * open the same new file at once (one migrates, the other finds it done).
+ * existing version-1 database (the schema as it shipped, SCHEMA_V1) upgrades to the current version in place, keeping
+ * every row, with the watchdog's table and runs.dispatched_at (version 2) and the effect ledger (version 3); a
+ * version-2 database upgrades to version 3 the same way; a newer version is refused; the Coordinator and the watchdog
+ * may open the same new file at once (one migrates, the other finds it done).
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -39,20 +40,36 @@ function createV1(path: string): void {
 const columns = (store: Store, table: string): string[] =>
 	store.all<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).map((row) => row.name);
 
-test("a new database is created at the current schema version, with the watchdog's table", async (t) => {
+test("a new database is created at the current schema version, with the watchdog's table and the effect ledger", async (t) => {
 	const store = new Store(await tempDb(t));
 	t.after(() => store.close());
-	assert.equal(SCHEMA_VERSION, 2);
-	assert.equal(store.getMeta("schema_version"), "2");
+	assert.equal(SCHEMA_VERSION, 3);
+	assert.equal(store.getMeta("schema_version"), "3");
 	assert.ok(columns(store, "watchdog_sweeps").includes("verified"));
 	assert.ok(columns(store, "runs").includes("dispatched_at"));
+	assert.deepEqual(columns(store, "effect_intents"), [
+		"id",
+		"run_id",
+		"task_id",
+		"tool",
+		"path",
+		"operation",
+		"pre_hash",
+		"intended_hash",
+		"state",
+		"observed_hash",
+		"reconciled",
+		"resolution",
+		"created_at",
+		"settled_at",
+	]);
 });
 
-test("an existing version-1 database upgrades to version 2 in place and keeps every row", async (t) => {
+test("an existing version-1 database upgrades to the current version in place and keeps every row", async (t) => {
 	const path = await tempDb(t);
 	createV1(path);
 	const store = new Store(path);
-	assert.equal(store.getMeta("schema_version"), "2");
+	assert.equal(store.getMeta("schema_version"), "3");
 	assert.equal(store.getMeta("telegram_offset"), "42", "meta kept");
 	const run = store.get<{ state: string; pid: number; dispatched_at: number | null }>(
 		"SELECT state, pid, dispatched_at FROM runs WHERE id = 1",
@@ -69,22 +86,68 @@ test("an existing version-1 database upgrades to version 2 in place and keeps ev
 	// The upgraded schema is the fresh one.
 	const fresh = new Store(join(path, "..", "fresh.sqlite"));
 	t.after(() => fresh.close());
-	for (const table of ["runs", "watchdog_sweeps", "tasks", "meta"])
+	for (const table of ["runs", "watchdog_sweeps", "effect_intents", "tasks", "meta"])
 		assert.deepEqual(columns(store, table), columns(fresh, table), table);
 	// Opening it again changes nothing.
 	store.close();
 	const again = new Store(path);
-	assert.equal(again.getMeta("schema_version"), "2");
+	assert.equal(again.getMeta("schema_version"), "3");
 	again.close();
+});
+
+test("a version-2 database upgrades to version 3 in place: the effect ledger is added, every row kept", async (t) => {
+	const path = await tempDb(t);
+	createV1(path);
+	// Version 2 exactly as it shipped: version 1 plus the watchdog's migration (applied by the version-2 code).
+	const db = new DatabaseSync(path);
+	db.exec(`CREATE TABLE watchdog_sweeps (
+	  id INTEGER PRIMARY KEY AUTOINCREMENT,
+	  reason TEXT NOT NULL CHECK (reason IN ('coordinator_start','recheck','coordinator_dead','deadline')),
+	  state TEXT NOT NULL CHECK (state IN ('pending','done')),
+	  requester_pid INTEGER, run_id INTEGER, task_id INTEGER, generation INTEGER,
+	  verified INTEGER CHECK (verified IN (0, 1)), processes_killed INTEGER, containers_killed INTEGER,
+	  processes_left INTEGER, containers_left INTEGER, detail TEXT,
+	  requested_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
+	ALTER TABLE runs ADD COLUMN dispatched_at INTEGER;`);
+	db.prepare("UPDATE runs SET dispatched_at = 5 WHERE id = 1").run();
+	db.prepare("UPDATE meta SET value = '2' WHERE key = 'schema_version'").run();
+	db.close();
+	const store = new Store(path);
+	t.after(() => store.close());
+	assert.equal(store.getMeta("schema_version"), "3");
+	const run = store.get<{ state: string; dispatched_at: number }>("SELECT state, dispatched_at FROM runs WHERE id = 1");
+	assert.deepEqual({ ...run }, { state: "running", dispatched_at: 5 }, "the running run is kept as it was");
+	assert.equal(store.get<{ n: number }>("SELECT COUNT(*) AS n FROM effect_intents")?.n, 0);
+	store.tx(() =>
+		store.run(
+			`INSERT INTO effect_intents(run_id, task_id, tool, path, pre_hash, intended_hash, state, created_at)
+			 VALUES (1, 1, 'write', 'a.txt', 'absent', 'sha256:00', 'pending', 1)`,
+		),
+	);
+	assert.throws(
+		() =>
+			store.run(
+				"INSERT INTO effect_intents(run_id, task_id, tool, state, created_at) VALUES (1, 1, 'shell', 'pending', 1)",
+			),
+		/CHECK constraint failed/,
+	);
+	assert.throws(
+		() =>
+			store.run(
+				"INSERT INTO effect_intents(run_id, task_id, tool, state, created_at) VALUES (1, 1, 'edit', 'maybe', 1)",
+			),
+		/CHECK constraint failed/,
+	);
 });
 
 test("a database of a newer schema version is refused, and left untouched", async (t) => {
 	const path = await tempDb(t);
 	createV1(path);
 	const db = new DatabaseSync(path);
-	db.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+	const newer = String(SCHEMA_VERSION + 1);
+	db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(newer);
 	db.close();
-	assert.throws(() => new Store(path), /unsupported coordinator schema 3/);
+	assert.throws(() => new Store(path), new RegExp(`unsupported coordinator schema ${newer}`));
 	const check = new DatabaseSync(path, { readOnly: true });
 	const tables = check.prepare("SELECT name FROM sqlite_master WHERE name = 'watchdog_sweeps'").all();
 	check.close();
@@ -99,8 +162,8 @@ test("two connections opening the same new file (Coordinator and watchdog) both 
 		first.close();
 		second.close();
 	});
-	assert.equal(first.getMeta("schema_version"), "2");
-	assert.equal(second.getMeta("schema_version"), "2");
+	assert.equal(first.getMeta("schema_version"), "3");
+	assert.equal(second.getMeta("schema_version"), "3");
 	first.tx(() => first.setMeta("watchdog_heartbeat_at", "123"));
 	assert.equal(second.getMeta("watchdog_heartbeat_at"), "123", "one file, two connections (WAL)");
 });

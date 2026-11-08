@@ -98,8 +98,49 @@ export function ownerStatus(store: Store, chatId: number, disk: readonly string[
 		RECENT_TERMINAL,
 	);
 	if (recent.length > 0) lines.push(`Recent finished tasks (last ${RECENT_TERMINAL}):`, ...recent.map(taskLine));
-	lines.push(...heldLines(store, chatId), ...housekeepingLines(store), ...disk);
+	lines.push(...heldLines(store, chatId), ...effectLines(store, chatId), ...housekeepingLines(store), ...disk);
 	return lines.join("\n");
+}
+
+type OpenIntentRow = {
+	id: number;
+	task_id: number;
+	run_id: number;
+	tool: string;
+	path: string | null;
+	operation: string | null;
+	state: string;
+	worktree_path: string | null;
+};
+
+/** The group's intents (pending or unresolved) of the effect ledger, by task and run. */
+function openIntents(store: Store, chatId: number, states: readonly string[]): OpenIntentRow[] {
+	return store.all<OpenIntentRow>(
+		`SELECT i.id, i.task_id, i.run_id, i.tool, i.path, i.operation, i.state, t.worktree_path
+		 FROM effect_intents i JOIN tasks t ON t.id = i.task_id
+		 WHERE t.chat_id = ? AND i.state IN (${states.map(() => "?").join(", ")}) ORDER BY i.id`,
+		chatId,
+		...states,
+	);
+}
+
+function intentLine(row: OpenIntentRow): string {
+	const target = row.tool === "run_check" ? `run_check ${row.operation ?? "?"}` : `${row.tool} ${row.path ?? "?"}`;
+	const where = row.worktree_path === null ? "" : ` in ${row.worktree_path}`;
+	return `  #${row.task_id} run ${row.run_id}: ${target}${where} (${row.state})`;
+}
+
+/**
+ * File changes whose outcome could not be reconciled (Agent Execution § Uncertain Effects: the group froze) and ones
+ * still waiting for reconciliation (it runs at the next start or recheck). Shown only if any. Names files, never content.
+ */
+function effectLines(store: Store, chatId: number): string[] {
+	const rows = openIntents(store, chatId, ["unresolved", "pending"]);
+	if (rows.length === 0) return [];
+	return [
+		"Uncertain file changes (unresolved: review the file, then unfreeze; pending: reconciled at the next start or recheck):",
+		...rows.map(intentLine),
+	];
 }
 
 /**
@@ -212,18 +253,47 @@ export function ownerUnfreeze(store: Store, chatId: number): OwnerResult {
 			store.now(),
 			chatId,
 		);
+		const resolved = resolveIntents(store, chatId);
 		const reason = group.reason === null ? "" : ` (it was frozen: ${clean(group.reason)})`;
 		return {
 			ok: true,
 			text: [
 				`Group ${chatId} unfrozen${reason}.`,
 				"Set state=normal and recheck_required=1: the Coordinator repeats recovery steps 1-4 (close run keys,",
-				"the watchdog's sweep of leftover Pi processes and containers, reconcile GitHub effects, restore the relay)",
-				"before it dispatches queued work again (not before the watchdog answers). Tasks cancelled by the freeze",
-				"stay cancelled; nothing resumes on its own.",
+				"the watchdog's sweep of leftover Pi processes and containers, reconcile GitHub and file effects, restore",
+				"the relay) before it dispatches queued work again (not before the watchdog answers). Tasks cancelled by the",
+				"freeze stay cancelled; nothing resumes on its own.",
+				...resolved,
 			].join("\n"),
 		};
 	});
+}
+
+/** What the owner's unfreeze records for an unresolved file change (effect_intents.resolution). */
+export const OWNER_RESOLUTION = "owner unfreeze: accepted as found in the worktree";
+
+/**
+ * Owner review resolves the group's unresolved file changes (Interfaces and Storage § Recovery: "Owner review
+ * resolves and unfreezes the group"): each is recorded as resolved, the file accepted as it is in the worktree, so the
+ * recheck lets its task's worktree be used again (a reply's fresh run, /cancel's final checkpoint). Inside the tx.
+ */
+function resolveIntents(store: Store, chatId: number): string[] {
+	const rows = openIntents(store, chatId, ["unresolved"]);
+	if (rows.length === 0) return [];
+	const now = store.now();
+	for (const row of rows) {
+		store.run(
+			"UPDATE effect_intents SET state = 'resolved', resolution = ?, settled_at = ? WHERE id = ? AND state = 'unresolved'",
+			OWNER_RESOLUTION,
+			now,
+			row.id,
+		);
+	}
+	return [
+		`Recorded your resolution of ${rows.length} uncertain file change${rows.length === 1 ? "" : "s"} (accepted as found`,
+		"in the worktree; a reply's fresh run or /cancel's final checkpoint uses the file as it is now):",
+		...rows.map(intentLine),
+	];
 }
 
 type FailedEventRow = {

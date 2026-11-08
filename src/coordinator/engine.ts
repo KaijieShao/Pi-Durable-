@@ -45,7 +45,14 @@ import {
 } from "./engine/runs.ts";
 import { liftTaskDiskHold, recheckTaskDisk, TASK_DISK_RECHECK_MS } from "./engine/task-disk.ts";
 import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
-import { holdNote, rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
+import {
+	holdNote,
+	INTERRUPTED_KEPT_REASON,
+	interruptedNext,
+	rejectedApprovalNote,
+	reviewReminder,
+	taskRef,
+} from "./messages.ts";
 import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
 
@@ -297,7 +304,8 @@ function dispatchOpen(ctx: Ctx, state: EngineState): boolean {
 	// STUB(spec: architecture.md § Sealing; capacity.md § Exclusive phases): sealing and the isolated evaluator are
 	// not built; a group in state 'sealing' only holds dispatch and merges here, nothing seals it.
 	if (group.state !== "normal" || group.recheck || state.recheckRunning) return false;
-	return ctx.recoveryPending === 0 && ctx.relayUrl !== undefined;
+	// Agent Execution § Uncertain Effects: "Dispatch stays blocked until reconciliation finishes".
+	return ctx.recoveryPending === 0 && ctx.reconciling.size === 0 && ctx.relayUrl !== undefined;
 }
 
 /** One merge at a time, and only with a free execution slot for its tests. */
@@ -361,9 +369,11 @@ function remind(ctx: Ctx, task: TaskRow): void {
 		if (changes === 0) return;
 		const hold = readBranchHold(ctx.store, task.id);
 		const rejectedNote =
-			hold === undefined
-				? rejectedApprovalNote(ctx.store.latestApproval(task.id), task.posted_head)
-				: holdNote({ ...hold, taskId: task.id });
+			hold !== undefined
+				? holdNote({ ...hold, taskId: task.id })
+				: task.reason === INTERRUPTED_KEPT_REASON
+					? interruptedNext(task.id)
+					: rejectedApprovalNote(ctx.store.latestApproval(task.id), task.posted_head);
 		enqueueTask(ctx, task, "review_reminder", reviewReminder({ taskId: task.id, prUrl: task.pr_url, rejectedNote }));
 	});
 }
@@ -496,6 +506,7 @@ export function createEngine(options: EngineOptions): Engine {
 		busy: new Map<number, string>(),
 		enforcement: undefined,
 		recoveryPending: 0,
+		reconciling: new Set<number>(),
 		track: (kind, taskId, work) => track(ctx, state, kind, taskId, work),
 		kick,
 	};

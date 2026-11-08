@@ -15,6 +15,12 @@
  *      merge); review steps and archives that did not complete are redone (comparing with GitHub before any push,
  *      finding the PR before opening one). Anything unresolved freezes the group; a push GitHub refuses because the
  *      branch changed outside the Coordinator is resolved (definite: nothing pushed) and holds only that task.
+ *      Effect evidence (Agent Execution § Uncertain Effects; engine/intents.ts): every file change or check still
+ *      pending is reconciled from its target before any job touches the task's worktree; the jobs run only once the
+ *      kills above and the watchdog's sweep are verified (termination confirmed). Unresolved → the group freezes and
+ *      the job waits for the owner. An interrupted run's worktree is NOT reviewed, committed or pushed: its changes
+ *      since the last checkpoint stay there, its users are told which files they are and what reconciliation found,
+ *      and only a reply (a fresh run, seeded with them) or /cancel (the archive's final checkpoint) moves them on.
  *      A run still 'starting' that never reached Pi (no Pi process recorded, no run key opened for its generation)
  *      did not start from Pi's point of view: it goes back to the queue (same run row and request id, so the same
  *      FIFO place; pending steers stay pending), at most START_RETURNS_LIMIT times, then its task fails. A first
@@ -27,7 +33,7 @@
 
 import { UNVERIFIED_SWEEP } from "../../watchdog/protocol.ts";
 import { agentQueuePosition } from "../admission.ts";
-import { requeuedAfterRestart, sha7 } from "../messages.ts";
+import { INTERRUPTED_KEPT_REASON, interruptedKept, requeuedAfterRestart, sha7 } from "../messages.ts";
 import type { RunnerRef } from "../ports.ts";
 import {
 	branchName,
@@ -36,9 +42,12 @@ import {
 	enqueueTask,
 	type FollowupRow,
 	freezeGroup,
+	INTERRUPTED_PREFIX,
+	interruptedKey,
 	loadTask,
 	type RunRow,
 	restartReturnsKey,
+	runNumber,
 	setupStateKey,
 	sleep,
 	type TaskRow,
@@ -49,8 +58,9 @@ import {
 	worktreeCheckKey,
 	worktreePath,
 } from "./context.ts";
-import { archiveEnded, effectFailed, ghRead, terminalText } from "./effects.ts";
+import { archiveEnded, effectFailed, ghRead, lastPushed, terminalText } from "./effects.ts";
 import { expireFollowup, expireFollowups } from "./finalize.ts";
+import { reconciledOf, settleTaskEffects, tasksWithOpenIntents } from "./intents.ts";
 import { closeAllRunKeys } from "./keys.ts";
 import { reviewStep } from "./review.ts";
 import { watchdogSweep } from "./watchdog.ts";
@@ -63,6 +73,10 @@ export const START_RETURNS_LIMIT = 3;
 export type RecoveryJob =
 	| { readonly kind: "review"; readonly runId: number; readonly taskId: number; readonly interrupted: boolean }
 	| { readonly kind: "archive"; readonly taskId: number }
+	/** A run interrupted by the restart: reconcile its effects, then tell its users what the worktree keeps. */
+	| { readonly kind: "interrupted"; readonly taskId: number; readonly runId: number }
+	/** Effect evidence of a task no other job covers (pending or unresolved intents). */
+	| { readonly kind: "effects"; readonly taskId: number }
 	/** The local worktree and branch of a first run that never started (worktreeCheckKey says what to do). */
 	| { readonly kind: "worktree"; readonly taskId: number };
 
@@ -161,12 +175,13 @@ function interruptRun(ctx: Ctx, run: RunRow, now: number, jobs: RecoveryJob[]): 
 	);
 	for (const followup of followups) expireFollowup(ctx, followup, "interrupted");
 	const task = loadTask(ctx, run.task_id);
-	if (TERMINAL_TASK_STATES.has(task.state) || task.cancel_requested === 1) return;
+	// An ended task's archive job (unfinishedWork) reconciles the run's effects before its final checkpoint.
+	if (TERMINAL_TASK_STATES.has(task.state)) return;
 	if (task.worktree_path !== null) {
-		// Its work goes to GitHub (checkpoint, push, PR) and the task waits in review.
-		jobs.push({ kind: "review", runId: run.id, taskId: task.id, interrupted: true });
+		keepInterrupted(ctx, task, run, now, jobs);
 		return;
 	}
+	if (task.cancel_requested === 1) return;
 	// Nothing ran yet and there is no worktree to review: the task fails (never resubmitted).
 	ctx.store.run(
 		"UPDATE runs SET state = 'cancelled', reason = 'task failed', ended_at = ? WHERE task_id = ? AND state = 'queued'",
@@ -180,6 +195,27 @@ function interruptRun(ctx: Ctx, run: RunRow, now: number, jobs: RecoveryJob[]): 
 		task.id,
 	);
 	jobs.push({ kind: "archive", taskId: task.id });
+}
+
+/**
+ * A run interrupted with a worktree (Interfaces and Storage § Recovery: "Its task keeps its worktree, branch and pull
+ * request"): nothing of it is tested, committed or pushed here, so edits since the last checkpoint are neither pushed
+ * nor dropped. The task waits in review, where a reply starts a fresh run seeded with the branch's current changes
+ * and /cancel archives it (its final checkpoint pushes them), but neither touches the worktree before the
+ * "interrupted" job has reconciled the run's effects and told the users what the worktree keeps. No head is posted
+ * meanwhile, so /approve is refused (approving the last checkpoint would leave these changes behind). Inside the tx.
+ */
+function keepInterrupted(ctx: Ctx, task: TaskRow, run: RunRow, now: number, jobs: RecoveryJob[]): void {
+	ctx.store.setMeta(interruptedKey(task.id), String(run.id));
+	ctx.store.run(
+		`UPDATE tasks SET state = CASE WHEN state = 'running' THEN 'review' ELSE state END, reason = ?, posted_head = NULL,
+		   review_since = NULL, review_reminded = 0, updated_at = ?
+		 WHERE id = ?`,
+		INTERRUPTED_KEPT_REASON,
+		now,
+		task.id,
+	);
+	addJob(jobs, { kind: "interrupted", taskId: task.id, runId: run.id });
 }
 
 /**
@@ -277,13 +313,35 @@ function reconcileRun(ctx: Ctx, run: RunRow, now: number, jobs: RecoveryJob[]): 
 	else interruptRun(ctx, run, now, jobs);
 }
 
+/** Interrupted runs whose reconciliation and notice did not complete (another restart, a freeze). In the tx. */
+function interruptedWork(ctx: Ctx, jobs: RecoveryJob[]): void {
+	const marks = ctx.store.all<{ key: string; value: string }>(
+		"SELECT key, value FROM meta WHERE substr(key, 1, ?) = ? ORDER BY key",
+		INTERRUPTED_PREFIX.length,
+		INTERRUPTED_PREFIX,
+	);
+	for (const { key, value } of marks) {
+		addJob(jobs, { kind: "interrupted", taskId: Number(key.slice(INTERRUPTED_PREFIX.length)), runId: Number(value) });
+	}
+}
+
 /** Review steps and archives that did not complete before the restart. Inside the transaction. */
 function unfinishedWork(ctx: Ctx, jobs: RecoveryJob[]): void {
+	interruptedWork(ctx, jobs);
+	// Not for a task whose later run was interrupted: that review would commit and push the interrupted run's changes
+	// (the next run's review supersedes it). Checked on the runs themselves, not only on the mark: the mark is cleared
+	// once the users are told, but the interrupted run's changes stay in the worktree until a reply's run or /cancel,
+	// so a later restart or recheck must not redo the earlier review either.
 	const unreviewed = ctx.store.all<{ id: number; task_id: number }>(
 		`SELECT r.id, r.task_id FROM runs r JOIN tasks t ON t.id = r.task_id
 		 WHERE r.state = 'finished' AND r.review_done = 0 AND t.cancel_requested = 0
 		   AND t.state NOT IN ('merged', 'failed', 'cancelled')
+		   AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ? || t.id)
+		   AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.task_id = r.task_id AND later.id > r.id
+		     AND later.state = 'failed' AND later.reason = ?)
 		 ORDER BY r.id`,
+		INTERRUPTED_PREFIX,
+		INTERRUPTED_REASON,
 	);
 	for (const run of unreviewed) jobs.push({ kind: "review", runId: run.id, taskId: run.task_id, interrupted: false });
 	const unarchived = ctx.store.all<{ id: number }>(
@@ -297,6 +355,10 @@ function unfinishedWork(ctx: Ctx, jobs: RecoveryJob[]): void {
 	);
 	for (const { key } of checks)
 		addJob(jobs, { kind: "worktree", taskId: Number(key.slice(WORKTREE_CHECK_PREFIX.length)) });
+	// Pending or unresolved effects of a task no job above covers (each job reconciles its task's effects first).
+	for (const taskId of tasksWithOpenIntents(ctx.store)) {
+		if (!jobs.some((job) => job.taskId === taskId)) jobs.push({ kind: "effects", taskId });
+	}
 }
 
 /** Step 3 in the database: one transaction. */
@@ -445,9 +507,65 @@ async function reconcileFirstWorktree(ctx: Ctx, taskId: number): Promise<void> {
 	ctx.log.info("recovery_worktree_discarded", { task: taskId });
 }
 
-/** Run one recovery job; review jobs reserve an execution slot for their tests. */
+/** What the task does next, for the notice: a follow-up run queued meanwhile, a cancel, or a reply. */
+function nextStep(ctx: Ctx, task: TaskRow): "reply" | "queued" | "cancelling" {
+	if (task.cancel_requested === 1) return "cancelling";
+	const queued = ctx.store.get<{ n: number }>(
+		"SELECT COUNT(*) AS n FROM runs WHERE task_id = ? AND state = 'queued'",
+		task.id,
+	)?.n;
+	return (queued ?? 0) > 0 ? "queued" : "reply";
+}
+
+/**
+ * The interrupted run's effects are reconciled (runRecoveryJob did it first): tell its users what its worktree keeps
+ * since the last checkpoint and what reconciliation found, then let replies, /cancel and reminders work on it. The
+ * mark is cleared in the same transaction as the notice, so another restart before that redoes it, never twice.
+ */
+async function reportInterrupted(ctx: Ctx, job: Extract<RecoveryJob, { kind: "interrupted" }>): Promise<void> {
+	if (ctx.store.getMeta(interruptedKey(job.taskId)) === undefined) return;
+	const task = loadTask(ctx, job.taskId);
+	const path = task.worktree_path;
+	const changes = path === null ? undefined : await ctx.git.uncommittedChanges(path).catch(() => undefined);
+	const run = ctx.store.get<RunRow>("SELECT * FROM runs WHERE id = ?", job.runId);
+	tx(ctx, () => {
+		const now = ctx.now();
+		ctx.store.run("DELETE FROM meta WHERE key = ?", interruptedKey(job.taskId));
+		const current = loadTask(ctx, job.taskId);
+		if (TERMINAL_TASK_STATES.has(current.state)) return;
+		if (current.state === "review") {
+			ctx.store.run(
+				"UPDATE tasks SET review_since = ?, review_reminded = 0, updated_at = ? WHERE id = ?",
+				now,
+				now,
+				current.id,
+			);
+		}
+		const text = interruptedKept({
+			taskId: current.id,
+			runNo: run === undefined ? 1 : runNumber(ctx, run),
+			branch: current.branch,
+			changes,
+			effects: reconciledOf(ctx.store, job.runId),
+			pushedHead: lastPushed(ctx, current),
+			prUrl: current.pr_url,
+			next: nextStep(ctx, current),
+		});
+		enqueueTask(ctx, current, "task_interrupted", text);
+	});
+	ctx.log.info("recovery_interrupted_kept", { task: job.taskId, run: job.runId, changes: changes?.length });
+}
+
+/**
+ * Run one recovery job; review jobs reserve an execution slot for their tests. Every job but a first run's worktree
+ * check (that run never reached Pi) first reconciles the task's pending effects: an unresolved one freezes the group
+ * and stops the job (UnknownEffect), which is redone after the owner's review.
+ */
 export async function runRecoveryJob(ctx: Ctx, job: RecoveryJob): Promise<void> {
 	if (job.kind === "worktree") return reconcileFirstWorktree(ctx, job.taskId);
+	await settleTaskEffects(ctx, job.taskId);
+	if (job.kind === "effects") return;
+	if (job.kind === "interrupted") return reportInterrupted(ctx, job);
 	if (job.kind === "archive") {
 		// A final push refused because the branch changed outside the Coordinator holds the task (no freeze).
 		await archiveEnded(ctx, job.taskId);

@@ -34,7 +34,11 @@ test outputs, the watchdog and the GitHub repository settings. Untrusted: model 
 - **Fail closed.** If Docker or the images are unavailable, or the Pi process isolation (systemd, the slice, the
   host setup), or the watchdog (no verified sweep, or no heartbeat for 15 s), no execution starts; commands are still
   saved and queued. If a stop or a GitHub outcome cannot be confirmed, by the Coordinator or by the watchdog, the group
-  freezes until the owner resolves it and unfreezes it with the owner CLI. A push GitHub refuses because a task branch
+  freezes until the owner resolves it and unfreezes it with the owner CLI. So does a file change whose outcome stays
+  unknown: each `edit`/`write` saves its intent (file, hash before, intended hash) before it runs; after an unknown
+  outcome the run is stopped and, once its processes and containers are verified gone, the Coordinator hashes the
+  file itself (no symlink followed, confined to the worktree): applied or currently unchanged, else frozen. An
+  interrupted run's changes are never committed or pushed at recovery. A push GitHub refuses because a task branch
   was changed outside the Coordinator is a known outcome (nothing was pushed): the Coordinator never force-pushes, and
   only that task waits, with its worktree kept, until the branch is restored.
 - **Logs are metadata only:** ids, counts, outcomes, denial categories and hashes; never message text, prompts, tool

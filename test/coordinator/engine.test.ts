@@ -10,16 +10,22 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { type TestContext, test } from "node:test";
 import type { Update } from "grammy/types";
+import { ownerUnfreeze } from "../../src/cli/owner.ts";
 import { admitRun } from "../../src/coordinator/admission.ts";
 import { ConfigError, type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { startCoordinator } from "../../src/coordinator/coordinator.ts";
 import type { DiskProbe } from "../../src/coordinator/disk.ts";
 import type { WatchdogOptions } from "../../src/coordinator/engine/context.ts";
-import { INTERRUPTED_NOTE } from "../../src/coordinator/engine/review.ts";
 import { createEngine, type Engine } from "../../src/coordinator/engine.ts";
 import { type Git, GitError } from "../../src/coordinator/git.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
 import {
+	INTERRUPTED_KEPT_REASON,
+	UNCERTAIN_TOOL_RESULT,
+	uncertainChangeReason,
+} from "../../src/coordinator/messages.ts";
+import {
+	type FsResponse,
 	type GitHubApi,
 	GitHubError,
 	type PullRequest,
@@ -34,7 +40,7 @@ import {
 import { hashRunKey } from "../../src/coordinator/relay.ts";
 import { createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
 import { Store } from "../../src/coordinator/store.ts";
-import type { FromRunner, RunnerStart, ToRunner } from "../../src/runner/protocol.ts";
+import type { FromRunner, RunnerStart, ToolResult, ToRunner } from "../../src/runner/protocol.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
 import { sleep, waitFor } from "../helpers/env.ts";
 import { sandboxReaper, startTestWatchdog, verifiedWatchdog } from "../helpers/watchdog.ts";
@@ -225,6 +231,18 @@ function createWorld() {
 				.filter((key) => a.get(key) !== tree.get(key))
 				.map((key) => `M ${key}`)
 				.join("\n");
+		},
+		async uncommittedChanges(path) {
+			const tree = await readTree(path);
+			const head = files(wt(path).head);
+			const changes = [...new Set([...tree.keys(), ...head.keys()])]
+				.filter((key) => tree.get(key) !== head.get(key))
+				.sort()
+				.map((key) => ({
+					path: key,
+					change: !head.has(key) ? ("new" as const) : !tree.has(key) ? ("deleted" as const) : ("modified" as const),
+				}));
+			return changes;
 		},
 		async showFile(rev, path) {
 			return files(rev).get(path);
@@ -1234,6 +1252,130 @@ test("tool calls get the second-layer policy, run only in the run's sandbox, and
 	assert.equal(taskRow(h, taskId).state, "review");
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// Uncertain effects in a live run (Agent Execution § Uncertain Effects)
+
+/** The local sandbox, with the agent container's answers for `path` replaced by `answer` (after `effect` ran). */
+function answerFor(
+	path: string,
+	effect: (worktree: string, real: () => Promise<FsResponse>) => Promise<void>,
+	answer: FsResponse,
+): (local: Sandbox) => Sandbox {
+	return (local) => ({
+		...local,
+		async startAgent(spec) {
+			const box = await local.startAgent(spec);
+			return {
+				name: box.name,
+				stop: () => box.stop(),
+				async fileOp(request, signal) {
+					if (request.path !== path) return box.fileOp(request, signal);
+					await effect(spec.worktree, () => box.fileOp(request, signal));
+					return answer;
+				},
+			};
+		},
+	});
+}
+
+/** A run that writes `path`, reports its result, then (aborted) takes `stopMs` to exit. */
+function changeThenStop(path: string, content: string, results: ToolResult[], stopMs: number): Script {
+	return async (run) => {
+		run.emit({ type: "ready" });
+		run.emit({ type: "tool", id: 1, name: "write", args: { path, content } });
+		results.push(((await run.next("tool_result")) as Extract<ToRunner, { type: "tool_result" }>).result);
+		await run.next("abort");
+		await sleep(stopMs);
+		run.emit({ type: "finished", outcome: "aborted", delivered: [], unconsumed: [], answered: [] });
+		run.exit(0);
+	};
+}
+
+test("an unknown outcome stops the run; dispatch waits until its stop is verified and the target reconciled (applied); the archive says so", async (t) => {
+	const h = await harness(t, {
+		sandbox: answerFor(
+			"uncertain.txt",
+			async (_worktree, real) => {
+				await real(); // the write reached the file, but its answer was lost
+			},
+			{ ok: false, code: "timeout", message: "file operation timed out", uncertain: true },
+		),
+	});
+	const results: ToolResult[] = [];
+	const uncertainScript = changeThenStop("uncertain.txt", "intended\n", results, 400);
+	h.fake.control.script = (run) => (run.start.taskId === first ? uncertainScript(run) : workScript()(run));
+	const first = submitTask(h, "alpha", "first");
+	h.engine.kick();
+	await waitFor(() => results.length === 1, { what: "the uncertain answer" });
+	assert.deepEqual(results[0], { ok: false, text: UNCERTAIN_TOOL_RESULT }, "the model is told not to repeat it");
+	// Another agent's task is admitted while the stopped run's change is not reconciled yet.
+	const second = submitTask(h, "beta", "second");
+	h.engine.kick();
+	await h.engine.idle();
+	const [intent] = h.store.all<{ state: string; reconciled: number; settled_at: number; path: string }>(
+		"SELECT * FROM effect_intents WHERE task_id = ?",
+		first,
+	);
+	assert.deepEqual([intent?.path, intent?.state, intent?.reconciled], ["uncertain.txt", "applied", 1]);
+	const dispatched = h.store.get<{ dispatched_at: number }>("SELECT dispatched_at FROM runs WHERE task_id = ?", second);
+	assert.ok(
+		(dispatched?.dispatched_at ?? 0) >= (intent?.settled_at ?? Number.POSITIVE_INFINITY),
+		"dispatch stayed blocked until reconciliation finished",
+	);
+	const task = taskRow(h, first);
+	assert.equal(task.state, "failed");
+	assert.equal(task.reason, uncertainChangeReason("uncertain.txt"));
+	const [final] = messages(h, "task_final").filter((m) => m.task_id === first);
+	assert.match(
+		final?.text ?? "",
+		/Reconciled after the stop: uncertain\.txt \(write\): applied \(the file has the intended result\)\./,
+	);
+	// Archived only after reconciliation: its final checkpoint holds the reconciled file.
+	assert.equal(h.world.files(h.world.remote.get(`task/${first}`) as string).get("uncertain.txt"), "intended\n");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(taskRow(h, second).state, "review");
+});
+
+test("a refusal that left the file in a third state freezes the group; nothing archives until the owner's unfreeze records the resolution", async (t) => {
+	const h = await harness(t, {
+		sandbox: answerFor("third.txt", async (worktree) => writeFile(join(worktree, "third.txt"), "THIRD STATE\n"), {
+			ok: false,
+			code: "io",
+			message: "third.txt: no space left on the task disk",
+		}),
+	});
+	const results: ToolResult[] = [];
+	h.fake.control.script = changeThenStop("third.txt", "INTENDED\n", results, 0);
+	const taskId = submitTask(h, "alpha", "third");
+	h.engine.kick();
+	await waitFor(() => results.length === 1, { what: "the refusal" });
+	await h.engine.idle();
+	assert.deepEqual(results[0], { ok: false, text: UNCERTAIN_TOOL_RESULT });
+	const group = h.store.groupState(CHAT);
+	assert.deepEqual(
+		[group.state, group.reason],
+		["frozen", `the outcome of a file change of Task ${taskId} could not be reconciled (third.txt)`],
+	);
+	const [told] = messages(h, "effect_unresolved");
+	assert.match(told?.text ?? "", /third\.txt matches neither its content before the change nor the intended result/);
+	assert.ok(!JSON.stringify(messages(h)).includes("THIRD STATE"), "never the file's content");
+	// The running task is cancelled by the freeze, but its worktree is not archived (no final checkpoint or push).
+	const task = taskRow(h, taskId);
+	assert.deepEqual([task.state, task.reason], ["cancelled", "group frozen"]);
+	assert.ok(task.worktree_path !== null && existsSync(task.worktree_path), "the worktree is kept");
+	assert.equal(h.world.remote.get(`task/${taskId}`), undefined, "nothing pushed");
+	assert.equal(await readFile(join(task.worktree_path, "third.txt"), "utf8"), "THIRD STATE\n");
+
+	// The owner reviews the file and unfreezes: the resolution is recorded, the recheck archives the task.
+	assert.equal(ownerUnfreeze(h.store, CHAT).ok, true);
+	const [row] = h.store.all<{ state: string; resolution: string }>("SELECT * FROM effect_intents");
+	assert.equal(row?.state, "resolved");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).worktree_path, null, "archived after the owner's review");
+	assert.equal(h.world.files(h.world.remote.get(`task/${taskId}`) as string).get("third.txt"), "THIRD STATE\n");
+});
+
 test("the run deadline fails the task, closes nothing it lacks and archives the worktree", async (t) => {
 	const h = await harness(t, { limits: { runDeadlineMs: 300 } });
 	h.fake.control.script = holdScript();
@@ -1249,7 +1391,7 @@ test("the run deadline fails the task, closes nothing it lacks and archives the 
 	assert.match(messages(h, "task_final")[0]?.text ?? "", /failed: 300 ms run deadline\. Branch task\/\d+ kept\./);
 });
 
-test("restart recovery: the interrupted task's review step (a check container) waits for a fresh watchdog heartbeat, like dispatch", async (t) => {
+test("restart recovery: the interrupted task's reconciliation waits for a fresh watchdog heartbeat, like dispatch; its work is never pushed", async (t) => {
 	const h1 = await harness(t);
 	h1.fake.control.script = holdScript();
 	const taskId = submitTask(h1, "alpha", "original task text");
@@ -1269,16 +1411,21 @@ test("restart recovery: the interrupted task's review step (a check container) w
 	h2.engine.kick();
 	await h2.engine.idle();
 	assert.equal(runsOf(h2, taskId)[0]?.state, "failed", "step 3 ran: the run is failed as interrupted");
-	assert.notEqual(taskRow(h2, taskId).state, "review", "the review step has not run");
+	assert.equal(h2.store.getMeta(`restart_interrupted:${taskId}`), String(runsOf(h2, taskId)[0]?.id));
+	assert.equal(messages(h2, "task_interrupted").length, 0, "not reconciled yet: the watchdog has not confirmed");
 	assert.equal(h2.world.remote.get(`task/${taskId}`), undefined, "nothing tested, committed or pushed");
 	assert.equal(h2.fake.runs.length, 0, "nothing dispatched either");
 	assert.equal(messages(h2, "watchdog_unavailable").length, 1, "the group is told execution is paused");
 
 	heartbeatAgeMs = 0;
 	h2.engine.kick();
-	await waitFor(() => taskRow(h2, taskId).state === "review", { what: "the review step once the watchdog is back" });
+	await waitFor(() => messages(h2, "task_interrupted").length === 1, { what: "reconciled once the watchdog is back" });
 	await h2.engine.idle();
-	assert.equal(h2.world.files(h2.world.remote.get(`task/${taskId}`) as string).get("wip.txt"), "work in progress\n");
+	assert.equal(h2.store.getMeta(`restart_interrupted:${taskId}`), undefined);
+	assert.deepEqual([taskRow(h2, taskId).state, taskRow(h2, taskId).reason], ["review", INTERRUPTED_KEPT_REASON]);
+	assert.equal(h2.world.remote.get(`task/${taskId}`), undefined, "still nothing committed or pushed");
+	const worktree = taskRow(h2, taskId).worktree_path as string;
+	assert.equal(await readFile(join(worktree, "wip.txt"), "utf8"), "work in progress\n", "kept in the worktree");
 	assert.deepEqual(
 		h2.fake.runs.map((run) => run.start.taskId),
 		[queuedOther],
@@ -1320,13 +1467,37 @@ test("restart recovery: running run failed as interrupted, conversation quaranti
 
 	h2.engine.kick();
 	await h2.engine.idle();
-	// The interrupted task's work is pushed and it waits in review; the interrupted run is never resubmitted.
+	// The interrupted task waits in review with its work kept, uncommitted and unpushed, in its worktree; the
+	// interrupted run is never resubmitted.
 	const task = taskRow(h2, taskId);
 	assert.equal(task.state, "review");
-	assert.equal(task.reason, INTERRUPTED_NOTE);
-	assert.equal(h2.world.files(h2.world.remote.get(`task/${taskId}`) as string).get("wip.txt"), "work in progress\n");
-	assert.ok(task.pr_number);
-	assert.ok(messages(h2, "task_review").some((m) => /was interrupted by restart/.test(m.text)));
+	assert.equal(task.reason, INTERRUPTED_KEPT_REASON);
+	assert.equal(task.posted_head, null, "no head to approve: the kept changes are in no commit");
+	assert.equal(h2.world.remote.get(`task/${taskId}`), undefined, "nothing committed or pushed");
+	assert.equal(task.pr_number, null);
+	assert.equal(await readFile(join(task.worktree_path as string, "wip.txt"), "utf8"), "work in progress\n");
+	const [notice] = messages(h2, "task_interrupted");
+	assert.match(
+		notice?.text ?? "",
+		/^Task \d+ was interrupted by restart \(run 1\)\. It is not resumed, and nothing was committed/,
+	);
+	assert.match(notice?.text ?? "", /changed since the last checkpoint: wip\.txt \(new\)\./);
+	assert.ok(!(notice?.text ?? "").includes("work in progress"), "file names only, never content");
+	assert.equal(
+		messages(h2, "task_review").filter((m) => m.task_id === taskId).length,
+		0,
+		"no review step ran for the interrupted task",
+	);
+	// The write had answered before the restart: its intent was settled then, nothing to reconcile.
+	assert.deepEqual(
+		h2.store
+			.all<{ tool: string; path: string; state: string }>(
+				"SELECT tool, path, state FROM effect_intents WHERE task_id = ?",
+				taskId,
+			)
+			.map((row) => ({ ...row })),
+		[{ tool: "write", path: "wip.txt", state: "applied" }],
+	);
 	assert.deepEqual(
 		h2.fake.runs.map((run) => run.start.taskId),
 		[queuedOther],
@@ -1342,6 +1513,10 @@ test("restart recovery: running run failed as interrupted, conversation quaranti
 	assert.match(fresh.start.input.content, /original task text/);
 	assert.match(fresh.start.input.content, /please continue/);
 	assert.match(fresh.start.input.content, /wip\.txt/);
+	assert.match(
+		fresh.start.input.content,
+		/Not committed yet \(left in the worktree since the last checkpoint\): wip\.txt \(new\)/,
+	);
 	const run2 = runsOf(h2, taskId)[1] as RunRecord;
 	assert.notEqual(run2.conversation_id, interrupted.conversation_id);
 	const row = h2.store.get<{ parent_id: string }>(
@@ -1351,6 +1526,10 @@ test("restart recovery: running run failed as interrupted, conversation quaranti
 	assert.equal(row?.parent_id, interrupted.conversation_id);
 	assert.equal(taskRow(h2, taskId).state, "review");
 	assert.equal(taskRow(h2, taskId).reason, null);
+	// That run's review step commits and pushes everything, the interrupted run's kept work included, for review.
+	const pushed = h2.world.files(h2.world.remote.get(`task/${taskId}`) as string);
+	assert.equal(pushed.get("wip.txt"), "work in progress\n");
+	assert.equal(pushed.get("src/resume.js"), "export const resumed = true;\n");
 });
 
 test("restart while a first run was starting and leftovers cannot be verified gone: queued again, its slot kept and nothing dispatched until the owner unfreezes; then it runs once", async (t) => {
@@ -2047,6 +2226,57 @@ test("a held review survives a restart: recovery redoes the refused push without
 	assert.equal(holdOf(h2, taskId), undefined);
 	assert.match(messages(h2, "task_review").at(-1)?.text ?? "", /is ready for review \(run 2\)/);
 	assert.equal(h2.world.remote.get(branch), taskRow(h2, taskId).posted_head);
+});
+
+test("a held review, then a later run interrupted by restart: no later restart redoes the held review, so the interrupted run's kept changes are never committed, pushed or posted by it", async (t) => {
+	const clock = { later: 0 };
+	const now = () => Date.now() + clock.later;
+	const h1 = await harness(t, { now });
+	const { taskId, branch, posted, foreign } = await rejectedAfterForeignPush(h1);
+	// Run 2 finishes, but GitHub refuses its push (the branch moved): held in review, its review step not done.
+	h1.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h1, taskId, "more");
+	h1.engine.kick();
+	await h1.engine.idle();
+	assert.equal(holdOf(h1, taskId)?.kind, "review");
+	const run2 = runsOf(h1, taskId)[1] as RunRecord;
+	assert.deepEqual([run2.state, run2.review_done], ["finished", 0]);
+	// Run 3, a follow-up admitted while held, writes wip.txt; the Coordinator goes away mid-run.
+	h1.fake.control.script = holdScript();
+	followupRun(h1, taskId, "and wip");
+	h1.engine.kick();
+	await waitFor(() => h1.fake.runs[2]?.received.some((m) => m.type === "tool_result") === true, {
+		what: "run 3's write",
+	});
+	await h1.engine.stop();
+
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, now });
+	await h2.engine.recover();
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(messages(h2, "task_interrupted").length, 1);
+	assert.equal(h2.store.getMeta(`restart_interrupted:${taskId}`), undefined, "the users were told: the mark is gone");
+	assert.deepEqual([taskRow(h2, taskId).state, taskRow(h2, taskId).reason], ["review", INTERRUPTED_KEPT_REASON]);
+	assert.equal(h2.world.remote.get(branch), foreign);
+	// The branch is restored on GitHub; the held look does not take it up (the kept changes wait for a reply).
+	h2.world.remote.set(branch, posted);
+	await nextHeldLook(h2, clock);
+	assert.equal(h2.world.remote.get(branch), posted, "the held look pushed nothing");
+	const reviews = messages(h2, "task_review").length;
+	await h2.engine.stop();
+
+	// Another restart: run 2's unfinished review is not redone (it would commit and push wip.txt and post a head).
+	const h3 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, now });
+	await h3.engine.recover();
+	h3.engine.kick();
+	await h3.engine.idle();
+	assert.equal(h3.store.groupState(CHAT).state, "normal");
+	assert.equal(h3.world.remote.get(branch), posted, "nothing pushed at the second restart");
+	const task = taskRow(h3, taskId);
+	assert.deepEqual([task.state, task.reason, task.posted_head], ["review", INTERRUPTED_KEPT_REASON, null]);
+	assert.equal(messages(h3, "task_review").length, reviews, "no review posted");
+	assert.equal(await readFile(join(task.worktree_path as string, "wip.txt"), "utf8"), "work in progress\n");
+	assert.equal(h3.fake.runs.length, 0, "nothing resumed");
 });
 
 test("a held review, then /cancel: the hold becomes an archive hold; it survives a restart (no second message, worktree kept); restored → run 2's checkpoint pushed, archived", async (t) => {

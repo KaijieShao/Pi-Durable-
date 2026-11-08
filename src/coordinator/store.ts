@@ -16,7 +16,7 @@ import { splitTelegramText } from "./telegram/split.ts";
  * same. The Coordinator and the watchdog open this file each with their own connection; whichever comes first
  * migrates, inside one `BEGIN IMMEDIATE` transaction (the other waits, then finds the current version).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Version 1 of the schema, exactly as it shipped (exported for the upgrade test). */
 export const SCHEMA_V1 = `
@@ -250,6 +250,31 @@ CREATE TABLE watchdog_sweeps (
 CREATE INDEX watchdog_sweeps_state ON watchdog_sweeps(state, id);
 CREATE INDEX watchdog_sweeps_run ON watchdog_sweeps(run_id, generation);
 ALTER TABLE runs ADD COLUMN dispatched_at INTEGER;
+`,
+	// 2 → 3: the effect ledger (Agent Execution § Uncertain Effects; src/coordinator/engine/intents.ts). One row per
+	// file change (edit/write) or run_check of a run, saved BEFORE the container executes it: the target, its state
+	// before ("absent", "sha256:<hex>", ...) and the state the change intends. Settled when the container answers;
+	// a row still pending after a crash (or a stop that cut it) is reconciled from the target once the run's processes
+	// and containers are verified gone. Metadata only: paths and hashes, never content.
+	`
+CREATE TABLE effect_intents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  task_id INTEGER NOT NULL,
+  tool TEXT NOT NULL CHECK (tool IN ('edit','write','run_check')),
+  path TEXT,                                    -- edit/write: the worktree-relative target; NULL for run_check
+  operation TEXT,                               -- run_check: the approved operation; NULL otherwise
+  pre_hash TEXT,                                -- the target before the change ('absent', 'sha256:<hex>', ...)
+  intended_hash TEXT,                           -- the target if the change applies
+  state TEXT NOT NULL CHECK (state IN ('pending','applied','failed','unchanged','unresolved','resolved','done')),
+  observed_hash TEXT,                           -- what reconciliation found
+  reconciled INTEGER NOT NULL DEFAULT 0,        -- 1: settled by reconciliation, not by the container's answer
+  resolution TEXT,                              -- the owner's resolution of an unresolved row
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER
+);
+CREATE INDEX effect_intents_task ON effect_intents(task_id, state);
+CREATE INDEX effect_intents_run ON effect_intents(run_id);
 `,
 ];
 

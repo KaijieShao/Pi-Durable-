@@ -10,7 +10,8 @@
  *   run or follow-up and no message, and the redelivered update is then applied once.
  * - Coordinator kill mid-run (evaluation.md; interfaces-and-storage.md § Recovery After a Restart; requirements.md
  *   § Durability, § No duplicate submissions, § Safe recovery): the run fails "interrupted by restart" and never
- *   resumes, its worktree, branch and conversation (quarantined) are kept, its steer expires "(interrupted)" with a
+ *   resumes, its worktree (with its work, uncommitted and unpushed), branch and conversation (quarantined) are kept,
+ *   its steer expires "(interrupted)" with a
  *   message, queued work (and a steer accepted for it) survives and runs once after recovery, a stranger's reply is
  *   rejected and the creator's starts a fresh conversation seeded with task, follow-up and diff. Once with a graceful
  *   stop (in process) and once with a real SIGKILL of a Coordinator process (stale lock, leftover Pi process; with
@@ -38,6 +39,7 @@ import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { type TestContext, test } from "node:test";
 import { ownerUnfreeze } from "../../src/cli/owner.ts";
+import { INTERRUPTED_KEPT_REASON } from "../../src/coordinator/messages.ts";
 import { Store } from "../../src/coordinator/store.ts";
 import { OFFSET_KEY } from "../../src/coordinator/telegram/poller.ts";
 import { type ApiCall, type FakeBotApi, groupUpdate, type ServerMessage } from "../fixtures/fake-bot-api.ts";
@@ -394,22 +396,27 @@ const MIDRUN_STEPS: readonly FakeStep[] = [
 	{ hang: true },
 ];
 
-/** After recovery: run 1 interrupted, never resumed, its task in review with its work on GitHub. */
+/**
+ * After recovery: run 1 interrupted, never resumed, its task in review with its work kept in the worktree: neither
+ * committed nor pushed (edits since the last checkpoint wait for a reply's fresh run or /cancel), and not lost.
+ */
 async function assertInterrupted(stack: Stack, interrupted: ServerMessage, requestsBefore: number): Promise<void> {
-	assert.match(interrupted.text, /Pull request: https:\/\/github\.com\/acme\/demo\/pull\/1\./);
-	assert.match(interrupted.text, /Reply to this message to start another run \(fresh conversation\)/);
+	assert.match(interrupted.text, /It is not resumed, and nothing was committed or pushed\./);
+	assert.match(interrupted.text, /Kept in its worktree, changed since the last checkpoint: midrun\.txt \(new\)\./);
+	assert.match(interrupted.text, /Reply to this message to start a fresh run that continues from these changes/);
+	assert.ok(!interrupted.text.includes(MIDRUN_CONTENT.trim()), "file names only, never content");
 	const run1 = stack.runs<RunRow>().find((run) => run.task_id === 1);
 	assert.deepEqual([run1?.state, run1?.reason], ["failed", "interrupted by restart"]);
 	const task1 = stack.tasks<TaskRow>()[0];
 	assert.equal(task1?.state, "review");
-	assert.equal(task1?.reason, "interrupted by restart; reply to start another run (fresh conversation)");
-	// The worktree and the branch are kept; the work done before the restart is on GitHub.
+	assert.equal(task1?.reason, INTERRUPTED_KEPT_REASON);
+	// The worktree and the branch are kept; the work done before the restart is in the worktree, not on GitHub.
 	assert.ok(task1?.worktree_path !== null && task1?.worktree_path !== undefined);
 	assert.ok(existsSync(task1.worktree_path), "the worktree is kept");
 	assert.ok((await stack.worktrees()).includes("task-1"));
 	assert.equal(readFileSync(join(task1.worktree_path, "midrun.txt"), "utf8"), MIDRUN_CONTENT);
-	assert.equal(await stack.branchSha("task/1"), task1.head_commit);
-	assert.equal(await fileAtBranch(stack, "task/1", "midrun.txt"), MIDRUN_CONTENT);
+	assert.equal(await stack.branchSha("task/1"), undefined, "nothing of the interrupted run is pushed");
+	assert.equal(task1.posted_head, null, "no head to approve");
 	// Its conversation is quarantined (never written again, never reused).
 	const [conversation] = conversations(stack);
 	assert.equal(conversation?.id, run1?.conversation_id);
@@ -443,8 +450,10 @@ async function assertFreshConversation(stack: Stack, interrupted: ServerMessage)
 	assert.equal(refused.text, "Follow-up rejected: only the creator of Task 1 or the group owner can follow up on it.");
 	const reply = stack.reply(USER1, interrupted.id, FRESH_TEXT);
 	const started = await stack.waitForBotMessage((message) => message.replyTo === reply, { since: interrupted.id });
-	assert.match(started.text, /^Follow-up started another run of Task 1 on the same branch and pull request\./);
+	// Nothing was pushed yet, so there is no pull request: this run's review step opens it.
+	assert.match(started.text, /^Follow-up started another run of Task 1 on the same branch\./);
 	await stack.waitForBotMessage(/^Task 1 is ready for review \(run 2\)/, { since: started.id });
+	assert.equal(await fileAtBranch(stack, "task/1", "midrun.txt"), MIDRUN_CONTENT, "pushed by run 2's review step");
 	const runs = stack.runs<RunRow>().filter((run) => run.task_id === 1);
 	assert.equal(runs.length, 2);
 	const [old, fresh] = conversations(stack).filter((conversation) => conversation.task_id === 1);
@@ -820,8 +829,9 @@ async function assertFrozenCommands(stack: Stack, review2: ServerMessage): Promi
 /** Tasks 1 and 2 in review with PRs; Task 3 running (its model call hangs); Task 4 queued behind it. */
 async function frozenSetup(stack: Stack): Promise<{ review2: ServerMessage }> {
 	stack.sendCommand(USER1, "/task alpha FROZEN-ONE: add one.js");
-	stack.sendCommand(USER2, "/task beta FROZEN-TWO: add two.js");
+	// One after the other, so Task 1 gets pull request #1 and Task 2 #2 (the faults below and the checks name them).
 	await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/);
+	stack.sendCommand(USER2, "/task beta FROZEN-TWO: add two.js");
 	const review2 = await stack.waitForBotMessage(/^Task 2 is ready for review \(run 1\)/);
 	stack.sendCommand(USER1, "/task alpha FROZEN-THREE: add three.js");
 	await waitFor(() => requestsFor(stack, /^FROZEN-THREE/).length === 2, { what: "Task 3 hangs", timeoutMs: 30_000 });

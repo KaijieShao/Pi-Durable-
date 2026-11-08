@@ -3,7 +3,9 @@
  * rejected or set aside and that nothing merged, says why, and offers only what the system supports next
  * (Interfaces and Storage § Telegram: "Each rejection gives its reason"; Architecture § Review and merge). Also the
  * texts of a task held because its branch changed on GitHub outside the Coordinator (a definite refusal of its push:
- * which branch, both heads, nothing merged, what is kept and what to do; no freeze).
+ * which branch, both heads, nothing merged, what is kept and what to do; no freeze). And the texts of a run interrupted
+ * by a restart whose changes stay in the worktree, and of a file change that could not be reconciled (Agent Execution
+ * § Uncertain Effects): file names and outcomes only, the next step the system supports.
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -17,6 +19,9 @@ import {
 	heldApproval,
 	heldFollowupNote,
 	holdNote,
+	interruptedApproval,
+	interruptedKept,
+	interruptedNext,
 	mainMoved,
 	mergeConflict,
 	rejected,
@@ -25,6 +30,8 @@ import {
 	reviewReminder,
 	runAdmitted,
 	staleHead,
+	unresolvedEffect,
+	unresolvedEffectReason,
 } from "../../src/coordinator/messages.ts";
 
 const APPROVED = "5d6e7f80a1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -367,6 +374,90 @@ describe("a task held because its branch changed on GitHub outside the Coordinat
 			heldFollowupNote("task/3"),
 			"Branch task/3 on GitHub still differs from what the Coordinator pushed, so this run's result is pushed only " +
 				"once the branch is restored",
+		);
+	});
+});
+
+describe("an interrupted run's kept changes and an unreconciled file change", () => {
+	const KEPT = {
+		taskId: 4,
+		runNo: 2,
+		branch: "task/4",
+		changes: [
+			{ path: "src/a.js", change: "modified" as const },
+			{ path: "src/new.js", change: "new" as const },
+			{ path: "old.txt", change: "deleted" as const },
+		],
+		effects: [
+			{ tool: "edit" as const, target: "src/a.js", outcome: "applied" as const },
+			{ tool: "write" as const, target: "b.txt", outcome: "unchanged" as const },
+			{ tool: "run_check" as const, target: "test", outcome: "failed" as const },
+		],
+		pushedHead: APPROVED,
+		prUrl: "https://github.com/acme/demo/pull/7",
+		next: "reply" as const,
+	};
+
+	test("what the worktree keeps, what was reconciled, where the last checkpoint is, and the two ways on", () => {
+		assert.equal(
+			interruptedKept(KEPT),
+			[
+				"Task 4 was interrupted by restart (run 2). It is not resumed, and nothing was committed or pushed.",
+				"Kept in its worktree, changed since the last checkpoint: src/a.js, src/new.js (new), old.txt (deleted).",
+				"In flight at the restart, reconciled: src/a.js (edit): applied (the file has the intended result); b.txt " +
+					"(write): currently unchanged (the file is as it was before the change); run_check test: reported failed " +
+					"(its check container was verified gone).",
+				"Branch task/4 and pull request https://github.com/acme/demo/pull/7 still hold the last checkpoint, 5d6e7f8.",
+				"Reply to this message to start a fresh run that continues from these changes (a new conversation; its result " +
+					"is committed, pushed and posted for review), or send /cancel 4 to end the task (its final checkpoint, with " +
+					"these changes, is pushed to branch task/4).",
+			].join("\n"),
+		);
+	});
+
+	test("nothing kept, an unreadable worktree, no checkpoint yet, a queued run or a cancel", () => {
+		const first = { ...KEPT, runNo: 1, changes: [], effects: [], pushedHead: null, prUrl: null };
+		const lines = interruptedKept({ ...first, next: "queued" }).split("\n");
+		assert.deepEqual(lines.slice(1), [
+			"Its worktree has no changes since the last checkpoint.",
+			"A follow-up run is queued: it starts in a fresh conversation and continues from these changes.",
+		]);
+		assert.equal(
+			interruptedKept({ ...first, changes: undefined, next: "cancelling" })
+				.split("\n")
+				.slice(1)
+				.join("\n"),
+			"Its worktree could not be read to list the changes it holds.\n" +
+				"It is being cancelled: its final checkpoint, with these changes, is pushed to branch task/4.",
+		);
+		assert.match(
+			interruptedKept({ ...KEPT, prUrl: null, effects: [{ tool: "edit", target: "a", outcome: "resolved" }] }),
+			/a \(edit\): reviewed by the owner\.\nBranch task\/4 still holds the last checkpoint, 5d6e7f8\./,
+		);
+	});
+
+	test("/approve, the reminder and the freeze name the task, the file and what to do", () => {
+		assert.equal(
+			rejected("/approve", interruptedApproval(4)),
+			"/approve rejected: Task 4 was interrupted by a restart and the changes its run made since the last " +
+				"checkpoint are kept in its worktree, not committed or pushed, so there is no head to approve; reply to " +
+				"its message to start a fresh run that continues from them (the bot then posts a new head to approve), or " +
+				"send /cancel 4.",
+		);
+		assert.match(
+			reviewReminder({ taskId: 4, prUrl: null, rejectedNote: interruptedNext(4) }),
+			/^Reminder: Task 4 is waiting for review\. Its interrupted run's changes are kept in its worktree, not pushed\./,
+		);
+		assert.equal(
+			unresolvedEffectReason(4, ["src/a.js"]),
+			"the outcome of a file change of Task 4 could not be reconciled (src/a.js)",
+		);
+		assert.equal(
+			unresolvedEffect({ taskId: 4, files: ["src/a.js", "b.txt"] }),
+			"Task 4: the outcome of a file change could not be confirmed, and src/a.js, b.txt match neither their " +
+				"content before the change nor the intended result. Nothing of it was committed or pushed. The group is " +
+				"frozen until the owner reviews it and unfreezes the group; /status and /cancel 4 still work (a cancel waits " +
+				"for that review).",
 		);
 	});
 });

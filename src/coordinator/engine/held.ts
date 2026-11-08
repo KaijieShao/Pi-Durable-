@@ -11,6 +11,7 @@
  * next look, never a freeze. A change whose outcome stays unknown freezes the group as everywhere else.
  */
 import { BRANCH_HOLD_PREFIX, type BranchHold, parseBranchHold } from "../branch-hold.ts";
+import { INTERRUPTED_KEPT_REASON } from "../messages.ts";
 import {
 	type Ctx,
 	describeError,
@@ -23,6 +24,7 @@ import {
 	tx,
 } from "./context.ts";
 import { archiveEnded, clearHold, effectFailed } from "./effects.ts";
+import { effectsOpen } from "./intents.ts";
 import { reviewStep } from "./review.ts";
 
 type Held = { readonly taskId: number; readonly hold: BranchHold };
@@ -71,6 +73,9 @@ function stale(ctx: Ctx, task: TaskRow, hold: BranchHold): boolean {
  */
 function lookNow(ctx: Ctx, task: TaskRow, hold: BranchHold): boolean {
 	if (hold.kind === "archive") return true;
+	// An interrupted run's changes wait in the worktree for a reply or /cancel: redoing an earlier run's review would
+	// commit and push them.
+	if (task.reason === INTERRUPTED_KEPT_REASON || effectsOpen(ctx.store, task.id)) return false;
 	return task.state === "review" && task.cancel_requested === 0 && !hasRunInProgress(ctx, task.id);
 }
 

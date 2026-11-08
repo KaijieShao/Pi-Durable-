@@ -7,6 +7,7 @@
  * Interfaces and Storage § Telegram: "Each acknowledgement carries the task ID and queue position. Each rejection
  * gives its reason."
  */
+import type { WorktreeChange } from "./git.ts";
 import { DEMO_LIMITS, type Limits } from "./limits.ts";
 
 export const TELEGRAM_TEXT_LIMIT = 4096;
@@ -642,6 +643,160 @@ export function followupExpired(taskId: number, cause: string): string {
 export function requeuedAfterRestart(taskId: number, position: number): string {
 	return `${taskRef(taskId)} is queued again after a restart: its run had not started yet. Queue position ${position}.`;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Uncertain effects and interrupted runs (Agent Execution § Uncertain Effects; Interfaces and Storage § Recovery
+// After a Restart). File names only, never content.
+
+/**
+ * tasks.reason of a task whose run was interrupted by a restart: its changes since the last checkpoint stay in the
+ * worktree, uncommitted and unpushed, until a reply starts a fresh run or /cancel archives the task. /approve is
+ * refused meanwhile (there is no posted head that holds them).
+ */
+export const INTERRUPTED_KEPT_REASON =
+	"interrupted by restart; its changes since the last checkpoint are kept in the worktree, not pushed; reply to " +
+	"start a fresh run, or /cancel";
+
+/** A file change or check whose outcome was reconciled from its target (or is waiting for the owner). */
+export type ReconciledEffect = {
+	readonly tool: "edit" | "write" | "run_check";
+	/** The file, or the run_check operation. */
+	readonly target: string;
+	readonly outcome: "applied" | "unchanged" | "failed" | "unresolved" | "resolved";
+};
+
+function effectOutcome(effect: ReconciledEffect): string {
+	switch (effect.outcome) {
+		case "applied":
+			return "applied (the file has the intended result)";
+		case "unchanged":
+			return "currently unchanged (the file is as it was before the change)";
+		case "failed":
+			return "reported failed (its check container was verified gone)";
+		case "unresolved":
+			return "unresolved (the file matches neither; the owner reviews it)";
+		case "resolved":
+			return "reviewed by the owner";
+	}
+}
+
+/** "src/a.js (edit): applied (…); run_check test: reported failed (…)". */
+export function reconciledEffects(effects: readonly ReconciledEffect[]): string {
+	return effects
+		.map((effect) =>
+			effect.tool === "run_check"
+				? `run_check ${effect.target}: ${effectOutcome(effect)}`
+				: `${effect.target} (${effect.tool}): ${effectOutcome(effect)}`,
+		)
+		.join("; ");
+}
+
+/** "a.js, new.txt (new), old.txt (deleted)": a worktree's uncommitted changes. */
+export function changeList(changes: readonly WorktreeChange[]): string {
+	return listFiles(
+		changes.map((change) => (change.change === "modified" ? change.path : `${change.path} (${change.change})`)),
+	);
+}
+
+export type InterruptedFacts = {
+	readonly taskId: number;
+	readonly runNo: number;
+	readonly branch: string | null;
+	/** undefined: the worktree could not be read. */
+	readonly changes: readonly WorktreeChange[] | undefined;
+	readonly effects: readonly ReconciledEffect[];
+	/** The last checkpoint on GitHub, if the Coordinator pushed one. */
+	readonly pushedHead: string | null;
+	readonly prUrl: string | null;
+	readonly next: "reply" | "queued" | "cancelling";
+};
+
+function keptLine(changes: readonly WorktreeChange[] | undefined): string {
+	if (changes === undefined) return "Its worktree could not be read to list the changes it holds.";
+	if (changes.length === 0) return "Its worktree has no changes since the last checkpoint.";
+	return `Kept in its worktree, changed since the last checkpoint: ${changeList(changes)}.`;
+}
+
+function lastCheckpointLine(p: InterruptedFacts): string[] {
+	if (p.pushedHead === null || p.branch === null) return [];
+	const pr = p.prUrl === null ? "" : ` and pull request ${p.prUrl}`;
+	const hold = p.prUrl === null ? "holds" : "hold";
+	return [`Branch ${p.branch}${pr} still ${hold} the last checkpoint, ${sha7(p.pushedHead)}.`];
+}
+
+function interruptedNextLine(p: InterruptedFacts): string {
+	const where = p.branch === null ? "its branch" : `branch ${p.branch}`;
+	if (p.next === "cancelling")
+		return `It is being cancelled: its final checkpoint, with these changes, is pushed to ${where}.`;
+	if (p.next === "queued")
+		return "A follow-up run is queued: it starts in a fresh conversation and continues from these changes.";
+	return (
+		"Reply to this message to start a fresh run that continues from these changes (a new conversation; its result " +
+		`is committed, pushed and posted for review), or send /cancel ${p.taskId} to end the task (its final checkpoint, ` +
+		`with these changes, is pushed to ${where}).`
+	);
+}
+
+/**
+ * Posted once a run interrupted by restart is reconciled: what its worktree holds now (files changed since the last
+ * checkpoint, nothing committed or pushed), what reconciliation found for the changes in flight, and what comes next.
+ */
+export function interruptedKept(p: InterruptedFacts): string {
+	const effects =
+		p.effects.length === 0 ? [] : [`In flight at the restart, reconciled: ${reconciledEffects(p.effects)}.`];
+	return [
+		`${taskRef(p.taskId)} was interrupted by restart (run ${p.runNo}). It is not resumed, and nothing was committed or pushed.`,
+		keptLine(p.changes),
+		...effects,
+		...lastCheckpointLine(p),
+		interruptedNextLine(p),
+	].join("\n");
+}
+
+/** /approve of a task whose interrupted run's changes wait in its worktree. */
+export function interruptedApproval(taskId: number): string {
+	const task = taskRef(taskId);
+	return (
+		`${task} was interrupted by a restart and the changes its run made since the last checkpoint are kept in its ` +
+		"worktree, not committed or pushed, so there is no head to approve; reply to its message to start a fresh run " +
+		`that continues from them (the bot then posts a new head to approve), or send /cancel ${taskId}`
+	);
+}
+
+/** The next step in the review reminder of such a task. */
+export function interruptedNext(taskId: number): string {
+	return (
+		"Its interrupted run's changes are kept in its worktree, not pushed. Reply to this message to start a fresh run " +
+		`that continues from them, or send /cancel ${taskId}.`
+	);
+}
+
+/** The group's freeze reason when a file change could not be reconciled. */
+export function unresolvedEffectReason(taskId: number, files: readonly string[]): string {
+	return `the outcome of a file change of ${taskRef(taskId)} could not be reconciled (${listFiles(files, 10)})`;
+}
+
+/** Told to the task's users when a file change of theirs could not be reconciled (the group freezes). */
+export function unresolvedEffect(p: { taskId: number; files: readonly string[] }): string {
+	const task = taskRef(p.taskId);
+	const one = p.files.length === 1;
+	return (
+		`${task}: the outcome of a file change could not be confirmed, and ${listFiles(p.files)} ` +
+		`${one ? "matches" : "match"} neither ${one ? "its" : "their"} content before the change nor the intended ` +
+		"result. Nothing of it was committed or pushed. The group is frozen until the owner reviews it and unfreezes " +
+		`the group; /status and /cancel ${p.taskId} still work (a cancel waits for that review).`
+	);
+}
+
+/** runs.reason / tasks.reason of a run stopped because a file change's outcome could not be confirmed. */
+export function uncertainChangeReason(path: string): string {
+	return `the outcome of a file change (${clip(path, 200)}) could not be confirmed, so the run was stopped`;
+}
+
+/** The tool result the model gets for such a change (its run stops; it must never repeat the change). */
+export const UNCERTAIN_TOOL_RESULT =
+	"unknown: the outcome of this change could not be confirmed; the run stops so the file can be reconciled. " +
+	"Do not repeat it.";
 
 export function taskCancelled(id: number): string {
 	return `${taskRef(id)} cancelled.`;

@@ -256,12 +256,25 @@ How to check:
 Stop the Coordinator first, then the watchdog. Press **Ctrl-C** in the Coordinator's terminal (SIGINT; SIGTERM does
 the same). The Coordinator logs `shutdown reason=SIGINT`, stops polling and
 dispatch, stops running runs and their containers, and closes the relay, the database and its lock. A run stopped
-this way is **not** resumed: on the next start it is marked "interrupted by restart", its work is checkpointed and
-pushed, and the task waits in review until someone replies (a fresh conversation). A run still starting (its run key
+this way is **not** resumed: on the next start it is marked "interrupted by restart" and nothing of it is committed
+or pushed. Its changes since the last checkpoint stay in the task's worktree; once any file change that was in flight
+is reconciled (below), the bot lists the changed files (names only) and the task waits in review until someone
+replies (a fresh conversation seeded with those changes; its review step commits and pushes them) or sends
+`/cancel <id>` (the final checkpoint pushes them). `/approve` is refused meanwhile: no posted head holds those
+changes. A run still starting (its run key
 not opened and its Pi process not launched yet) is queued again instead, in the same place, and the bot says so; a
 first run's worktree is kept only if its setup finished and nothing changed it, otherwise it is recreated from the
 latest main. After 3 such returns the next restart fails the task. A second Ctrl-C exits at once; a shutdown that
 takes longer than 30 seconds exits with code 1.
+
+**File changes in flight.** Before the Coordinator runs an `edit` or `write` in the agent container, it saves the
+change's intent in `coordinator.sqlite` (table `effect_intents`: the file, its hash before, the intended hash). If
+the container's answer never came (a stop or crash in between, or a timed-out file operation, which also stops the
+run), the Coordinator reconciles it once the run's Pi process and containers are verified gone (after a restart: once
+the watchdog's sweep is verified): it hashes the file itself, without following symlinks and only inside the worktree.
+The intended result is "applied", the content before is "currently unchanged"; anything else freezes the group, and
+the bot names the task and the file (never its content). A `run_check` that was in flight is reported failed. No
+queued task starts until this reconciliation has finished, and nothing archives or pushes that worktree before it.
 
 While the watchdog still runs, it notices that no Coordinator holds the data directory's lock any more and removes
 whatever is left (log: `watchdog_coordinator_gone`, then `watchdog_sweep reason=coordinator_dead …`); the same
@@ -290,18 +303,22 @@ node src/cli/main.ts owner unfreeze --env-file .env.local        # frozen group 
 last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it.
 
 A group **freezes** when the Coordinator or the watchdog cannot confirm a stop, or the Coordinator the outcome of a
-GitHub change (for example a push whose answer was lost while GitHub could not be read back). A push GitHub refuses
+GitHub change (for example a push whose answer was lost while GitHub could not be read back) or of a file change (the
+file matches neither its content before the change nor the intended result). A push GitHub refuses
 because a task branch was changed outside the Coordinator is not unknown and does not freeze the group: only that task
 waits until the branch is restored (step 7 of the walkthrough; `owner status` lists such held tasks). Resolve the cause
-first (no leftover containers or Pi processes, see above; GitHub branch and pull request state as expected), then
-unfreeze. Unfreezing sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery checks,
-including a new watchdog sweep (`reason=recheck`), before it dispatches queued work again. Nothing that was cancelled
-resumes.
+first (no leftover containers or Pi processes, see above; GitHub branch and pull request state as expected; for an
+uncertain file change, `owner status` lists the task, the file and its worktree: look at the file and fix it by hand if
+needed), then unfreeze. Unfreezing records your resolution of every unresolved file change (accepted as the file is
+now in the worktree) and sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery
+checks, including a new watchdog sweep (`reason=recheck`), before it dispatches queued work again. A `/cancel` sent
+while the change was unresolved goes ahead only then. Nothing that was cancelled resumes.
 
 ## Where the data lives
 
 - `PI_DATA_DIR` (default `~/.local/state/pi-durable-coordinator`, mode 700): `coordinator.sqlite` (tasks, runs,
-  follow-ups, queue, approvals, merge intents, budget ledger, outbox, Telegram offset), `conversations/` (one Pi SQLite
+  follow-ups, queue, approvals, merge intents, file-change intents, budget ledger, outbox, Telegram offset),
+  `conversations/` (one Pi SQLite
   file per conversation; raw task content lives here and in `coordinator.sqlite` only), `run-home/` (empty HOME for Pi
   processes) and the lock file.
 - `PI_TASK_DIR` (default `<PI_DATA_DIR>/tasks`): `repo.git` (the Coordinator's clone), `worktrees/task-<id>` (one per

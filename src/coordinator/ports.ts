@@ -116,7 +116,17 @@ export type FsErrorCode =
 
 export type FsResponse =
 	| { readonly ok: true; readonly output: string; readonly truncated: boolean }
-	| { readonly ok: false; readonly code: FsErrorCode; readonly message: string };
+	| {
+			readonly ok: false;
+			readonly code: FsErrorCode;
+			readonly message: string;
+			/**
+			 * The operation may still run or may have changed the file: no answer of the file operation itself was read (its
+			 * client was killed at the deadline, cancelled or flooded, or it ended without one). Absent: the file operation
+			 * answered (and ended), or never started.
+			 */
+			readonly uncertain?: true;
+	  };
 
 /** Named outcomes returned to the model (Agent Execution § Agent and check enforcement). */
 export type CheckOutcome =

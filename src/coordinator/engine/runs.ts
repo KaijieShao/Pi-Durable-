@@ -14,7 +14,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { FromRunner, RunnerStart, ToRunner } from "../../runner/protocol.ts";
 import { type TaskDiskShortfall, taskDiskToldKey } from "../disk.ts";
-import { clip, taskDiskWait } from "../messages.ts";
+import { changeList, clip, taskDiskWait } from "../messages.ts";
 import type { RunnerHandle } from "../ports.ts";
 import {
 	type ActiveRun,
@@ -91,6 +91,8 @@ export function newActiveRun(ctx: Ctx, reservation: Reservation): ActiveRun {
 		decided,
 		resolveDecision,
 		tools: new Set(),
+		effects: Promise.resolve(),
+		effectsClosed: false,
 		sentSteers: new Set(),
 		deadline: undefined,
 		exited: false,
@@ -474,6 +476,8 @@ async function seededInput(
 ): Promise<string> {
 	if (previous === undefined || task.worktree_path === null || task.base_commit === null) return run.input_text;
 	const diff = await ctx.git.diffSummary(task.worktree_path, task.base_commit, DIFF_SUMMARY_BYTES).catch(() => "");
+	// An interrupted run's changes since its last checkpoint are still in the worktree, uncommitted: say which.
+	const kept = await ctx.git.uncommittedChanges(task.worktree_path).catch(() => []);
 	return [
 		"This task continues on its existing branch in a fresh conversation: the previous conversation was interrupted",
 		"and is kept read-only.",
@@ -484,8 +488,11 @@ async function seededInput(
 		run.kind === "conflict" ? "Conflict fix:" : "Follow-up:",
 		run.input_text,
 		"",
-		"Current changes on the branch (summary of the diff against the base commit):",
+		"Current changes on the branch (summary of the diff against the base commit, uncommitted files included):",
 		diff.trim() === "" ? "(no changes yet)" : diff,
+		...(kept.length === 0
+			? []
+			: ["", `Not committed yet (left in the worktree since the last checkpoint): ${changeList(kept)}.`]),
 	].join("\n");
 }
 

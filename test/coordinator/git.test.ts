@@ -317,6 +317,48 @@ test("diffSummary, showFile and changedFiles", async () => {
 	assert.deepEqual(await s.git.changedFiles(base, base), []);
 });
 
+test("uncommittedChanges lists what the worktree holds beyond its last checkpoint; diffSummary includes untracked files; neither stages anything", async () => {
+	const s = await setup({ "a.txt": "one\n", "gone.txt": "bye\n", ".gitignore": "ignored/\n*.log\n" });
+	const { path, base } = await withWorktree(s);
+	assert.deepEqual(await s.git.uncommittedChanges(path), []);
+	writeFileSync(join(path, "a.txt"), "one\nchanged\n");
+	rmSync(join(path, "gone.txt"));
+	mkdirSync(join(path, "new", "deep"), { recursive: true });
+	writeFileSync(join(path, "new", "deep", "file.txt"), "untracked content\n");
+	writeFileSync(join(path, "debug.log"), "ignored\n");
+	mkdirSync(join(path, "ignored"));
+	writeFileSync(join(path, "ignored", "x.txt"), "ignored\n");
+	assert.deepEqual(await s.git.uncommittedChanges(path), [
+		{ path: "a.txt", change: "modified" },
+		{ path: "gone.txt", change: "deleted" },
+		{ path: "new/deep/file.txt", change: "new" },
+	]);
+	const summary = await s.git.diffSummary(path, base, 10_000);
+	assert.match(summary, /^\+untracked content$/m, "an untracked file is in the summary");
+	assert.match(summary, /^\+changed$/m);
+	assert.ok(!summary.includes("ignored"), ".gitignore is respected");
+	// Nothing was staged in the worktree's own index, and no scratch index is left behind.
+	assert.equal(
+		await local(s, [
+			"--work-tree",
+			path,
+			"--git-dir",
+			join(s.repoDir, "worktrees", "task-1"),
+			"diff",
+			"--cached",
+			"--name-only",
+		]),
+		"",
+	);
+	assert.deepEqual(
+		readdirSync(join(s.repoDir, "worktrees", "task-1")).filter((name) => name.startsWith("pi-scratch-")),
+		[],
+	);
+	const { commit } = await s.git.checkpoint(path, "everything");
+	assert.notEqual(commit, base);
+	assert.deepEqual(await s.git.uncommittedChanges(path), [], "the checkpoint took exactly those changes");
+});
+
 test("repository hooks, outside config, inherited git env and .gitattributes filters have no effect", async () => {
 	const s = await setup({ "a.txt": "one\n" });
 	const markers = tempDir("pd-git-markers-");

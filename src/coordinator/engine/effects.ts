@@ -28,6 +28,7 @@ import {
 	UnknownEffect,
 	worktreePath,
 } from "./context.ts";
+import { effectsOpen } from "./intents.ts";
 
 const ATTEMPTS = 3;
 
@@ -303,6 +304,9 @@ export async function archiveTask(
 	taskId: number,
 	message: ((result: ArchiveResult) => string) | undefined,
 ): Promise<"archived" | "held"> {
+	// Fails closed: the final checkpoint commits and pushes everything left, so only once every effect is reconciled.
+	if (effectsOpen(ctx.store, taskId))
+		throw new UnknownEffect(`the file changes of ${taskRef(taskId)} are not reconciled`);
 	const task = loadTask(ctx, taskId);
 	const path = task.worktree_path;
 	if (path === null) {

@@ -46,6 +46,9 @@ import {
 	heldFollowupNote,
 	helpText,
 	holdNote,
+	INTERRUPTED_KEPT_REASON,
+	interruptedApproval,
+	interruptedNext,
 	MERGE_CONFLICT_REASON,
 	mergeInProgress,
 	noPullRequest,
@@ -613,6 +616,8 @@ function reviewBlocker(store: Store, task: TaskRow): Blocker | undefined {
 		return ["run_admitted", runAdmitted({ taskId: task.id, postedHead: task.posted_head, kind: busy })];
 	}
 	if (task.state !== "review") return ["state", notInReview(task.id, task.state)];
+	// An interrupted run's changes since the last checkpoint wait in the worktree: no posted head holds them.
+	if (task.reason === INTERRUPTED_KEPT_REASON) return ["interrupted", interruptedApproval(task.id)];
 	const hold = readBranchHold(store, task.id);
 	if (hold?.kind === "review") return ["branch_held", heldApproval(holdFacts(task.id, hold))];
 	if (task.pr_number === null) return ["no_pr", noPullRequest(task.id)];
@@ -703,7 +708,10 @@ function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
 		note: queue.note,
 		cancelling: task.cancel_requested === 1,
 		archived: task.archived === 1,
-		rejectedNote: rejectedApprovalNote(store.latestApproval(task.id), task.posted_head),
+		rejectedNote:
+			task.reason === INTERRUPTED_KEPT_REASON
+				? interruptedNext(task.id)
+				: rejectedApprovalNote(store.latestApproval(task.id), task.posted_head),
 		heldNote: heldNoteOf(store, task.id),
 	});
 }

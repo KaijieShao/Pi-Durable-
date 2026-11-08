@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { errorSummary, type Logger } from "../runtime/log.ts";
 import { redact } from "../runtime/redact.ts";
@@ -38,6 +39,9 @@ export type MergeBaseResult =
 	/** Nothing merged; the merge stays in progress in the worktree (MERGE_HEAD, conflict markers). */
 	| { readonly conflict: true; readonly files: string[] };
 
+/** One uncommitted change of a worktree against its last checkpoint (HEAD). */
+export type WorktreeChange = { readonly path: string; readonly change: "new" | "modified" | "deleted" | "conflict" };
+
 export type Git = {
 	ensureRepo(): Promise<void>;
 	/** Fetch the base branch into `baseRef`; returns its commit. */
@@ -67,8 +71,16 @@ export type Git = {
 	mergeBase(path: string): Promise<MergeBaseResult>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
 	changedFiles(base: string, head: string): Promise<string[]>;
-	/** Stat + patch of the worktree against `base`, capped at `maxBytes` (marked "[truncated]"). */
+	/**
+	 * Stat + patch of the worktree against `base`, untracked files included (.gitignore respected: what the next
+	 * checkpoint would commit), capped at `maxBytes` (marked "[truncated]"). The worktree's own index is not touched.
+	 */
 	diffSummary(path: string, base: string, maxBytes: number): Promise<string>;
+	/**
+	 * What the worktree holds beyond its last checkpoint (HEAD): changed, deleted, new (untracked, .gitignore respected)
+	 * and conflicted files, sorted. Read only (no optional locks, nothing staged).
+	 */
+	uncommittedChanges(path: string): Promise<WorktreeChange[]>;
 	/** A file's content at `rev` (capped at 1 MiB), or undefined if it is not a file there. */
 	showFile(rev: string, path: string): Promise<string | undefined>;
 	/**
@@ -145,6 +157,8 @@ export function buildGitInvocation(options: {
 	readonly home: string;
 	readonly author: GitAuthor;
 	readonly path?: string | undefined;
+	/** A scratch index (GIT_INDEX_FILE) for one call; never inherited from the Coordinator's environment. */
+	readonly indexFile?: string | undefined;
 }): GitInvocation {
 	const argv = [...hardeningConfig(options.remoteUrl).flatMap((entry) => ["-c", entry]), ...options.args];
 	const env: Record<string, string> = {
@@ -160,6 +174,7 @@ export function buildGitInvocation(options: {
 		GIT_COMMITTER_EMAIL: options.author.email,
 		LC_ALL: "C",
 	};
+	if (options.indexFile !== undefined) env.GIT_INDEX_FILE = options.indexFile;
 	const header = options.network ? authHeader(options.remoteUrl, options.token) : undefined;
 	if (header !== undefined) {
 		env.GIT_CONFIG_COUNT = "1";
@@ -304,6 +319,8 @@ type ExecOptions = {
 	readonly truncate?: boolean;
 	/** Remove lock files a killed git process may have left (only called when we hold the matching mutex). */
 	readonly onTimeout?: () => Promise<void>;
+	/** GIT_INDEX_FILE for this call (an absolute path of a scratch index). */
+	readonly indexFile?: string;
 };
 
 type ExecResult = {
@@ -349,7 +366,8 @@ export function createGit(options: GitOptions): Git {
 		await homeReady;
 		const network = execOptions.network === true;
 		const timeoutMs = network ? networkMs : localMs;
-		const invocation = buildGitInvocation({ args, remoteUrl, token, network, home, author });
+		const indexFile = execOptions.indexFile;
+		const invocation = buildGitInvocation({ args, remoteUrl, token, network, home, author, indexFile });
 		const started = Date.now();
 		let raw: RawResult;
 		try {
@@ -641,23 +659,55 @@ export function createGit(options: GitOptions): Git {
 		throw new GitError("failed", "git merge failed (exit 1)", { exitCode: 1, stderr: result.stderr });
 	}
 
+	/**
+	 * A scratch index holding the whole worktree (a copy of its index, then `add --all`: untracked files included,
+	 * .gitignore respected), so a diff of it shows what the next checkpoint would commit. Removed by the caller.
+	 */
+	async function scratchIndex(wt: readonly string[], gitdir: string): Promise<string> {
+		const indexFile = join(gitdir, `pi-scratch-${randomBytes(8).toString("hex")}.index`);
+		const copied = await copyFile(join(gitdir, "index"), indexFile).then(
+			() => true,
+			() => false,
+		);
+		if (!copied) await exec([...wt, "read-tree", "HEAD"], { op: "read-tree", indexFile });
+		await exec([...wt, "add", "--all"], { op: "add", indexFile });
+		return indexFile;
+	}
+
 	async function diff(path: string, base: string, maxBytes: number): Promise<string> {
 		assertRev(base);
 		const wt = await worktreeArgs(path);
-		const common = [...wt, "diff", "--no-color", "--no-ext-diff", "--no-textconv"];
-		const limit = Math.max(0, Math.floor(maxBytes));
-		const stat = await exec([...common, "--stat=120", "--summary", base, "--"], {
-			op: "diff",
-			maxStdoutBytes: limit + 1,
-			truncate: true,
+		const indexFile = await scratchIndex(wt, wt[1] as string);
+		try {
+			const common = [...wt, "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv"];
+			const limit = Math.max(0, Math.floor(maxBytes));
+			const options = { op: "diff", maxStdoutBytes: limit + 1, truncate: true, indexFile };
+			const stat = await exec([...common, "--stat=120", "--summary", base, "--"], options);
+			const patch = await exec([...common, "--patch", "-U3", base, "--"], options);
+			const text = stat.stdout === "" && patch.stdout === "" ? "" : `${stat.stdout}\n${patch.stdout}`;
+			return capBytes(text, limit);
+		} finally {
+			await rm(indexFile, { force: true });
+			await rm(`${indexFile}.lock`, { force: true });
+		}
+	}
+
+	async function uncommitted(path: string): Promise<WorktreeChange[]> {
+		const wt = await worktreeArgs(path);
+		const args = [
+			...wt,
+			"--no-optional-locks",
+			"status",
+			"--porcelain=v1",
+			"-z",
+			"--untracked-files=all",
+			"--no-renames",
+		];
+		const result = await exec(args, { op: "status" });
+		const changes = nulList(result.stdout).map((entry): WorktreeChange => {
+			return { path: entry.slice(3), change: statusChange(entry.slice(0, 2)) };
 		});
-		const patch = await exec([...common, "--patch", "-U3", base, "--"], {
-			op: "diff",
-			maxStdoutBytes: limit + 1,
-			truncate: true,
-		});
-		const text = stat.stdout === "" && patch.stdout === "" ? "" : `${stat.stdout}\n${patch.stdout}`;
-		return capBytes(text, limit);
+		return changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 	}
 
 	async function show(rev: string, file: string): Promise<string | undefined> {
@@ -718,9 +768,18 @@ export function createGit(options: GitOptions): Git {
 			return nulList(result.stdout);
 		},
 		diffSummary: (path, base, maxBytes) => serialized(wtKey(path), () => diff(path, base, maxBytes)),
+		uncommittedChanges: (path) => serialized(wtKey(path), () => uncommitted(path)),
 		showFile: (rev, file) => show(rev, file),
 		checkoutBytes: (rev) => checkout(rev),
 	};
+}
+
+/** The kind of change of a `git status --porcelain=v1` XY code. */
+function statusChange(code: string): WorktreeChange["change"] {
+	if (code.includes("U") || code === "DD" || code === "AA") return "conflict";
+	if (code === "??" || code.includes("A")) return "new";
+	if (code.includes("D")) return "deleted";
+	return "modified";
 }
 
 /** The refusal of a `git push --porcelain` (`!\t<src>:<dst>\t[rejected] (non-fast-forward)`), if any. */

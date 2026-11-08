@@ -9,8 +9,9 @@
  *
  * The same path also runs on the production Docker sandbox (opt-in: E2E_DOCKER=1). Neighbouring paths of the
  * acceptance list on the same stack: failing tests reported and blocking the merge, a steer while the run is busy,
- * a restart mid-run (interrupted run, quarantined conversation, fresh conversation on reply), and two users with two
- * agents overlapping, the second merge combined with the moved main and approved again.
+ * a restart mid-run (interrupted run, its work kept uncommitted and unpushed in the worktree, quarantined
+ * conversation, fresh conversation on reply whose review pushes it), and two users with two agents overlapping, the
+ * second merge combined with the moved main and approved again.
  */
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
@@ -325,7 +326,7 @@ test("a reply during the run is steered into the same run and conversation, then
 	assert.equal(await stack.branchSha("task/1"), stack.tasks<TaskRow>()[0]?.head_commit);
 });
 
-test("a restart during a run: the run is interrupted, its work saved to the PR, and a reply starts a fresh conversation", {
+test("a restart during a run: the run is interrupted, its work kept in the worktree (not pushed), and a reply starts a fresh conversation that pushes it", {
 	timeout: 180_000,
 }, async (t) => {
 	const stack = await startStack({
@@ -345,13 +346,17 @@ test("a restart during a run: the run is interrupted, its work saved to the PR, 
 	await stack.model.waitForRequests(2, 30_000);
 	await stack.restart();
 	const interrupted = await stack.waitForBotMessage(/^Task 1 was interrupted by restart \(run 1\)/);
-	assert.ok(interrupted.text.includes(`Pull request: https://github.com/${REPO}/pull/1.`), interrupted.text);
+	assert.ok(interrupted.text.includes("changed since the last checkpoint: greet.js (new)."), interrupted.text);
 	const [run1] = stack.runs<RunRow & { reason: string }>();
 	assert.equal(run1?.state, "failed");
 	assert.match(run1?.reason ?? "", /interrupted/);
 	const [task] = stack.tasks<TaskRow>();
 	assert.equal(task?.state, "review");
-	assert.equal(await stack.branchSha("task/1"), task?.head_commit, "the interrupted run's work is on GitHub");
+	// Edits since the last checkpoint are neither pushed nor dropped: they wait in the worktree for a reply or /cancel.
+	assert.equal(await stack.branchSha("task/1"), undefined, "nothing of the interrupted run is pushed");
+	assert.equal(stack.github.pulls.size, 0);
+	assert.ok(task?.worktree_path !== null && task?.worktree_path !== undefined);
+	assert.ok(existsSync(join(task.worktree_path, "greet.js")), "its work is kept in the worktree");
 	const conversations = stack.coordinator.store.all<{ id: string; quarantined: number; parent_id: string | null }>(
 		"SELECT id, quarantined, parent_id FROM conversations ORDER BY created_at",
 	);
@@ -375,7 +380,10 @@ test("a restart during a run: the run is interrupted, its work saved to the PR, 
 	// The fresh conversation is seeded with the original task, the follow-up and the branch's changes.
 	const seeded = JSON.stringify(requestsFor(stack, /also export farewell/)[0]?.body.input);
 	assert.ok(seeded.includes(TASK_TEXT) && seeded.includes("greet.js"), seeded.slice(0, 400));
+	// That run's review step commits and pushes the kept work with its own, and opens the one pull request.
 	assert.equal(stack.github.pulls.size, 1);
+	assert.ok(review.text.includes(`Pull request: https://github.com/${REPO}/pull/1.`), review.text);
+	assert.equal(await stack.branchSha("task/1"), stack.tasks<TaskRow>()[0]?.head_commit);
 });
 
 test("two users, two agents at the same time: both PRs merge; the second is combined with the moved main and re-approved", {

@@ -10,9 +10,14 @@
  * Cancel / limit / failure: revoke FIRST (close the key, so no successor or new request starts; pending follow-ups
  * expire), then abort Pi, let the in-flight tool round settle, terminate and verify; the task ends failed or
  * cancelled and its worktree is archived. A stop that cannot be confirmed freezes the group.
+ *
+ * Either way, once termination is verified the run's file changes still pending (a tool call cut by the stop, or one
+ * whose outcome was unknown) are reconciled from their targets before the worktree is reviewed or archived (Agent
+ * Execution § Uncertain Effects; engine/intents.ts): unresolved → the group freezes and the worktree waits for the
+ * owner. Dispatch stays blocked until this reconciliation is done (ctx.reconciling).
  */
 import { admitRun } from "../admission.ts";
-import { followupExpired, followupStarted } from "../messages.ts";
+import { followupExpired, followupStarted, reconciledEffects } from "../messages.ts";
 import type { RunnerHandle } from "../ports.ts";
 import {
 	type ActiveRun,
@@ -31,6 +36,7 @@ import {
 	tx,
 } from "./context.ts";
 import { archiveTask, effectFailed, terminalText } from "./effects.ts";
+import { freezeOnUnresolved, type IntentRow, newlyUnresolved, reconcilePending, toReconciled } from "./intents.ts";
 import { closeRunKeys } from "./keys.ts";
 import { reviewStep } from "./review.ts";
 
@@ -286,11 +292,42 @@ async function stopWorkload(ctx: Ctx, active: ActiveRun, decision: Decision): Pr
 		problems.push(`the Pi process of ${task} could not be confirmed stopped`);
 	}
 	const settleMs = ctx.limits.checkDeadlineMs + ctx.limits.stopGraceMs;
-	if (active.tools.size > 0 && !(await settlesWithin(Promise.allSettled([...active.tools]), settleMs))) {
-		problems.push(`a tool call of ${task} could not be confirmed settled`);
+	const settled = active.tools.size === 0 || (await settlesWithin(Promise.allSettled([...active.tools]), settleMs));
+	const gone = await stopContainers(ctx, active);
+	if (!gone) problems.push(`the containers of ${task} could not be verified gone`);
+	// A tool call still unsettled once the Pi process and every container of the run are verified gone can no longer
+	// act (its file operation or check ran in one of them): its effect is reconciled from its intent (reconcileRun).
+	// Without that verification it stays unconfirmed.
+	if (!settled) {
+		ctx.log.warn("tool_unsettled_after_stop", { run: active.runId, verified: problems.length === 0 });
+		if (problems.length > 0) problems.push(`a tool call of ${task} could not be confirmed settled`);
 	}
-	if (!(await stopContainers(ctx, active))) problems.push(`the containers of ${task} could not be verified gone`);
 	return problems[0];
+}
+
+type RunEffects = {
+	/** Intents of the run that reconciliation settled now. */
+	readonly reconciled: readonly IntentRow[];
+	/** The freeze reason, when an intent of the task is unresolved (the worktree waits for the owner). */
+	readonly frozen: string | undefined;
+};
+
+/**
+ * Termination is verified: close the run's effects (no new intent, no late answer settles one) and reconcile what is
+ * still pending from the targets (Agent Execution § Uncertain Effects, steps 2–4).
+ */
+async function reconcileRun(ctx: Ctx, active: ActiveRun): Promise<RunEffects> {
+	const worktree = active.worktree ?? loadTask(ctx, active.taskId).worktree_path;
+	const reconciled = await reconcilePending(ctx, { runId: active.runId }, worktree);
+	const frozen = freezeOnUnresolved(ctx, active.taskId, newlyUnresolved(reconciled));
+	if (reconciled.length > 0) ctx.log.info("run_effects_reconciled", { run: active.runId, count: reconciled.length });
+	return { reconciled, frozen };
+}
+
+/** " Reconciled after the stop: a.js (edit): applied (…)." for a final message, or "". */
+function effectsNote(effects: RunEffects | undefined): string {
+	if (effects === undefined || effects.reconciled.length === 0) return "";
+	return ` Reconciled after the stop: ${reconciledEffects(effects.reconciled.map(toReconciled))}.`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -299,11 +336,18 @@ async function stopWorkload(ctx: Ctx, active: ActiveRun, decision: Decision): Pr
 /** Finalize a decided run, run the review step or the archive procedure, then release the slot. */
 export async function finalizeRun(ctx: Ctx, active: ActiveRun, decision: Decision): Promise<void> {
 	const problem = await stopWorkload(ctx, active, decision);
+	// From here on no late answer settles an intent and no new one is saved: reconciliation (below, or recovery's after
+	// an unconfirmed stop or a shutdown) owns what is still pending.
+	active.effectsClosed = true;
 	if (ctx.stopped) return;
 	try {
-		if (decision.kind === "normal") await finalizeNormal(ctx, active, decision, problem);
-		else await finalizeAbnormal(ctx, active, decision, problem);
+		// An unconfirmed stop leaves pending intents pending: recovery reconciles them after the owner's unfreeze.
+		const effects = problem === undefined ? await reconcileRun(ctx, active) : undefined;
+		ctx.reconciling.delete(active.runId);
+		if (decision.kind === "normal") await finalizeNormal(ctx, active, decision, problem, effects);
+		else await finalizeAbnormal(ctx, active, decision, problem, effects);
 	} finally {
+		ctx.reconciling.delete(active.runId);
 		// The slot is released only after verified cleanup (Architecture § Request Flow). An unconfirmed stop keeps it
 		// (the group is frozen anyway); the recheck clears it once the leftovers are verified gone.
 		if (!ctx.stopped && problem === undefined) {
@@ -318,6 +362,7 @@ async function finalizeNormal(
 	active: ActiveRun,
 	decision: Extract<Decision, { kind: "normal" }>,
 	problem: string | undefined,
+	effects: RunEffects | undefined,
 ): Promise<void> {
 	tx(ctx, () => {
 		const now = ctx.now();
@@ -337,6 +382,9 @@ async function finalizeNormal(
 		freezeGroup(ctx, problem);
 		return;
 	}
+	// A file change could not be reconciled: the group is frozen, and the review step (which commits and pushes the
+	// worktree) runs at the recheck after the owner resolved it.
+	if (effects?.frozen !== undefined) return;
 	try {
 		await reviewStep(ctx, active.runId, { interrupted: false });
 	} catch (error) {
@@ -349,6 +397,7 @@ async function finalizeAbnormal(
 	active: ActiveRun,
 	decision: Extract<Decision, { kind: "cancelled" | "failed" }>,
 	problem: string | undefined,
+	effects: RunEffects | undefined,
 ): Promise<void> {
 	const kind = decision.kind;
 	tx(ctx, () => {
@@ -396,9 +445,17 @@ async function finalizeAbnormal(
 		freezeGroup(ctx, problem);
 		return;
 	}
+	if (effects?.frozen !== undefined) {
+		// Never archive (final checkpoint, push) a worktree with an unresolved file change: after the owner's review.
+		archivePending(ctx, active.taskId, kind, decision.reason);
+		return;
+	}
+	const note = effectsNote(effects);
 	try {
-		await archiveTask(ctx, active.taskId, (result) =>
-			terminalText(loadTask(ctx, active.taskId), kind, decision.reason, result),
+		await archiveTask(
+			ctx,
+			active.taskId,
+			(result) => `${terminalText(loadTask(ctx, active.taskId), kind, decision.reason, result)}${note}`,
 		);
 	} catch (error) {
 		effectFailed(ctx, error, `archiving ${taskRef(active.taskId)}`);

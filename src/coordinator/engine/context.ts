@@ -142,6 +142,17 @@ export type ActiveRun = {
 	resolveDecision: (decision: Decision) => void;
 	/** In-flight tool executions; finalize waits for them to settle. */
 	readonly tools: Set<Promise<void>>;
+	/**
+	 * The run's file changes run one at a time (engine/tools.ts): each inspects its target, saves its intent, executes
+	 * and settles before the next starts, so a pre-hash is never stale and nothing competes with a change being
+	 * reconciled. The tail of that chain.
+	 */
+	effects: Promise<void>;
+	/**
+	 * Set once finalize has confirmed termination and reconciles the run's pending intents: no new intent is saved and
+	 * no late answer settles one any more (engine/intents.ts owns them from here).
+	 */
+	effectsClosed: boolean;
 	/** Follow-up ids already sent to the Pi process as steers. */
 	readonly sentSteers: Set<number>;
 	deadline: NodeJS.Timeout | undefined;
@@ -243,6 +254,11 @@ export type Ctx = {
 	enforcement: { ok: boolean; reason: string | undefined; checkedAt: number } | undefined;
 	/** Recovery jobs (review / archive redo) not yet completed; dispatch and merges wait for them. */
 	recoveryPending: number;
+	/**
+	 * Runs with a file change whose outcome is unknown, until finalize has reconciled it (Agent Execution § Uncertain
+	 * Effects: "Dispatch stays blocked until reconciliation finishes"). Dispatch and merges wait while any is here.
+	 */
+	readonly reconciling: Set<number>;
 	/** Run queued work in the background, tracked for idle(); marks `taskId` busy while it runs. */
 	track(kind: string, taskId: number | undefined, work: () => Promise<void>): void;
 	kick(): void;
@@ -352,6 +368,17 @@ export function setupStateKey(taskId: number): string {
 /** Meta key: how many times a restart before the run started returned it to the queue. Deleted when it starts. */
 export function restartReturnsKey(runId: number): string {
 	return `restart_returns:${runId}`;
+}
+
+export const INTERRUPTED_PREFIX = "restart_interrupted:";
+
+/**
+ * Meta key of a task whose run was interrupted by a restart (value: that run's id) until its effects are reconciled
+ * and its users are told what its worktree keeps (recovery.ts). While it is set nothing archives, cancels or reviews
+ * the worktree; another restart finds it again.
+ */
+export function interruptedKey(taskId: number): string {
+	return `${INTERRUPTED_PREFIX}${taskId}`;
 }
 
 export const WORKTREE_CHECK_PREFIX = "restart_worktree:";

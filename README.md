@@ -56,10 +56,18 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
   The Coordinator never force-pushes: if someone changes a task branch on GitHub, the approval is rejected and GitHub
   refuses the Coordinator's next push of it. That is a definite outcome, so only that task waits, its work kept in its
   worktree, until the branch is restored; the group and the other tasks carry on.
-- **Recovery:** after a restart nothing in progress resumes. An interrupted run is marked failed, its work is pushed,
-  its conversation is quarantined, and a later follow-up starts a fresh conversation. A run that had not reached Pi
-  yet (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop
-  or a GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
+- **Recovery:** after a restart nothing in progress resumes. An interrupted run is marked failed and its
+  conversation is quarantined; its changes since the last checkpoint stay in the task's worktree, neither committed
+  nor pushed, and the bot lists those files. A reply then starts a fresh conversation seeded with them (its review
+  pushes them), or `/cancel` archives the task (its final checkpoint pushes them). A run that had not reached Pi yet
+  (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop or a
+  GitHub outcome, it freezes the group; only the owner CLI unfreezes it.
+- **Uncertain file edits:** before an `edit` or `write` runs in the agent container, its intent (the file, its hash
+  before, the intended hash) is saved. If the answer never comes (a crash, a client timeout), the run is stopped, and
+  once its Pi process and containers are verified gone the Coordinator hashes the file itself (no symlink followed,
+  only inside the worktree): the intended result is "applied", the content before is "currently unchanged", anything
+  else freezes the group for owner review, naming the task and file (never its content). Dispatch waits until this
+  reconciliation is done, and nothing archives or pushes the worktree before it.
 - **The watchdog**, a separate process, is the stop path that survives the Coordinator: it kills and verifies every
   leftover Pi process and container before dispatch reopens after any restart, removes what a crashed Coordinator
   left, and enforces each run's deadline on its own; an unconfirmed stop freezes the group.
@@ -93,10 +101,10 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 ## Not built yet
 
 Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; the
-owner CLI's local socket and read-only inspection of quarantined conversations; reconciliation of uncertain file
-edits after a crash; a task disk that fills up during a run (only a new worktree is checked against the task disk);
-size limits and retention rules for the boot disk's budgets (database, Pi's stores, logs, retained trials: `owner
-status` only reports their usage); trial reset and the stress test.
+owner CLI's local socket and read-only inspection of quarantined conversations; a task disk that fills up during a
+run (only a new worktree is checked against the task disk); size limits and retention rules for the boot disk's
+budgets (database, Pi's stores, logs, retained trials: `owner status` only reports their usage); trial reset and the
+stress test.
 Measurements in the spec are planned, not results. Pi processes run as their own user in a dedicated systemd slice on Linux, and as your own user
 on a Mac (the weaker local mode): see [docs/isolation.md](docs/isolation.md).
 

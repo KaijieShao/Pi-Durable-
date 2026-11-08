@@ -27,8 +27,10 @@ import {
 	TERMINAL_TASK_STATES,
 	taskRef,
 	tx,
+	UnknownEffect,
 } from "./context.ts";
 import { clearHold, ensurePullRequest, lastPushed, pushOrMoved, saveHold } from "./effects.ts";
+import { effectsOpen } from "./intents.ts";
 
 const ANSWER_IN_MESSAGE = 1500;
 const TEST_FILE =
@@ -283,6 +285,9 @@ function holdReview(ctx: Ctx, runId: number, h: HeldReview): void {
 export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted: boolean }): Promise<void> {
 	const run = loadRun(ctx, runId);
 	if (run.review_done === 1) return;
+	// Fails closed: the checkpoint commits the whole worktree, so only once every file change is reconciled.
+	if (effectsOpen(ctx.store, run.task_id))
+		throw new UnknownEffect(`the file changes of ${taskRef(run.task_id)} are not reconciled`);
 	const task = loadTask(ctx, run.task_id);
 	const { worktree_path: path, branch, base_commit: base } = task;
 	if (path === null || branch === null || base === null) {

@@ -248,6 +248,15 @@ export function fsError(code: FsErrorCode, message: string): FsResponse {
 	return { ok: false, code, message };
 }
 
+/**
+ * A failure whose effect is unknown (Agent Execution § Uncertain Effects): the client was killed (deadline, cancel,
+ * output overflow) or no answer of the file operation could be read, so it may still be running or may have changed
+ * the file. The Coordinator then stops the run and reconciles the target once termination is confirmed.
+ */
+export function fsUncertain(code: FsErrorCode, message: string): FsResponse {
+	return { ok: false, code, message, uncertain: true };
+}
+
 /** Parse fsop.mjs's response line; anything else is an `io` failure (or `unavailable` if the container is gone). */
 export function parseFsResponse(stdout: string, stderr: string): FsResponse {
 	const line = stdout.split("\n").find((part) => part.trim() !== "");
@@ -271,7 +280,7 @@ export function parseFsResponse(stdout: string, stderr: string): FsResponse {
 	if (/no such container|is not running|cannot exec in a stopped/i.test(stderr)) {
 		return fsError("unavailable", "the task container is not running");
 	}
-	return fsError("io", "file operation failed");
+	return fsUncertain("io", "file operation failed");
 }
 
 /**
@@ -307,15 +316,15 @@ export function runFsop(
 			child.kill("SIGKILL");
 			finish(response);
 		};
-		const onAbort = (): void => kill(fsError("unavailable", "file operation cancelled"));
+		const onAbort = (): void => kill(fsUncertain("unavailable", "file operation cancelled"));
 		const timer = setTimeout(
-			() => kill(fsError("timeout", "file operation timed out")),
+			() => kill(fsUncertain("timeout", "file operation timed out")),
 			options.timeoutMs ?? FS_TIMEOUT_MS,
 		);
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		child.stdout.on("data", (chunk: Buffer) => {
 			stdoutBytes += chunk.length;
-			if (stdoutBytes > FS_MAX_STDOUT_BYTES) kill(fsError("io", "file operation output too large"));
+			if (stdoutBytes > FS_MAX_STDOUT_BYTES) kill(fsUncertain("io", "file operation output too large"));
 			else stdout.push(chunk);
 		});
 		child.stderr.on("data", (chunk: Buffer) => {

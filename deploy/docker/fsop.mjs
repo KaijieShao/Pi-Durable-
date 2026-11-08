@@ -20,8 +20,9 @@
  *   - write accepts at most 1 MiB and creates missing parent directories inside the root;
  *   - edit needs `oldText` to occur exactly once unless `replaceAll` is true.
  * Error messages name only the relative path, never a host path.
- * STUB(spec: agent-execution.md § Uncertain Effects): no persisted edit/write intent (target, pre-hash, intended
- * hash) and no reconciliation; an interrupted edit or write is reported as failed and the run fails with it.
+ * Uncertain effects (agent-execution.md § Uncertain Effects) are the Coordinator's: before it runs an edit or write
+ * here it saves the intent (target, pre-hash, intended hash), and after an unknown outcome it inspects the target on
+ * the host (src/coordinator/effect-target.ts mirrors editOp below to compute the intended hash; keep them in step).
  */
 import { constants, promises as fsp } from "node:fs";
 import { join } from "node:path";

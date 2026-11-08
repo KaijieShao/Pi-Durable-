@@ -7,7 +7,8 @@
  *   queued with a worktree (a later run waiting) → the queued run is cancelled, then the archive procedure;
  *   review → close the PR and archive (the final checkpoint is a no-op: each run ended with one).
  * Merging tasks are not cancellable. A final push GitHub refuses because the branch changed outside the Coordinator
- * keeps the worktree: the task is cancelled, held until the branch is restored, then archived (engine/held.ts).
+ * keeps the worktree: the task is cancelled, held until the branch is restored, then archived (engine/held.ts). A
+ * cancel waits while the task's effects are not reconciled (an interrupted run, an intent pending or unresolved).
  */
 import { taskCancelled } from "../messages.ts";
 import {
@@ -22,6 +23,7 @@ import {
 } from "./context.ts";
 import { archiveTask, effectFailed, terminalText } from "./effects.ts";
 import { archivePending, decide, expireFollowups } from "./finalize.ts";
+import { effectsOpen } from "./intents.ts";
 
 /** Start the work for every pending cancel request; returns true if any work was started. */
 export function processCancels(ctx: Ctx): boolean {
@@ -47,6 +49,9 @@ function cancelOne(ctx: Ctx, task: TaskRow): boolean {
 	// A first run's worktree still to be reconciled after a restart (recovery.ts): wait for it, so a worktree that may
 	// be half set up is never checkpointed or pushed (the reconciliation discards it for a task being cancelled).
 	if (ctx.store.getMeta(worktreeCheckKey(task.id)) !== undefined) return false;
+	// Effects of an interrupted or stopped run not reconciled yet, or waiting for the owner's review: the archive's final
+	// checkpoint waits for them, so nothing unreconciled is committed or pushed (engine/intents.ts).
+	if (effectsOpen(ctx.store, task.id)) return false;
 	if (task.state === "queued" && task.worktree_path === null) cancelQueued(ctx, task.id);
 	else ctx.track("cancel", task.id, () => cancelWithArchive(ctx, task.id));
 	return true;
