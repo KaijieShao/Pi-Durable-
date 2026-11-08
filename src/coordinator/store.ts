@@ -341,6 +341,14 @@ export class Store {
 			: { state: row.state, reason: row.reason, recheck: row.recheck_required === 1 };
 	}
 
+	/** The task's latest approval (any state), or undefined if it was never approved. */
+	latestApproval(taskId: number): { head_commit: string; state: string; reason: string | null } | undefined {
+		return this.get<{ head_commit: string; state: string; reason: string | null }>(
+			"SELECT head_commit, state, reason FROM approvals WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+			taskId,
+		);
+	}
+
 	/** Freeze the group (Architecture § Frozen group). Idempotent; keeps the first reason. */
 	freeze(chatId: number, reason: string): boolean {
 		const now = this.now();

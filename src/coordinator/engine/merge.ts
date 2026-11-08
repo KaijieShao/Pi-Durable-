@@ -4,7 +4,8 @@
  * pending merge intent). A merge intent is saved before any merge step, so recovery can ask GitHub whether main
  * already contains the head before trying again.
  *
- * For an approved task: GitHub's PR head must still equal the approved head (else the approval is rejected). Fetch
+ * For an approved task: GitHub's PR head must still equal the approved head (else the approval is rejected, and the
+ * message says why and what the system supports next: messages.ts approvalBranchChanged and its siblings). Fetch
  * main. If main has not moved for this branch, the tests that passed at the end of the run cover this commit
  * (failed tests block the merge) and GitHub is asked to merge exactly that commit; the up-to-date rule makes GitHub
  * refuse if main moved meanwhile, and the Coordinator starts over. If main moved, main is merged into the task
@@ -12,7 +13,20 @@
  * review for a new approval. Merge tests hold a 'check' execution slot.
  */
 import { admitRun } from "../admission.ts";
-import { listFiles, sha7 } from "../messages.ts";
+import {
+	approvalBranchChanged,
+	approvalLocalMoved,
+	approvalMergedElsewhere,
+	approvalPrClosed,
+	approvalUnfinishedCombine,
+	BRANCH_CHANGED_REASON,
+	listFiles,
+	MERGE_CONFLICT_REASON,
+	mainMoved,
+	mergeConflict,
+	PR_CLOSED_REASON,
+	sha7,
+} from "../messages.ts";
 import { GitHubError, type MergeResult, type PullRequest } from "../ports.ts";
 import {
 	type Ctx,
@@ -166,27 +180,63 @@ type MergeJob = {
 	readonly base: string;
 };
 
-type PrVerdict = "ok" | "merged" | "stale" | "closed";
+/**
+ * What GitHub's view of the PR means for this approval: "pushed" = the PR head on GitHub is not the approved head;
+ * "local_moved" = GitHub has the approved head but the Coordinator's record of the branch moved.
+ */
+type PrVerdict = "ok" | "merged" | "merged_elsewhere" | "closed" | "pushed" | "local_moved";
+type Rejection = Exclude<PrVerdict, "ok" | "merged">;
 
-/** What GitHub's view of the PR means for this approval. */
 function prVerdict(pr: PullRequest, head: string, localHead: string | null): PrVerdict {
-	if (pr.merged) return pr.headSha === head ? "merged" : "stale";
+	if (pr.merged) return pr.headSha === head ? "merged" : "merged_elsewhere";
 	if (pr.state !== "open") return "closed";
-	return pr.headSha === head && localHead === head ? "ok" : "stale";
+	if (pr.headSha !== head) return "pushed";
+	return localHead === head ? "ok" : "local_moved";
 }
 
-function rejectApproval(ctx: Ctx, job: MergeJob, verdict: "stale" | "closed"): void {
-	const task = taskRef(job.task.id);
+/**
+ * Did the Coordinator push GitHub's head itself? Only the task's worktree HEAD can be (the Coordinator fetches main
+ * only, so a commit pushed by someone else never is): an earlier merge attempt combined the task with main, pushed
+ * and was interrupted before it saved the result.
+ */
+async function pushedByCoordinator(ctx: Ctx, task: TaskRow, githubHead: string): Promise<boolean> {
+	const path = task.worktree_path;
+	if (path === null) return false;
+	return (await ctx.git.head(path).catch(() => undefined)) === githubHead;
+}
+
+/** The rejection message: which task, that nothing merged, why, and what the system supports doing next. */
+async function rejectionText(
+	ctx: Ctx,
+	job: MergeJob,
+	pr: PullRequest,
+	verdict: Rejection,
+	localHead: string | null,
+): Promise<string> {
+	const facts = { taskId: job.task.id, branch: job.task.branch as string, approvedHead: job.head };
+	if (verdict === "closed") return approvalPrClosed(facts);
+	if (verdict === "local_moved") return approvalLocalMoved({ ...facts, localHead });
+	const withGitHub = { ...facts, githubHead: pr.headSha };
+	if (verdict === "merged_elsewhere") return approvalMergedElsewhere(withGitHub);
+	if (await pushedByCoordinator(ctx, job.task, pr.headSha)) return approvalUnfinishedCombine(withGitHub);
+	return approvalBranchChanged(withGitHub);
+}
+
+async function rejectApproval(
+	ctx: Ctx,
+	job: MergeJob,
+	pr: PullRequest,
+	verdict: Rejection,
+	localHead: string | null,
+): Promise<void> {
+	const text = await rejectionText(ctx, job, pr, verdict, localHead);
 	returnToReview(ctx, job.task, {
 		approvalId: job.approval.id,
 		intentId: job.intentId,
 		intentState: "failed",
-		reason: verdict === "stale" ? "branch changed after approval" : "pull request closed",
+		reason: verdict === "closed" ? PR_CLOSED_REASON : BRANCH_CHANGED_REASON,
 		kind: "merge_rejected",
-		text:
-			verdict === "stale"
-				? `Approval rejected: the branch of ${task} changed after approval. Nothing was merged; approve the new head with /approve ${job.task.id} once the bot posts it.`
-				: `Approval rejected: the pull request of ${task} was closed on GitHub. Nothing was merged.`,
+		text,
 	});
 }
 
@@ -202,11 +252,12 @@ function testsBlocked(ctx: Ctx, job: MergeJob): void {
 }
 
 /** Handle a PR that is already merged, closed or stale; true when the merge attempt is over. */
-async function settledByPr(ctx: Ctx, job: MergeJob, pr: PullRequest, verdict: PrVerdict): Promise<boolean> {
+async function settledByPr(ctx: Ctx, job: MergeJob, pr: PullRequest, localHead: string | null): Promise<boolean> {
+	const verdict = prVerdict(pr, job.head, localHead);
 	if (verdict === "ok") return false;
 	if (verdict === "merged")
 		await completeMerge(ctx, job.task, job.approval, job.intentId, pr.mergeCommitSha ?? job.head);
-	else rejectApproval(ctx, job, verdict);
+	else await rejectApproval(ctx, job, pr, verdict, localHead);
 	return true;
 }
 
@@ -216,7 +267,7 @@ async function mergeAttempt(ctx: Ctx, job: MergeJob, loop: number): Promise<"aga
 	if (groupHeld(ctx) || ctx.stopped) return "done";
 	const pr = await ghRead(ctx, "pull request", () => ctx.github.getPullRequest(job.prNumber));
 	const current = loadTask(ctx, job.task.id);
-	if (await settledByPr(ctx, job, pr, prVerdict(pr, job.head, current.head_commit))) return "done";
+	if (await settledByPr(ctx, job, pr, current.head_commit)) return "done";
 	const mainSha = await ctx.git.fetchBase();
 	if (!(await ctx.git.isAncestor(mainSha, job.head))) {
 		await combineWithMain(ctx, current, job.approval, job.intentId);
@@ -367,7 +418,7 @@ function conflictFound(
 	const listed = files.length === 0 ? "(unknown files)" : listFiles(files);
 	tx(ctx, () => {
 		const now = ctx.now();
-		settleCombined(ctx, approval.id, intentId, "merge conflict");
+		settleCombined(ctx, approval.id, intentId, MERGE_CONFLICT_REASON);
 		// The worktree now holds an unfinished merge: /approve waits for the next posted head.
 		ctx.store.run("UPDATE tasks SET posted_head = NULL, updated_at = ? WHERE id = ?", now, task.id);
 		const admitted = admitRun(ctx.store, ctx.limits, {
@@ -379,20 +430,19 @@ function conflictFound(
 		});
 		if (!admitted.ok) {
 			ctx.store.run(
-				"UPDATE tasks SET state = 'review', reason = 'merge conflict', review_since = ?, review_reminded = 0 WHERE id = ?",
+				"UPDATE tasks SET state = 'review', reason = ?, review_since = ?, review_reminded = 0 WHERE id = ?",
+				MERGE_CONFLICT_REASON,
 				now,
 				task.id,
 			);
 		}
-		const outcome = admitted.ok
-			? `A run of ${taskRef(task.id)} was admitted to resolve it (queue position ${admitted.position}); you'll review again.`
-			: `The conflict-fix run could not be queued (${admitted.reason}); reply to this message to start the conflict fix when the queue has room.`;
-		enqueueTask(
-			ctx,
-			loadTask(ctx, task.id),
-			"merge_conflict",
-			`Merge conflict in: ${listed}. Nothing was merged. ${outcome}`,
-		);
+		const text = mergeConflict({
+			taskId: task.id,
+			approvedHead: approval.head_commit,
+			files: listed,
+			admitted: admitted.ok ? { position: admitted.position } : { refused: admitted.reason },
+		});
+		enqueueTask(ctx, loadTask(ctx, task.id), "merge_conflict", text);
 	});
 	ctx.log.info("merge_conflict", { task: task.id, files: files.length });
 }
@@ -419,12 +469,14 @@ async function combineWithMain(ctx: Ctx, task: TaskRow, approval: ApprovalRow, i
 			now,
 			task.id,
 		);
-		enqueueTask(
-			ctx,
-			loadTask(ctx, task.id),
-			"merge_main_moved",
-			`Main moved; ${taskRef(task.id)} was combined with the latest main and retested (${testsText(tests)}). Head: ${sha7(head)}. Nothing was merged yet: approve again with /approve ${task.id}.`,
-		);
+		const text = mainMoved({
+			taskId: task.id,
+			approvedHead: approval.head_commit,
+			head,
+			tests: testsText(tests),
+			testsPassed: tests.passed,
+		});
+		enqueueTask(ctx, loadTask(ctx, task.id), "merge_main_moved", text);
 	});
 	ctx.log.info("merge_main_moved", { task: task.id, tests: tests.outcome });
 }

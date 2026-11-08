@@ -610,7 +610,7 @@ describe("handleUpdate: /approve", () => {
 		assert.match(f.reply(second.messageId), /Merge queue position 2\./);
 	});
 
-	test("rejected when the head moved since the bot posted it", () => {
+	test("rejected when the head moved since the bot posted it: both heads, and how a new head gets posted", () => {
 		const f = fixture();
 		const id = f.submit(ANA, "alpha");
 		f.toReview(id);
@@ -618,7 +618,32 @@ describe("handleUpdate: /approve", () => {
 		const sent = f.send(ANA, `/approve ${id}`);
 		assert.equal(
 			f.reply(sent.messageId),
-			"/approve rejected: the branch changed since the bot posted it; wait for the new head.",
+			`/approve rejected: the branch of Task ${id} is at ffffeee, but the bot last posted a1b2c3d; reply to a ` +
+				`message of Task ${id} for a follow-up run, then approve the head the bot posts after it.`,
+		);
+		assert.equal(f.count("approvals"), 0);
+		assert.equal(f.task(id).state, "review");
+	});
+
+	test("rejected while a merge conflict waits for its fix run (no posted head): reply to start the conflict fix", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		// What engine/merge.ts conflictFound leaves when the conflict-fix run could not be queued.
+		f.store.run("UPDATE tasks SET posted_head = NULL, reason = 'merge conflict' WHERE id = ?", id);
+		const conflict = f.send(ANA, `/approve ${id}`);
+		assert.equal(
+			f.reply(conflict.messageId),
+			`/approve rejected: the merge of Task ${id} with the latest main stopped with a conflict, so there is no ` +
+				`head to approve yet; reply to a message of Task ${id} to start the conflict fix, then approve the head ` +
+				"the bot posts after it.",
+		);
+		f.store.run("UPDATE tasks SET reason = NULL WHERE id = ?", id);
+		const unposted = f.send(ANA, `/approve ${id}`);
+		assert.equal(
+			f.reply(unposted.messageId),
+			`/approve rejected: the bot has not posted a head of Task ${id} to approve; reply to a message of Task ${id} ` +
+				"for a follow-up run, then approve the head the bot posts after it.",
 		);
 		assert.equal(f.count("approvals"), 0);
 		assert.equal(f.task(id).state, "review");
@@ -628,11 +653,20 @@ describe("handleUpdate: /approve", () => {
 		const f = fixture();
 		const id = f.submit(ANA, "alpha");
 		const early = f.send(ANA, `/approve ${id}`);
-		assert.match(f.reply(early.messageId), /a new run of Task \d+ has been admitted/);
+		assert.equal(
+			f.reply(early.messageId),
+			`/approve rejected: Task ${id} is still on its first run, so the bot has not posted a head to approve yet; ` +
+				`wait for its review message, then send /approve ${id}.`,
+		);
 		f.toReview(id);
 		f.send(ANA, "one more thing", { replyTo: f.post(id) });
 		const afterFollowup = f.send(ANA, `/approve ${id}`);
-		assert.match(f.reply(afterFollowup.messageId), /^\/approve rejected: a new run of Task \d+ has been admitted/);
+		assert.equal(
+			f.reply(afterFollowup.messageId),
+			`/approve rejected: a new run of Task ${id} was admitted, so a1b2c3d, the head the bot last posted, is no ` +
+				"longer what would merge; wait for the bot to post that run's result, then approve its new head with " +
+				`/approve ${id}.`,
+		);
 		f.toReview(id);
 		f.store.run("UPDATE tasks SET state = 'running' WHERE id = ?", id);
 		const running = f.send(ANA, `/approve ${id}`);
@@ -751,6 +785,49 @@ describe("handleUpdate: /status and /help", () => {
 		assert.equal(f.repliesTo(sent.messageId)[0]?.task_id, id);
 		const missing = f.send(CAROL, "/status 404");
 		assert.equal(f.reply(missing.messageId), "/status rejected: there is no Task 404 in this group.");
+	});
+
+	test("detail after the merge step rejected the approval: points to that message, not to a follow-up", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		const detail = (): string => f.reply(f.send(CAROL, `/status ${id}`).messageId);
+		const generic = `Reply to a message of this task for a follow-up, or send /approve ${id}.`;
+		// What engine/merge.ts rejectApproval leaves: the approval of the posted head invalidated, the task in review.
+		const approval = (reason: string, state = "invalidated") =>
+			f.store.run(
+				`INSERT INTO approvals(task_id, user_id, update_id, head_commit, state, reason, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, 0)`,
+				id,
+				ANA,
+				900_000 + f.count("approvals"),
+				HEAD,
+				state,
+				reason,
+			);
+		approval("branch changed after approval");
+		const changed = detail();
+		assert.ok(
+			changed.endsWith(
+				"\nIts last approval was rejected because the branch changed after approval; see that message for what to " +
+					"do next.",
+			),
+			changed,
+		);
+		assert.ok(!changed.includes("for a follow-up"), changed);
+		approval("pull request closed");
+		assert.ok(
+			detail().endsWith(
+				"\nIts last approval was rejected because the pull request was closed on GitHub; see that message for " +
+					"what to do next.",
+			),
+		);
+		// Any other outcome of the last approval (here: tests failed), or a new head posted since: the usual step.
+		approval("tests failed");
+		assert.ok(detail().endsWith(`\n${generic}`));
+		approval("branch changed after approval");
+		f.toReview(id, NEW_HEAD);
+		assert.ok(detail().endsWith(`\n${generic}`));
 	});
 
 	test("/help lists the commands and the configured agents", () => {

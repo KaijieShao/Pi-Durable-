@@ -177,10 +177,19 @@ from the bot quote the command or message they answer.
    reaches it…", then "Task 1 merged into main (…)". `main` on GitHub now contains the merge commit.
 7. **Approval rejected after the head changes.** Start task 3 and wait for its review message (note its head
    commit). On GitHub, push a commit to branch `task/3` (for example edit a file in the web editor on that branch).
-   Then `/approve@smule_code_bot 3` → the approval is rejected because the branch no longer matches the commit the bot
-   posted ("Approval rejected: the branch changed after approval." — the bot may first acknowledge the `/approve`
-   and reject it when the merge step compares the pull request's head on GitHub). `main` does not change and task 3
-   stays in review. Cancel it afterwards with `/cancel@smule_code_bot 3`.
+   Then `/approve@smule_code_bot 3` → the bot first acknowledges it ("Approved Task 3 at abc1234…"), then the merge
+   step compares the pull request's head on GitHub with the approved head and rejects the approval: "Approval of
+   Task 3 rejected; nothing was merged." The message says why (branch `task/3` on GitHub is at the new commit, but the
+   approval was for the head the bot posted; the branch changed outside the Coordinator) and what to do. `main` does
+   not change and task 3 stays in review.
+   - Restore the branch as the message says, from a clone: `git fetch origin`, then
+     `git push --force origin <approved sha>:refs/heads/task/3` (the message gives the full sha; this drops the
+     commit you pushed). Then `/approve@smule_code_bot 3` again → "Task 3 merged into main (…)" (if `main` moved
+     meanwhile: "Main moved; …" and a new approval), or `/cancel@smule_code_bot 3` → "Task 3 cancelled. Pull request
+     closed; branch task/3 kept."
+   - Do not reply with a follow-up or send `/cancel` before the branch is restored: the Coordinator never overwrites a
+     commit on GitHub (it pushes without force), so its push is refused and the group freezes until the owner
+     resolves it and unfreezes the group with the owner CLI.
 
 ## Privacy mode
 

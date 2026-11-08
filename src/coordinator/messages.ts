@@ -154,16 +154,235 @@ export function notInReview(id: number, state: TaskState): string {
 	return `${taskRef(id)} is ${describeState(state)}, not in review; approve it after the bot posts its pull request`;
 }
 
-export function runAdmitted(id: number): string {
-	return `a new run of ${taskRef(id)} has been admitted since the bot posted it; review its result first`;
+/**
+ * /approve while a run of the task is queued or in progress (Interfaces and Storage § Telegram: rejected "if a new
+ * run has been admitted since"). `kind` is the busy run's kind; `postedHead` the head the bot last posted, if any.
+ */
+export function runAdmitted(p: { taskId: number; postedHead: string | null; kind: string }): string {
+	const task = taskRef(p.taskId);
+	const approve = `/approve ${p.taskId}`;
+	if (p.kind === "initial") {
+		return (
+			`${task} is still on its first run, so the bot has not posted a head to approve yet; ` +
+			`wait for its review message, then send ${approve}`
+		);
+	}
+	if (p.kind === "conflict") {
+		return (
+			`a conflict-fix run of ${task} is queued or running, so there is no head to approve yet; ` +
+			`wait for the bot to post its result, then approve the new head with ${approve}`
+		);
+	}
+	if (p.postedHead === null) {
+		return (
+			`a new run of ${task} is queued or running and the bot has not posted a head to approve yet; ` +
+			`wait for the bot to post its result, then send ${approve}`
+		);
+	}
+	return (
+		`a new run of ${task} was admitted, so ${sha7(p.postedHead)}, the head the bot last posted, is no longer what ` +
+		`would merge; wait for the bot to post that run's result, then approve its new head with ${approve}`
+	);
 }
 
 export function noPullRequest(id: number): string {
 	return `${taskRef(id)} has no pull request, so there is nothing to merge`;
 }
 
-export function staleHead(): string {
-	return "the branch changed since the bot posted it; wait for the new head";
+/** tasks.reason while a merge conflict waits for its fix run because the run could not be queued (engine/merge.ts). */
+export const MERGE_CONFLICT_REASON = "merge conflict";
+
+/**
+ * /approve when there is no posted head to approve, or the task's branch is no longer at the head the bot last posted
+ * (Interfaces and Storage § Telegram: rejected "if the branch has changed"). `conflict`: a merge with main stopped
+ * with a conflict and its fix run could not be queued (the worktree holds the unfinished merge).
+ */
+export function staleHead(p: {
+	taskId: number;
+	head: string | null;
+	postedHead: string | null;
+	conflict: boolean;
+}): string {
+	const task = taskRef(p.taskId);
+	const followup = `reply to a message of ${task} for a follow-up run, then approve the head the bot posts after it`;
+	if (p.postedHead === null && p.conflict) {
+		return (
+			`the merge of ${task} with the latest main stopped with a conflict, so there is no head to approve yet; ` +
+			`reply to a message of ${task} to start the conflict fix, then approve the head the bot posts after it`
+		);
+	}
+	if (p.postedHead === null || p.head === null)
+		return `the bot has not posted a head of ${task} to approve; ${followup}`;
+	return `the branch of ${task} is at ${sha7(p.head)}, but the bot last posted ${sha7(p.postedHead)}; ${followup}`;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The merge step (engine/merge.ts): approvals rejected or set aside, each with why and what to do.
+// Architecture § Review and merge; Interfaces and Storage § Coordinator to GitHub.
+
+/** approvals.reason when the merge step rejects an approval because GitHub's branch no longer matches it. */
+export const BRANCH_CHANGED_REASON = "branch changed after approval";
+/** approvals.reason when the merge step rejects an approval because the pull request was closed on GitHub. */
+export const PR_CLOSED_REASON = "pull request closed";
+
+/**
+ * For a task in review (its review reminder, /status <task>) whose latest approval the merge step rejected because
+ * GitHub's branch or pull request no longer matched, with no new head posted since: point back to that rejection
+ * instead of the usual "reply for a follow-up, or /approve". Its steps are the only safe ones: a follow-up or /cancel
+ * would push onto a commit pushed outside the Coordinator, be refused, and freeze the group. Else undefined.
+ */
+export function rejectedApprovalNote(
+	approval: { readonly head_commit: string; readonly state: string; readonly reason: string | null } | undefined,
+	postedHead: string | null,
+): string | undefined {
+	if (approval?.state !== "invalidated" || approval.head_commit !== postedHead) return undefined;
+	const see = "see that message for what to do next";
+	if (approval.reason === BRANCH_CHANGED_REASON) {
+		return `Its last approval was rejected because the branch changed after approval; ${see}.`;
+	}
+	if (approval.reason === PR_CLOSED_REASON) {
+		return `Its last approval was rejected because the pull request was closed on GitHub; ${see}.`;
+	}
+	return undefined;
+}
+
+/** What the merge step knows when GitHub's view of the pull request does not match the approval. */
+export type ApprovalFacts = {
+	readonly taskId: number;
+	readonly branch: string;
+	/** The approved head: the head the bot posted when /approve was sent (full sha). */
+	readonly approvedHead: string;
+	/** The pull request's head on GitHub now (full sha). */
+	readonly githubHead: string;
+};
+
+function rejectedHeadline(taskId: number): string {
+	return `Approval of ${taskRef(taskId)} rejected; nothing was merged.`;
+}
+
+function headsDiffer(p: ApprovalFacts): string {
+	return (
+		`Why: branch ${p.branch} on GitHub is at ${sha7(p.githubHead)}, but the approval was for ` +
+		`${sha7(p.approvedHead)}, the head the bot posted.`
+	);
+}
+
+/**
+ * GitHub's pull request head is not the approved head and the Coordinator did not push it: someone pushed to the task
+ * branch on GitHub. The only ways on: restore the branch to the approved head, then /approve again or /cancel. A
+ * follow-up run or /cancel before that would push without force onto the foreign commit; the push is refused and
+ * the group freezes (engine/effects.ts pushBranch), so neither is offered.
+ */
+export function approvalBranchChanged(p: ApprovalFacts): string {
+	return [
+		rejectedHeadline(p.taskId),
+		`${headsDiffer(p)} The branch changed outside the Coordinator.`,
+		`What to do: restore ${p.branch} on GitHub to ${sha7(p.approvedHead)}, for example from a clone after ` +
+			"git fetch origin:",
+		`git push --force origin ${p.approvedHead}:refs/heads/${p.branch}`,
+		"(this drops the commits pushed since; save them on another branch first if you need them). " +
+			`Then send /approve ${p.taskId} again to approve that head, or /cancel ${p.taskId} to drop the task.`,
+		`Until the branch is restored, do not reply with a follow-up or send /cancel ${p.taskId}: the Coordinator never ` +
+			"overwrites commits on GitHub, so its push would be refused and the group would freeze.",
+	].join("\n");
+}
+
+/**
+ * GitHub's head is the task worktree's own HEAD: the Coordinator pushed it, from an earlier merge attempt that
+ * combined the task with main and was interrupted before it saved and posted the result. The worktree and GitHub
+ * agree, so a follow-up run (whose review posts a new head) or /cancel push nothing foreign.
+ */
+export function approvalUnfinishedCombine(p: ApprovalFacts): string {
+	return [
+		rejectedHeadline(p.taskId),
+		`${headsDiffer(p)} ${sha7(p.githubHead)} was pushed by the Coordinator itself: an earlier merge attempt ` +
+			"combined the task with the latest main and was interrupted before it posted the result.",
+		`What to do: reply to a message of ${taskRef(p.taskId)} for a follow-up run, then approve the head the bot ` +
+			`posts after it; or send /cancel ${p.taskId}.`,
+	].join("\n");
+}
+
+/** The pull request was merged on GitHub at another head than the approved one: not by the Coordinator. */
+export function approvalMergedElsewhere(p: ApprovalFacts): string {
+	return [
+		`Approval of ${taskRef(p.taskId)} rejected; the Coordinator merged nothing.`,
+		`Why: the pull request of ${taskRef(p.taskId)} was merged on GitHub outside the Coordinator, at ` +
+			`${sha7(p.githubHead)} instead of the approved head ${sha7(p.approvedHead)}. Main on GitHub now contains ` +
+			"that merge; the group owner should check it.",
+		`What to do: this pull request cannot be merged again. To close the task, make sure branch ${p.branch} on ` +
+			`GitHub is at ${sha7(p.approvedHead)} or deleted (restore it if it changed), then send /cancel ${p.taskId}.`,
+	].join("\n");
+}
+
+/** The pull request was closed on GitHub (the Coordinator closes one only on cancel or a limit). */
+export function approvalPrClosed(p: Omit<ApprovalFacts, "githubHead">): string {
+	return [
+		rejectedHeadline(p.taskId),
+		`Why: the pull request of ${taskRef(p.taskId)} was closed on GitHub outside the Coordinator.`,
+		`What to do: make sure branch ${p.branch} on GitHub is at ${sha7(p.approvedHead)}, the approved head (restore ` +
+			`it if it was changed or deleted). Then reopen the pull request on GitHub and send /approve ${p.taskId} ` +
+			`again, or send /cancel ${p.taskId} to drop the task.`,
+	].join("\n");
+}
+
+/** GitHub still has the approved head, but the Coordinator's record of the branch moved (not expected to happen). */
+export function approvalLocalMoved(p: Omit<ApprovalFacts, "githubHead"> & { localHead: string | null }): string {
+	const local = p.localHead === null ? "no commit" : sha7(p.localHead);
+	return [
+		rejectedHeadline(p.taskId),
+		`Why: the Coordinator's record of branch ${p.branch} is at ${local}, not at the approved head ` +
+			`${sha7(p.approvedHead)} (GitHub still has ${sha7(p.approvedHead)}).`,
+		`What to do: this is not expected; the group owner should check /status ${p.taskId} and the Coordinator's ` +
+			"log before anyone approves it again.",
+	].join("\n");
+}
+
+/**
+ * Main moved: the combined result is a new commit, tested and pushed, so the approval no longer covers what would
+ * merge (Architecture § Review and merge). Failed tests block a merge, so then the way on is a follow-up.
+ */
+export function mainMoved(p: {
+	taskId: number;
+	approvedHead: string;
+	head: string;
+	tests: string;
+	testsPassed: boolean;
+}): string {
+	const lead =
+		`Main moved; ${taskRef(p.taskId)} was combined with the latest main and retested (${p.tests}). ` +
+		`Head: ${sha7(p.head)}. Nothing was merged: the approval of ${sha7(p.approvedHead)} does not cover this ` +
+		"combined result";
+	if (p.testsPassed) return `${lead}, so approve it with /approve ${p.taskId}.`;
+	return (
+		`${lead}, and it cannot merge until its tests pass. Reply to this message for a follow-up to fix them, then ` +
+		"approve the head the bot posts after it."
+	);
+}
+
+/**
+ * Merging main into the task branch stopped with a conflict: nothing merged, the approval is set aside, and a
+ * conflict-fix run was admitted (`position`) or could not be queued (`refused`, the admission's reason).
+ */
+export function mergeConflict(p: {
+	taskId: number;
+	approvedHead: string;
+	files: string;
+	admitted: { position: number } | { refused: string };
+}): string {
+	const task = taskRef(p.taskId);
+	const lead =
+		`Merge conflict in: ${p.files}. Nothing was merged: ${task} could not be combined with the latest main, so ` +
+		`the approval of ${sha7(p.approvedHead)} no longer applies.`;
+	if ("position" in p.admitted) {
+		return (
+			`${lead} A run of ${task} was admitted to resolve it (queue position ${p.admitted.position}); when the bot ` +
+			`posts its result, review it and approve the new head with /approve ${p.taskId}.`
+		);
+	}
+	return (
+		`${lead} The conflict-fix run could not be queued (${p.admitted.refused}); reply to this message to start the ` +
+		"conflict fix when the queue has room, then approve the head the bot posts after it."
+	);
 }
 
 export function cannotFollowUp(id: number, state: TaskState): string {
@@ -234,6 +453,16 @@ export function approved(p: { taskId: number; head: string; position: number; te
 		`Approved ${taskRef(p.taskId)} at ${sha7(p.head)}; merging when the merge queue reaches it. ` +
 		`Merge queue position ${p.position}.${tests}`
 	);
+}
+
+/**
+ * The one reminder for a task in review past the configured time (Architecture § Review and merge). `rejectedNote`
+ * (rejectedApprovalNote) replaces the usual next step after the merge step rejected its last approval.
+ */
+export function reviewReminder(p: { taskId: number; prUrl: string | null; rejectedNote: string | undefined }): string {
+	const pr = p.prUrl === null ? "" : ` Pull request: ${p.prUrl}.`;
+	const next = p.rejectedNote ?? `Reply to this message for a follow-up, or send /approve ${p.taskId}.`;
+	return `Reminder: ${taskRef(p.taskId)} is waiting for review.${pr} ${next}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -316,6 +545,8 @@ export type StatusDetail = {
 	note: string | undefined;
 	cancelling: boolean;
 	archived: boolean;
+	/** rejectedApprovalNote for a task in review whose last approval was rejected; replaces the usual next step. */
+	rejectedNote?: string | undefined;
 };
 
 export function statusDetail(p: StatusDetail): string {
@@ -327,7 +558,9 @@ export function statusDetail(p: StatusDetail): string {
 		...branchLines(p),
 		...runLines(p),
 	];
-	if (p.state === "review") lines.push(`Reply to a message of this task for a follow-up, or send /approve ${p.id}.`);
+	if (p.state === "review") {
+		lines.push(p.rejectedNote ?? `Reply to a message of this task for a follow-up, or send /approve ${p.id}.`);
+	}
 	return fitText(lines.join("\n"));
 }
 

@@ -36,6 +36,7 @@ import {
 	followupSteered,
 	frozenNotice,
 	helpText,
+	MERGE_CONFLICT_REASON,
 	mergeInProgress,
 	noPullRequest,
 	noSuchTask,
@@ -44,6 +45,7 @@ import {
 	notPermitted,
 	type RejectSubject,
 	rejected,
+	rejectedApprovalNote,
 	runAdmitted,
 	runStopping,
 	type StatusTaskLine,
@@ -539,7 +541,7 @@ function onApprove(store: Store, ctx: CommandContext, cmd: CommandMessage): Resu
 	const { task } = found;
 	const blocked = approveBlocker(store, ctx, task, cmd);
 	if (blocked !== undefined || task.posted_head === null) {
-		return rejection("approve", "/approve", blocked ?? ["stale_head", staleHead()], task.id);
+		return rejection("approve", "/approve", blocked ?? staleHeadBlocker(task), task.id);
 	}
 	const head = task.posted_head;
 	const now = store.now();
@@ -581,19 +583,28 @@ function approveBlocker(store: Store, ctx: CommandContext, task: TaskRow, cmd: C
 	if (isTerminal(task.state)) return ["state", terminalForCommand(task.id, task.state)];
 	if (task.cancel_requested === 1) return ["cancelling", beingCancelled(task.id)];
 	if (task.state === "merging") return ["merging", `${taskRef(task.id)} is already approved and merging`];
-	if (hasBusyRun(store, task.id)) return ["run_admitted", runAdmitted(task.id)];
+	const busy = busyRunKind(store, task.id);
+	if (busy !== undefined) {
+		return ["run_admitted", runAdmitted({ taskId: task.id, postedHead: task.posted_head, kind: busy })];
+	}
 	if (task.state !== "review") return ["state", notInReview(task.id, task.state)];
 	if (task.pr_number === null) return ["no_pr", noPullRequest(task.id)];
-	if (task.posted_head === null || task.head_commit !== task.posted_head) return ["stale_head", staleHead()];
+	if (task.posted_head === null || task.head_commit !== task.posted_head) return staleHeadBlocker(task);
 	return undefined;
 }
 
-function hasBusyRun(store: Store, taskId: number): boolean {
-	const busy = store.get<{ n: number }>(
-		"SELECT COUNT(*) AS n FROM runs WHERE task_id = ? AND state IN ('queued', 'starting', 'running', 'finalizing')",
+function staleHeadBlocker(task: TaskRow): Blocker {
+	const conflict = task.reason === MERGE_CONFLICT_REASON;
+	return ["stale_head", staleHead({ taskId: task.id, head: task.head_commit, postedHead: task.posted_head, conflict })];
+}
+
+/** The kind of the task's latest queued or in-progress run ("initial", "followup", "conflict"), if any. */
+function busyRunKind(store: Store, taskId: number): string | undefined {
+	return store.get<{ kind: string }>(
+		`SELECT kind FROM runs WHERE task_id = ? AND state IN ('queued', 'starting', 'running', 'finalizing')
+		 ORDER BY id DESC LIMIT 1`,
 		taskId,
-	);
-	return (busy?.n ?? 0) > 0;
+	)?.kind;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -661,6 +672,7 @@ function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
 		note: queue.note,
 		cancelling: task.cancel_requested === 1,
 		archived: task.archived === 1,
+		rejectedNote: rejectedApprovalNote(store.latestApproval(task.id), task.posted_head),
 	});
 }
 

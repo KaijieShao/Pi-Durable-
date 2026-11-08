@@ -28,7 +28,7 @@ import { decide } from "./engine/finalize.ts";
 import { mergeTask, nextMergeTask } from "./engine/merge.ts";
 import { type RecoveryJob, reconcile, runRecoveryJob } from "./engine/recovery.ts";
 import { defaultFreeBytes, limitReason, newActiveRun, runLifecycle, sendPendingSteers } from "./engine/runs.ts";
-import { taskRef } from "./messages.ts";
+import { rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
 import { projectTokensSpent } from "./relay.ts";
 
 export type { EngineOptions } from "./engine/context.ts";
@@ -303,19 +303,14 @@ function reminders(ctx: Ctx, state: EngineState): void {
 }
 
 function remind(ctx: Ctx, task: TaskRow): void {
-	const pr = task.pr_url === null ? "" : ` Pull request: ${task.pr_url}.`;
 	tx(ctx, () => {
 		const changes = ctx.store.run(
 			"UPDATE tasks SET review_reminded = 1 WHERE id = ? AND review_reminded = 0 AND state = 'review'",
 			task.id,
 		).changes;
 		if (changes === 0) return;
-		enqueueTask(
-			ctx,
-			task,
-			"review_reminder",
-			`Reminder: ${taskRef(task.id)} is waiting for review.${pr} Reply to this message for a follow-up, or send /approve ${task.id}.`,
-		);
+		const rejectedNote = rejectedApprovalNote(ctx.store.latestApproval(task.id), task.posted_head);
+		enqueueTask(ctx, task, "review_reminder", reviewReminder({ taskId: task.id, prUrl: task.pr_url, rejectedNote }));
 	});
 }
 

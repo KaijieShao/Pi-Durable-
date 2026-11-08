@@ -5,7 +5,8 @@
  * Lost pull request response, Cancel in review):
  *
  *   - /approve binds to the head the bot last posted; a commit pushed to the task branch on GitHub afterwards (before
- *     or during the merge) gets the approval rejected and nothing merges;
+ *     or during the merge) gets the approval rejected and nothing merges; the rejection says why (both heads, changed
+ *     outside the Coordinator) and what works: restoring the branch, then /approve merges, or /cancel closes it;
  *   - only the creator or the owner can approve, cancel or follow up; a newly admitted run blocks /approve;
  *   - merges run one at a time (never two pending merge intents); the second task meets a moved main, is combined,
  *     retested and needs a new approval;
@@ -195,6 +196,31 @@ function onGitHubCall(github: FakeGitHub, hook: (call: FakeCall) => void): void 
 	};
 }
 
+/**
+ * The rejection posted when GitHub's pull request head (`onGitHub`) is not the approved head: which task, nothing
+ * merged, why, and what works (restore the branch, then /approve or /cancel; not a follow-up or /cancel before).
+ */
+function staleApprovalText(id: number, onGitHub: string, approvedHead: string): string {
+	return [
+		`Approval of Task ${id} rejected; nothing was merged.`,
+		`Why: branch task/${id} on GitHub is at ${sha7(onGitHub)}, but the approval was for ${sha7(approvedHead)}, the ` +
+			"head the bot posted. The branch changed outside the Coordinator.",
+		`What to do: restore task/${id} on GitHub to ${sha7(approvedHead)}, for example from a clone after git fetch ` +
+			"origin:",
+		`git push --force origin ${approvedHead}:refs/heads/task/${id}`,
+		"(this drops the commits pushed since; save them on another branch first if you need them). Then send " +
+			`/approve ${id} again to approve that head, or /cancel ${id} to drop the task.`,
+		`Until the branch is restored, do not reply with a follow-up or send /cancel ${id}: the Coordinator never ` +
+			"overwrites commits on GitHub, so its push would be refused and the group would freeze.",
+	].join("\n");
+}
+
+/** What the rejection asks for: a force push of `branch` on GitHub back to `sha` (only if it is still at `from`). */
+async function restoreBranch(stack: Stack, branch: string, sha: string, from: string): Promise<void> {
+	await originGit(stack.origin.bare, ["update-ref", `refs/heads/${branch}`, sha, from]);
+	assert.equal(await stack.branchSha(branch), sha);
+}
+
 async function mergeCommitsOnMain(stack: Stack): Promise<number> {
 	return Number((await originGit(stack.origin.bare, ["rev-list", "--count", "--merges", "refs/heads/main"])).stdout);
 }
@@ -202,7 +228,7 @@ async function mergeCommitsOnMain(stack: Stack): Promise<number> {
 // ---------------------------------------------------------------------------------------------------------------
 // (a) Stale approval
 
-test("stale approval: a commit pushed to the task branch after the bot posted its head → the approval is rejected, nothing merges", {
+test("stale approval: a commit pushed to the task branch after the bot posted its head → rejected with why and what to do, nothing merges; restored branch + /approve merges", {
 	timeout: 120_000,
 }, async (t) => {
 	const stack = await stackFor(t, { model: scriptedAgent(AGENTS) });
@@ -226,12 +252,12 @@ test("stale approval: a commit pushed to the task branch after the bot posted it
 	assert.ok(ack.text.startsWith(`Approved Task 1 at ${sha7(posted)};`), ack.text);
 	assert.equal(approvals(stack)[0]?.head_commit, posted);
 
-	// The merge step sees GitHub's pull request head differ from the approved head: approval rejected.
-	const rejected = await stack.waitForBotMessage(
-		/^Approval rejected: the branch of Task 1 changed after approval\. Nothing was merged/,
-		{ since: ack.id },
-	);
-	assert.match(rejected.text, /approve the new head with \/approve 1 once the bot posts it/);
+	// The merge step sees GitHub's pull request head differ from the approved head: approval rejected, and the
+	// message says which task, that nothing merged, why, and what the system supports doing next.
+	const rejected = await stack.waitForBotMessage(/^Approval of Task 1 rejected; nothing was merged\./, {
+		since: ack.id,
+	});
+	assert.equal(rejected.text, staleApprovalText(1, foreign, posted));
 	await stack.coordinator.idle();
 	assert.equal(await stack.mainSha(), mainBefore, "main is unchanged");
 	assert.equal(await stack.fileAtMain("evil.js"), undefined);
@@ -246,9 +272,29 @@ test("stale approval: a commit pushed to the task branch after the bot posted it
 		intents(stack).map((i) => i.state),
 		["failed"],
 	);
+
+	// As the message says: restore task/1 on GitHub to the approved head (a force push), then /approve again merges.
+	await restoreBranch(stack, "task/1", posted, foreign);
+	const again = await command(stack, USER1, "/approve 1");
+	assert.ok(again.text.startsWith(`Approved Task 1 at ${sha7(posted)};`), again.text);
+	await stack.waitForBotMessage(/^Task 1 merged into main/, { since: again.id });
+	await stack.coordinator.idle();
+	const main = await stack.mainSha();
+	assert.deepEqual(await stack.parents(main), [mainBefore, posted], "exactly the approved head merged");
+	assert.equal(await stack.fileAtMain("a.js"), A_JS);
+	assert.equal(await stack.fileAtMain("evil.js"), undefined, "the commit pushed outside never merges");
+	assert.deepEqual(mergeCalls(stack.github), ["/pulls/1/merge"]);
+	assert.deepEqual(
+		approvals(stack).map((a) => [a.head_commit, a.state]),
+		[
+			[posted, "invalidated"],
+			[posted, "consumed"],
+		],
+	);
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "normal");
 });
 
-test("stale approval during the merge: a commit lands on the task branch between the check and GitHub's merge → refused, rejected, nothing merges", {
+test("stale approval during the merge: a commit lands on the task branch between the check and GitHub's merge → refused, rejected, nothing merges; restored branch + /cancel closes it", {
 	timeout: 120_000,
 }, async (t) => {
 	const stack = await stackFor(t, { model: scriptedAgent(AGENTS) });
@@ -264,19 +310,31 @@ test("stale approval during the merge: a commit lands on the task branch between
 	};
 	const ack = await command(stack, USER1, "/approve 1");
 	assert.ok(ack.text.startsWith(`Approved Task 1 at ${sha7(posted)};`), ack.text);
-	await stack.waitForBotMessage(
-		/^Approval rejected: the branch of Task 1 changed after approval\. Nothing was merged/,
-		{
-			since: ack.id,
-		},
-	);
+	const rejected = await stack.waitForBotMessage(/^Approval of Task 1 rejected; nothing was merged\./, {
+		since: ack.id,
+	});
 	await stack.coordinator.idle();
 	assert.ok(pushed !== undefined);
+	assert.equal(rejected.text, staleApprovalText(1, pushed, posted));
 	assert.deepEqual(mergeCalls(stack.github), ["/pulls/1/merge"], "GitHub refused the one merge call (409)");
 	assert.equal(await stack.mainSha(), mainBefore, "main is unchanged");
 	assert.equal(stack.github.pulls.get(1)?.merged, false);
 	assert.equal(taskRow(stack, 1).state, "review");
 	assert.equal(approvals(stack)[0]?.state, "invalidated");
+
+	// As the message says: restore the branch, then /cancel closes the task cleanly (its push compares equal with
+	// GitHub, so nothing is refused and the group does not freeze).
+	await restoreBranch(stack, "task/1", posted, pushed);
+	const cancel = await command(stack, USER1, "/cancel 1");
+	assert.match(cancel.text, /^Cancelling Task 1…/);
+	const final = await stack.waitForBotMessage(/^Task 1 cancelled\./, { since: cancel.id });
+	await stack.coordinator.idle();
+	assert.equal(final.text, "Task 1 cancelled. Pull request closed; branch task/1 kept.");
+	assert.equal(stack.coordinator.store.groupState(GROUP).state, "normal");
+	assert.deepEqual([taskRow(stack, 1).state, taskRow(stack, 1).worktree_path], ["cancelled", null]);
+	assert.equal(stack.github.pulls.get(1)?.state, "closed");
+	assert.equal(await stack.branchSha("task/1"), posted, "the approved head is kept on the branch");
+	assert.equal(await stack.mainSha(), mainBefore, "nothing merged");
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -328,7 +386,9 @@ test("only the creator or the owner can approve, cancel or follow up; a newly ad
 	const blocked = await command(stack, USER1, "/approve 1");
 	assert.equal(
 		blocked.text,
-		"/approve rejected: a new run of Task 1 has been admitted since the bot posted it; review its result first.",
+		`/approve rejected: a new run of Task 1 was admitted, so ${sha7(review1.head)}, the head the bot last posted, ` +
+			"is no longer what would merge; wait for the bot to post that run's result, then approve its new head with " +
+			"/approve 1.",
 	);
 	assert.deepEqual(approvals(stack), []);
 	hold.release();
@@ -408,7 +468,13 @@ test("two approved tasks merge one at a time: never two merge intents pending; t
 		/^Main moved; Task 2 was combined with the latest main and retested \(passed\)\./,
 		{ since: ack2.id },
 	);
-	assert.match(moved.text, /Nothing was merged yet: approve again with \/approve 2\./);
+	assert.ok(
+		moved.text.endsWith(
+			`Nothing was merged: the approval of ${sha7(review2.head)} does not cover this combined result, so approve ` +
+				"it with /approve 2.",
+		),
+		moved.text,
+	);
 	await stack.coordinator.idle();
 	const main1 = await stack.mainSha();
 	assert.ok(merged1.text.includes(sha7(main1)), merged1.text);
@@ -578,9 +644,11 @@ test("two tasks edit the same lines: the second merge lists the conflict, nothin
 	// Merging Task 2 merges main into task/2 first: git reports the conflict, nothing merges.
 	const ack2 = await command(stack, USER2, "/approve 2");
 	const conflict = await stack.waitForBotMessage(/^Merge conflict in: /, { since: ack2.id });
-	assert.match(
+	assert.equal(
 		conflict.text,
-		/^Merge conflict in: README\.md\. Nothing was merged\. A run of Task 2 was admitted to resolve it \(queue position 1\); you'll review again\./,
+		"Merge conflict in: README.md. Nothing was merged: Task 2 could not be combined with the latest main, so the " +
+			`approval of ${sha7(review2.head)} no longer applies. A run of Task 2 was admitted to resolve it (queue ` +
+			"position 1); when the bot posts its result, review it and approve the new head with /approve 2.",
 	);
 	assert.equal(await stack.mainSha(), main1, "nothing merged");
 	assert.equal(await stack.fileAtMain("README.md"), "# demo\n\nA tiny project, reworded by alpha.\n");
@@ -608,7 +676,11 @@ test("two tasks edit the same lines: the second merge lists the conflict, nothin
 	assert.match(onDisk, /^>>>>>>> /m);
 	assert.equal(taskRow(stack, 2).posted_head, null, "no head to approve during the fix");
 	const early = await command(stack, USER2, "/approve 2");
-	assert.match(early.text, /^\/approve rejected: a new run of Task 2 has been admitted/);
+	assert.equal(
+		early.text,
+		"/approve rejected: a conflict-fix run of Task 2 is queued or running, so there is no head to approve yet; " +
+			"wait for the bot to post its result, then approve the new head with /approve 2.",
+	);
 	hold.release();
 
 	// After the fix run: retested, pushed, back in review on the same pull request.

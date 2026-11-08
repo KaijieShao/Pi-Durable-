@@ -469,6 +469,8 @@ async function harness(
 		store?: Store;
 		dir?: string;
 		world?: World;
+		/** The engine's clock (default: the store's). */
+		now?: () => number;
 	} = {},
 ) {
 	const dir = options.dir ?? (await mkdtemp(join(tmpdir(), "engine-test-")));
@@ -506,6 +508,7 @@ async function harness(
 		log: silentLogger,
 		retryDelayMs: 5,
 		freeBytes: async () => 1e12,
+		...(options.now === undefined ? {} : { now: options.now }),
 	});
 	engine.setRelayUrl("http://127.0.0.1:9/v1");
 	if (options.store === undefined) {
@@ -1155,12 +1158,15 @@ test("merges run one at a time; main moved → combined, retested, back to revie
 	assert.equal(h.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM merge_intents WHERE state = 'pending'")?.n, 0);
 });
 
-test("stale approval: the PR head changed after approval → rejected, nothing merges", async (t) => {
-	const h = await harness(t);
+test("stale approval: the PR head changed after approval → rejected, nothing merges; the later reminder points to it", async (t) => {
+	let later = 0;
+	const h = await harness(t, { now: () => Date.now() + later });
 	const taskId = await runToReview(h);
 	const approvalId = approve(h, taskId);
 	const branch = `task/${taskId}`;
-	h.world.remote.set(branch, h.world.commitOn(h.world.remote.get(branch) as string, "late.txt", "late\n"));
+	const posted = taskRow(h, taskId).posted_head as string;
+	const late = h.world.commitOn(posted, "late.txt", "late\n");
+	h.world.remote.set(branch, late);
 	const main = h.world.state.main;
 	h.engine.kick();
 	await h.engine.idle();
@@ -1170,10 +1176,218 @@ test("stale approval: the PR head changed after approval → rejected, nothing m
 	const approval = h.store.get<{ state: string; reason: string }>("SELECT * FROM approvals WHERE id = ?", approvalId);
 	assert.equal(approval?.state, "invalidated");
 	assert.equal(approval?.reason, "branch changed after approval");
-	assert.match(
-		messages(h, "merge_rejected")[0]?.text ?? "",
-		/^Approval rejected: the branch of Task \d+ changed after approval\./,
+	const text = messages(h, "merge_rejected")[0]?.text ?? "";
+	assert.ok(text.startsWith(`Approval of Task ${taskId} rejected; nothing was merged.\n`), text);
+	assert.ok(
+		text.includes(
+			`Why: branch ${branch} on GitHub is at ${late.slice(0, 7)}, but the approval was for ${posted.slice(0, 7)}, ` +
+				"the head the bot posted. The branch changed outside the Coordinator.",
+		),
+		text,
 	);
+	assert.ok(text.includes(`\ngit push --force origin ${posted}:refs/heads/${branch}\n`), text);
+	assert.ok(text.includes(`Then send /approve ${taskId} again to approve that head, or /cancel ${taskId}`), text);
+	// A day later the task's one review reminder points back to that rejection; it does not offer a follow-up, which
+	// would push onto the commit pushed outside the Coordinator, be refused, and freeze the group.
+	assert.equal(messages(h, "review_reminder").length, 0);
+	later = h.limits.reviewReminderMs + 120_000;
+	await h.engine.idle();
+	assert.equal(
+		messages(h, "review_reminder")[0]?.text,
+		`Reminder: Task ${taskId} is waiting for review. Pull request: ${taskRow(h, taskId).pr_url}. Its last approval ` +
+			"was rejected because the branch changed after approval; see that message for what to do next.",
+	);
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+/** A commit pushed to the task branch outside the Coordinator after approval: the merge step rejects the approval. */
+async function rejectedAfterForeignPush(h: Harness) {
+	const taskId = await runToReview(h);
+	approve(h, taskId);
+	const branch = `task/${taskId}`;
+	h.world.remote.set(branch, h.world.commitOn(taskRow(h, taskId).posted_head as string, "late.txt", "late\n"));
+	h.engine.kick();
+	await h.engine.idle();
+	assert.match(messages(h, "merge_rejected")[0]?.text ?? "", /do not reply with a follow-up or send \/cancel/);
+	return { taskId, branch };
+}
+
+for (const [what, act] of [
+	["a follow-up run", (h: Harness, id: number) => void followupRun(h, id, "one more thing")],
+	["/cancel", (h: Harness, id: number) => requestCancel(h, id)],
+] as const) {
+	test(`stale approval: ${what} before the branch is restored freezes the group, as the rejection warns`, async (t) => {
+		const h = await harness(t);
+		const { taskId, branch } = await rejectedAfterForeignPush(h);
+		const foreign = h.world.remote.get(branch);
+		act(h, taskId);
+		h.engine.kick();
+		await h.engine.idle();
+		const group = h.store.groupState(CHAT);
+		assert.equal(group.state, "frozen");
+		assert.equal(group.reason, `GitHub rejected the push of ${branch} (the remote branch changed)`);
+		assert.equal(h.world.remote.get(branch), foreign, "the commit pushed outside is never overwritten");
+	});
+}
+
+/**
+ * An earlier merge attempt combined the worktree with a newer main and pushed it, then was interrupted before it saved
+ * the result (the approval stayed valid, the task merging); the next merge attempt rejects the approval.
+ */
+async function rejectedAfterInterruptedCombine(h: Harness) {
+	const taskId = await runToReview(h);
+	const approvalId = approve(h, taskId);
+	const task = taskRow(h, taskId);
+	const branch = task.branch as string;
+	const posted = task.posted_head as string;
+	h.world.advanceMain("CHANGELOG.md", "other work\n");
+	const combined = await h.world.git.mergeBase(task.worktree_path as string);
+	assert.equal(combined.conflict, false);
+	await h.world.git.push(task.worktree_path as string, branch);
+	const own = h.world.remote.get(branch) as string;
+	assert.notEqual(own, posted);
+	const main = h.world.state.main;
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "review");
+	assert.equal(h.world.state.main, main);
+	assert.equal(count(h.world.calls, "mergePullRequest"), 0);
+	assert.equal(
+		h.store.get<{ state: string }>("SELECT * FROM approvals WHERE id = ?", approvalId)?.state,
+		"invalidated",
+	);
+	const text = messages(h, "merge_rejected")[0]?.text ?? "";
+	assert.ok(
+		text.includes(`${own.slice(0, 7)} was pushed by the Coordinator itself: an earlier merge attempt combined`),
+		text,
+	);
+	assert.doesNotMatch(text, /outside the Coordinator|git push --force/);
+	return { taskId, task, own };
+}
+
+test("an interrupted combine with main left the Coordinator's own commit on GitHub → rejected; /cancel then works", async (t) => {
+	const h = await harness(t);
+	const { taskId, task } = await rejectedAfterInterruptedCombine(h);
+	// The advice holds: /cancel pushes nothing foreign (GitHub has the worktree's own head), so nothing freezes.
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "cancelled");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.pulls.get(task.pr_number as number)?.state, "closed");
+});
+
+test("an interrupted combine with main → rejected; the advised follow-up run posts a new head, which then merges", async (t) => {
+	const h = await harness(t);
+	const { taskId, own } = await rejectedAfterInterruptedCombine(h);
+	// The advice holds: the follow-up run works on the worktree, whose HEAD is GitHub's head, so its push is a
+	// fast-forward and the review posts a new head; approving that head merges it.
+	h.fake.control.script = workScript("src/followup.js", "export const followup = true;\n");
+	followupRun(h, taskId, "finish it");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	const reviewed = taskRow(h, taskId);
+	assert.equal(reviewed.state, "review");
+	const head = reviewed.posted_head as string;
+	assert.ok(head !== own && (await h.world.git.isAncestor(own, head)), "the new head builds on GitHub's head");
+	assert.equal(h.world.remote.get(reviewed.branch as string), head);
+	approve(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "merged");
+	assert.ok(await h.world.git.isAncestor(head, h.world.state.main));
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("the pull request was closed on GitHub → rejected with why; reopening it and approving again merges", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	approve(h, taskId);
+	const task = taskRow(h, taskId);
+	const pull = h.world.pulls.get(task.pr_number as number);
+	assert.ok(pull !== undefined);
+	Object.assign(pull, { state: "closed", frozenHead: h.world.remote.get(pull.head) });
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "review");
+	assert.equal(count(h.world.calls, "mergePullRequest"), 0);
+	const text = messages(h, "merge_rejected")[0]?.text ?? "";
+	assert.ok(text.startsWith(`Approval of Task ${taskId} rejected; nothing was merged.\n`), text);
+	assert.ok(text.includes(`Why: the pull request of Task ${taskId} was closed on GitHub outside the Coordinator.`));
+	assert.ok(text.includes(`Then reopen the pull request on GitHub and send /approve ${taskId} again`), text);
+	assert.equal(
+		h.store.get<{ reason: string }>("SELECT reason FROM approvals ORDER BY id DESC LIMIT 1")?.reason,
+		"pull request closed",
+	);
+	Object.assign(pull, { state: "open", frozenHead: undefined });
+	approve(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "merged");
+	assert.ok(await h.world.git.isAncestor(task.posted_head as string, h.world.state.main));
+});
+
+test("the pull request was merged on GitHub at another head → the Coordinator merged nothing; /cancel closes it", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	approve(h, taskId);
+	const task = taskRow(h, taskId);
+	const branch = task.branch as string;
+	const posted = task.posted_head as string;
+	const foreign = h.world.commitOn(posted, "extra.txt", "extra\n");
+	h.world.remote.set(branch, foreign);
+	const outside = h.world.commitOn(h.world.state.main, "extra.txt", "extra\n");
+	h.world.state.main = outside;
+	const pull = h.world.pulls.get(task.pr_number as number);
+	Object.assign(pull ?? {}, { state: "closed", merged: true, frozenHead: foreign, mergeCommitSha: outside });
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "review");
+	assert.equal(count(h.world.calls, "mergePullRequest"), 0);
+	assert.equal(h.world.state.main, outside, "the Coordinator merged nothing");
+	const text = messages(h, "merge_rejected")[0]?.text ?? "";
+	assert.ok(text.startsWith(`Approval of Task ${taskId} rejected; the Coordinator merged nothing.\n`), text);
+	assert.ok(text.includes(`at ${foreign.slice(0, 7)} instead of the approved head ${posted.slice(0, 7)}`), text);
+	// The advice holds: with the branch back at the approved head, /cancel archives the task without freezing.
+	h.world.remote.set(branch, posted);
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "cancelled");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("main moved and the combined result fails its tests → the message says it cannot merge until they pass", async (t) => {
+	let calls = 0;
+	const h = await harness(t, {
+		checks: {
+			test: async () => (++calls === 1 ? { exitCode: 0, output: "ok" } : { exitCode: 1, output: "1 failing" }),
+		},
+	});
+	const taskId = await runToReview(h);
+	const posted = taskRow(h, taskId).posted_head as string;
+	approve(h, taskId);
+	h.world.advanceMain("CHANGELOG.md", "other work\n");
+	h.engine.kick();
+	await h.engine.idle();
+	const task = taskRow(h, taskId);
+	assert.equal(task.state, "review");
+	assert.equal(task.tests_passed_head, null);
+	assert.equal(
+		messages(h, "merge_main_moved")[0]?.text,
+		`Main moved; Task ${taskId} was combined with the latest main and retested (failed (failed)). Head: ` +
+			`${(task.head_commit as string).slice(0, 7)}. Nothing was merged: the approval of ${posted.slice(0, 7)} does ` +
+			"not cover this combined result, and it cannot merge until its tests pass. Reply to this message for a " +
+			"follow-up to fix them, then approve the head the bot posts after it.",
+	);
+	// Approving it anyway is blocked by the failed tests, as the message says.
+	approve(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "review");
+	assert.equal(count(h.world.calls, "mergePullRequest"), 0);
+	assert.match(messages(h, "merge_blocked")[0]?.text ?? "", /cannot merge: the tests did not pass/);
 });
 
 test("failed tests block a merge when main has not moved", async (t) => {
@@ -1206,7 +1420,7 @@ test("merge conflict: nothing merges, files listed, a conflict-fix run is admitt
 	);
 	assert.match(
 		messages(h, "merge_conflict")[0]?.text ?? "",
-		/^Merge conflict in: README\.md\. Nothing was merged\. A run of Task \d+ was admitted/,
+		/^Merge conflict in: README\.md\. Nothing was merged: Task \d+ could not be combined with the latest main, so the approval of [0-9a-f]{7} no longer applies\. A run of Task \d+ was admitted/,
 	);
 	const runs = runsOf(h, taskId);
 	assert.equal(runs.length, 2);
