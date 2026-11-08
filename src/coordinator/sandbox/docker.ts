@@ -224,8 +224,8 @@ export function createDockerSandbox(options: DockerSandboxOptions): Sandbox {
 	];
 
 	// STUB(spec: capacity.md § Disk): no per-container disk quota; worktree and scratch writes are bounded only by
-	// the task disk (a separate mount) and the free-space check at admission; the read-only root and the 64 MiB /tmp
-	// tmpfs keep container writes off the boot disk.
+	// the task disk (a separate mount) and the check made before each new worktree (its floor and budget,
+	// engine/task-disk.ts); the read-only root and the 64 MiB /tmp tmpfs keep container writes off the boot disk.
 	const hardening = (cpus: number, memoryMiB: number, pids: number): string[] => [
 		"--pull",
 		"never",

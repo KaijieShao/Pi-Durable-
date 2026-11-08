@@ -5,7 +5,8 @@
  * redelivered update is a no-op: Requirements § No duplicate submissions), the state change (task, run, follow-up,
  * approval, cancel request) and the acknowledgement or rejection in the outbox. "An accepted command, its task or
  * follow-up change and its acknowledgement event are saved in one database transaction, so a crash keeps all three
- * or none." Nothing but SQLite runs inside the transaction: no network, no IPC (free disk space is read before it).
+ * or none." Nothing but SQLite runs inside the transaction: no network, no IPC (the boot disk's free space is read
+ * before it).
  * After commit the caller kicks the engine when `kick` is true; the engine reads the database.
  *
  * The engine consumes: runs in state 'queued'; follow-ups (mode 'steer' + state 'pending' → steer into run_id;
@@ -15,21 +16,26 @@
  * Every reply is a required outbox message replying to the user's message. Ignored updates are recorded (so
  * redelivery stays deduplicated) but get no reply. Logs carry metadata only (ids, kinds, outcomes, codes).
  */
-import { statfsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import type { Update } from "grammy/types";
 import type { Logger } from "../runtime/log.ts";
 import { admitRun, agentQueuePosition, openTaskCount, waitingCapReason, waitingCounts } from "./admission.ts";
 import { type BranchHold, readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import {
+	type BootDiskCheck,
+	checkBootDisk,
+	type DiskProbe,
+	diskSettings,
+	systemDiskProbe,
+	TASK_DISK_WAIT_KEY,
+	taskDiskToldKey,
+} from "./disk.ts";
 import type { Limits } from "./limits.ts";
 import {
 	approved,
 	beingCancelled,
 	cancelling,
 	cannotFollowUp,
-	diskLow,
-	diskUnknown,
 	emptyText,
 	followupExpired,
 	followupLimit,
@@ -69,6 +75,7 @@ import {
 	waitingForAgent,
 	waitingForReviews,
 	waitingForSlot,
+	waitingForTaskDisk,
 } from "./messages.ts";
 import type { OutboxMessage, Store } from "./store.ts";
 import { type ParsedUpdate, parseUpdate } from "./telegram/parse.ts";
@@ -77,8 +84,8 @@ export type CommandContext = {
 	config: CoordinatorConfig;
 	limits: Limits;
 	log: Logger;
-	/** Free bytes available on the filesystem holding `path`; default `fs.statfsSync`. */
-	freeBytes?: (path: string) => number;
+	/** How the boot disk is measured (src/coordinator/disk.ts); default the system's statfs. Tests inject one. */
+	diskProbe?: DiskProbe;
 };
 
 type CommandKind = "task" | "followup" | "status" | "cancel" | "approve" | "help" | "ignored";
@@ -124,8 +131,6 @@ type TaskRow = {
 
 type RunRow = { id: number; kind: string; state: string; reason: string | null };
 
-type DiskCheck = { ok: true } | { ok: false; reason: string };
-
 const TERMINAL: ReadonlySet<TaskState> = new Set(["merged", "failed", "cancelled"]);
 const ACTIVE_RUN = new Set(["queued", "starting", "running"]);
 const TASK_COLUMNS = `id, chat_id, creator_id, agent_id, text, state, reason, branch, worktree_path, archived,
@@ -138,8 +143,8 @@ export function handleUpdate(store: Store, ctx: CommandContext, update: Update):
 		topicId: telegram.topicId,
 		botUsername: telegram.botUsername,
 	});
-	// Read free space before the transaction: only SQLite work happens inside it.
-	const disk = parsed.kind === "command" && parsed.name === "task" ? checkDisk(ctx) : undefined;
+	// Read the boot disk's free space before the transaction: only SQLite work happens inside it.
+	const disk = parsed.kind === "command" && parsed.name === "task" ? bootDisk(ctx) : undefined;
 
 	const result = store.tx((): Result | undefined => {
 		// Redelivered update: already handled (it has its row), so no second effect and no second reply.
@@ -202,7 +207,7 @@ function enqueueReplies(store: Store, parsed: ParsedUpdate, outcome: Result): vo
 	for (const message of outcome.extra ?? []) store.enqueue(message);
 }
 
-function route(store: Store, ctx: CommandContext, parsed: ParsedUpdate, disk: DiskCheck | undefined): Result {
+function route(store: Store, ctx: CommandContext, parsed: ParsedUpdate, disk: BootDiskCheck | undefined): Result {
 	if (parsed.kind === "ignored") return ignored(parsed.reason);
 	if (parsed.kind === "reply") return onReply(store, ctx, parsed);
 	switch (parsed.name) {
@@ -239,7 +244,7 @@ function rejection(kind: CommandKind, subject: RejectSubject, blocker: Blocker, 
 // ---------------------------------------------------------------------------------------------------------------
 // /task <agent> <text>
 
-function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: DiskCheck): Result {
+function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: BootDiskCheck): Result {
 	const { limits } = ctx;
 	const request = taskRequest(store, ctx, cmd, disk);
 	if ("blocker" in request) return rejection("task", "Task request", request.blocker);
@@ -270,6 +275,8 @@ function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: Di
 		return rejection("task", "Task request", ["admission", admitted.reason]);
 	}
 	const note = waitNote(store, limits, { chatId: cmd.chatId, agent, initial: true });
+	// Told in the acknowledgement: the engine does not say it again when it holds the run (dispatch.ts).
+	if (note !== undefined && note === taskDiskNote(store)) store.setMeta(taskDiskToldKey(admitted.runId), String(now));
 	return {
 		kind: "task",
 		outcome: "accepted",
@@ -279,12 +286,12 @@ function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: Di
 	};
 }
 
-/** Validate a /task in rule order: member allowlist, frozen group, agent, text, disk, waiting caps. */
+/** Validate a /task in rule order: member allowlist, frozen group, agent, text, boot disk, waiting caps. */
 function taskRequest(
 	store: Store,
 	ctx: CommandContext,
 	cmd: CommandMessage,
-	disk: DiskCheck,
+	disk: BootDiskCheck,
 ): { agent: string; text: string } | { blocker: Blocker } {
 	const { config, limits } = ctx;
 	const members = config.telegram.memberIds;
@@ -300,7 +307,7 @@ function taskRequest(
 	const text = (match?.[2] ?? "").trim();
 	if (text === "") return { blocker: ["empty", `${emptyText("task")}; ${usageTask(config.agents)}`] };
 	if (text.length > limits.taskChars) return { blocker: ["too_long", tooLong("task", text.length, limits.taskChars)] };
-	if (!disk.ok) return { blocker: ["disk_low", disk.reason] };
+	if (!disk.ok) return { blocker: [disk.code, disk.reason] };
 	const counts = waitingCounts(store, { agentId: agent, chatId: cmd.chatId, userId: cmd.userId });
 	const full = waitingCapReason(limits, counts, agent);
 	return full === undefined ? { agent, text } : { blocker: ["queue_full", full] };
@@ -738,7 +745,9 @@ function queueInfo(store: Store, limits: Limits, task: TaskRow): { position?: nu
 
 /**
  * Why a queued run is not starting right away (Capacity § Waiting): a first run waits for the group to have fewer
- * than `openTasksPerGroup` open tasks; every run waits for its agent and for a deployment-wide execution slot.
+ * than `openTasksPerGroup` open tasks and for room on the task disk for its new worktree (Capacity § Disk, while the
+ * engine holds new worktrees: engine/task-disk.ts); every run waits for its agent and for a deployment-wide execution
+ * slot.
  */
 function waitNote(
 	store: Store,
@@ -750,6 +759,8 @@ function waitNote(
 	if (p.initial) {
 		const open = openTaskCount(store, p.chatId);
 		if (open >= limits.openTasksPerGroup) return waitingForReviews(open);
+		const disk = taskDiskNote(store);
+		if (disk !== undefined) return disk;
 	}
 	const agentBusy =
 		store.get<{ n: number }>(
@@ -762,6 +773,12 @@ function waitNote(
 	const inUse = slotsInUse(store);
 	if (inUse >= limits.maxConcurrentRuns) return waitingForSlot(inUse, limits.maxConcurrentRuns);
 	return undefined;
+}
+
+/** The note of a held task disk (engine/task-disk.ts), if new worktrees are held now. */
+function taskDiskNote(store: Store): string | undefined {
+	const detail = store.getMeta(TASK_DISK_WAIT_KEY);
+	return detail === undefined ? undefined : waitingForTaskDisk(detail);
 }
 
 function slotsInUse(store: Store): number {
@@ -821,38 +838,13 @@ function rawMeta(update: Update): { chatId: number | null; userId: number | null
 	};
 }
 
-/** Capacity § Disk: new tasks are rejected while the data disk or the task disk is low (fail closed if unreadable). */
-function checkDisk(ctx: CommandContext): DiskCheck {
-	const free = ctx.freeBytes ?? statfsFree;
-	const min = ctx.limits.minFreeDiskBytes;
-	const disks: ["data" | "task", string][] = [
-		["data", ctx.config.paths.dataDir],
-		["task", ctx.config.paths.taskDir],
-	];
-	for (const [which, path] of disks) {
-		let bytes: number;
-		try {
-			bytes = free(path);
-		} catch {
-			return { ok: false, reason: diskUnknown(which) };
-		}
-		if (!Number.isFinite(bytes)) return { ok: false, reason: diskUnknown(which) };
-		if (bytes < min) return { ok: false, reason: diskLow(which, bytes, min) };
-	}
-	return { ok: true };
-}
-
-/** Free bytes for unprivileged users on the filesystem of `path` (or of its nearest existing parent). */
-export function statfsFree(path: string): number {
-	let current = resolve(path);
-	for (;;) {
-		try {
-			const stats = statfsSync(current);
-			return Number(stats.bavail) * Number(stats.bsize);
-		} catch (error) {
-			const parent = dirname(current);
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === current) throw error;
-			current = parent;
-		}
-	}
+/**
+ * Capacity § Disk: "When its free space runs low, new tasks are rejected with a reason." The boot disk (PI_DATA_DIR's
+ * filesystem) only; fails closed if it cannot be read. A full task disk does not reject a /task: the task is accepted
+ * and stays queued until its worktree fits (engine/task-disk.ts; Evaluation "Task disk full": commands are still
+ * saved and acknowledged).
+ */
+function bootDisk(ctx: CommandContext): BootDiskCheck {
+	const min = diskSettings(ctx.config, ctx.limits).bootMinFreeBytes;
+	return checkBootDisk(ctx.diskProbe ?? systemDiskProbe, ctx.config.paths.dataDir, min);
 }

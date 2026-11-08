@@ -43,8 +43,17 @@ export type Limits = {
 	readonly checkCpus: number;
 	readonly checkMemoryMiB: number;
 	readonly checkPids: number;
-	/** New tasks are rejected when free space on the data or task disk falls below this. */
+	/**
+	 * Free-space floor of both disks (Capacity § Disk), the default of PI_BOOT_DISK_MIN_FREE and PI_TASK_DISK_MIN_FREE:
+	 * new /task requests are rejected while the boot disk (PI_DATA_DIR) has less free; a new worktree is created only if
+	 * at least this much stays free on the task disk (PI_TASK_DIR) after it (src/coordinator/disk.ts).
+	 */
 	readonly minFreeDiskBytes: number;
+	/**
+	 * Room a new worktree is assumed to need beyond its checked-out files (dependencies, build output), the default of
+	 * PI_WORKTREE_HEADROOM. Provisional: the stress test sets the task disk's size (Capacity § Disk).
+	 */
+	readonly worktreeHeadroomBytes: number;
 	/** A task in review past this gets one reminder. */
 	readonly reviewReminderMs: number;
 	/** Grace period for a stop (abort → terminate → verify) before it counts as unconfirmed. */
@@ -75,6 +84,7 @@ export const DEMO_LIMITS: Limits = Object.freeze({
 	checkMemoryMiB: 1024,
 	checkPids: 256,
 	minFreeDiskBytes: 1024 * 1024 * 1024,
+	worktreeHeadroomBytes: 1024 * 1024 * 1024,
 	reviewReminderMs: 24 * 60 * 60_000,
 	stopGraceMs: 15_000,
 });

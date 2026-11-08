@@ -7,6 +7,7 @@ import { afterEach, describe, test } from "node:test";
 import type { Update } from "grammy/types";
 import { type CommandContext, handleUpdate } from "../../src/coordinator/commands.ts";
 import { parseCoordinatorConfig } from "../../src/coordinator/config.ts";
+import { type DiskProbe, TASK_DISK_WAIT_KEY } from "../../src/coordinator/disk.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
 import { Store } from "../../src/coordinator/store.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
@@ -54,7 +55,28 @@ afterEach(() => {
 let nextUpdateId = 10_000;
 let nextMessageId = 500;
 
-function fixture(options: { limits?: Partial<Limits>; members?: string; freeBytes?: (path: string) => number } = {}) {
+type FixtureOptions = {
+	limits?: Partial<Limits>;
+	members?: string;
+	/** Free bytes of the filesystem holding a path (default 50 GiB); throw = unreadable. */
+	freeBytes?: (path: string) => number;
+	/** Extra Coordinator environment (e.g. PI_BOOT_DISK_MIN_FREE). */
+	env?: Record<string, string>;
+};
+
+/** A disk probe from a free-bytes function (sizes other than free do not matter to the commands front). */
+function probeOf(freeBytes: (path: string) => number): DiskProbe {
+	return {
+		space: (path) => {
+			const free = freeBytes(path);
+			return { free, size: 100 * 1024 ** 3, used: 100 * 1024 ** 3 - free };
+		},
+		isMountPoint: async () => false,
+		treeBytes: async () => 0,
+	};
+}
+
+function fixture(options: FixtureOptions = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pd-commands-"));
 	let clock = 1_800_000_000_000;
 	const store = new Store(join(dir, "coordinator.sqlite"), () => ++clock);
@@ -77,6 +99,7 @@ function fixture(options: { limits?: Partial<Limits>; members?: string; freeByte
 			GITHUB_REPO: "acme/signup",
 			PI_DATA_DIR: join(dir, "data"),
 			PI_TASK_DIR: join(dir, "tasks"),
+			...options.env,
 		},
 		{ cwd: dir, home: dir, uid: 1000, gid: 1000 },
 	);
@@ -84,7 +107,7 @@ function fixture(options: { limits?: Partial<Limits>; members?: string; freeByte
 		config,
 		limits: { ...DEMO_LIMITS, ...options.limits },
 		log: silentLogger,
-		freeBytes: options.freeBytes ?? (() => 50 * 1024 ** 3),
+		diskProbe: probeOf(options.freeBytes ?? (() => 50 * 1024 ** 3)),
 	};
 	const f: Fixture = {
 		store,
@@ -309,18 +332,127 @@ describe("handleUpdate: /task", () => {
 		f.submit(OWNER, "beta");
 	});
 
-	test("low or unreadable disk rejects new tasks", () => {
-		const low = fixture({ freeBytes: (path) => (path.endsWith("tasks") ? 10 * 1024 ** 2 : 50 * 1024 ** 3) });
+	test("boot disk low (PI_DATA_DIR's filesystem): a new task is rejected with free and required space", () => {
+		const data = (path: string) => path.endsWith("data");
+		const low = fixture({ freeBytes: (path) => (data(path) ? 300 * 1024 ** 2 : 50 * 1024 ** 3) });
 		const sent = low.send(ANA, "/task alpha one");
-		assert.match(low.reply(sent.messageId), /^Task request rejected: disk low: free space on the task disk is 10 MiB/);
+		assert.equal(
+			low.reply(sent.messageId),
+			"Task request rejected: the boot disk is low on free space: 300.0 MiB free, at least 1.0 GiB needed for new " +
+				"tasks; follow-ups, /status, /cancel and /approve still work.",
+		);
 		assert.equal(low.count("tasks"), 0);
+		assert.equal(low.count("runs"), 0);
+		const command = low.store.get<Row>("SELECT * FROM commands WHERE update_id = ?", sent.updateId);
+		assert.deepEqual([command?.outcome, command?.task_id], ["rejected", null]);
+		// Exactly at the floor is enough.
+		const edge = fixture({ freeBytes: (path) => (data(path) ? 1024 ** 3 : 0) });
+		edge.submit(ANA, "alpha");
+	});
+
+	test("the boot disk floor is PI_BOOT_DISK_MIN_FREE when set, else DEMO_LIMITS'", () => {
+		const free = (path: string) => (path.endsWith("data") ? 3 * 1024 ** 3 : 50 * 1024 ** 3);
+		const raised = fixture({ freeBytes: free, env: { PI_BOOT_DISK_MIN_FREE: "4GiB" } });
+		const sent = raised.send(ANA, "/task alpha one");
+		assert.match(
+			raised.reply(sent.messageId),
+			/^Task request rejected: the boot disk is low on free space: 3\.0 GiB free, at least 4\.0 GiB needed/,
+		);
+		fixture({ freeBytes: free }).submit(ANA, "alpha");
+		fixture({ freeBytes: () => 600 * 1024 ** 2, env: { PI_BOOT_DISK_MIN_FREE: "512M" } }).submit(ANA, "alpha");
+	});
+
+	test("boot disk unreadable or not a number: fail closed, new tasks rejected", () => {
 		const broken = fixture({
-			freeBytes: () => {
-				throw new Error("EIO");
+			freeBytes: (path) => {
+				if (path.endsWith("data")) throw new Error("EIO");
+				return 50 * 1024 ** 3;
 			},
 		});
-		const other = broken.send(ANA, "/task alpha one");
-		assert.match(broken.reply(other.messageId), /disk low: free space on the data disk cannot be read/);
+		const sent = broken.send(ANA, "/task alpha one");
+		assert.equal(
+			broken.reply(sent.messageId),
+			"Task request rejected: the free space of the boot disk cannot be read, so new tasks are refused; follow-ups, " +
+				"/status, /cancel and /approve still work.",
+		);
+		assert.equal(broken.count("tasks"), 0);
+		const nan = fixture({ freeBytes: () => Number.NaN });
+		const other = nan.send(ANA, "/task alpha one");
+		assert.match(nan.reply(other.messageId), /the free space of the boot disk cannot be read/);
+	});
+
+	test("a low or unreadable task disk does not reject a task: it is accepted and waits in the queue", () => {
+		const task = (path: string) => path.endsWith("tasks");
+		const low = fixture({ freeBytes: (path) => (task(path) ? 10 * 1024 ** 2 : 50 * 1024 ** 3) });
+		const id = low.submit(ANA, "alpha");
+		assert.equal(low.task(id).state, "queued");
+		const unreadable = fixture({
+			freeBytes: (path) => {
+				if (task(path)) throw new Error("EIO");
+				return 50 * 1024 ** 3;
+			},
+		});
+		unreadable.submit(ANA, "alpha");
+	});
+
+	test("with the boot disk low, follow-ups, /status, /cancel and /approve still work", () => {
+		let free = 50 * 1024 ** 3;
+		const f = fixture({ freeBytes: () => free });
+		const reviewed = f.submit(ANA, "alpha");
+		f.toReview(reviewed);
+		const queued = f.submit(ANA, "beta");
+		const approved = f.submit(BOB, "gamma");
+		f.toReview(approved);
+		free = 10 * 1024 ** 2;
+
+		const rejected = f.send(ANA, "/task alpha more work");
+		assert.match(f.reply(rejected.messageId), /^Task request rejected: the boot disk is low/);
+		const followup = f.send(ANA, "add a unit test too", { replyTo: f.post(reviewed) });
+		assert.match(f.reply(followup.messageId), /^Follow-up started another run of Task \d+ on the same branch/);
+		const status = f.send(CAROL, "/status");
+		assert.match(f.reply(status.messageId), /^Group: normal\./);
+		const cancel = f.send(ANA, `/cancel ${queued}`);
+		assert.equal(f.reply(cancel.messageId), `Task ${queued} cancelled.`);
+		const approve = f.send(BOB, `/approve ${approved}`);
+		assert.match(f.reply(approve.messageId), /^Approved Task \d+ at a1b2c3d/);
+		assert.equal(f.count("tasks"), 3);
+	});
+
+	test("while the engine holds new worktrees (task disk too full): the ack says why, and marks the task told", () => {
+		const f = fixture();
+		const detail =
+			"its new worktree needs about 1.0 GiB on the task disk, but only 1.5 GiB is free and 1.0 GiB must stay free";
+		f.store.tx(() => f.store.setMeta(TASK_DISK_WAIT_KEY, detail));
+		const sent = f.send(ANA, "/task alpha one");
+		assert.equal(
+			f.reply(sent.messageId),
+			`Task 1 accepted for agent alpha. Queue position 1. Waiting for room on the task disk: ${detail}.`,
+		);
+		const run = f.store.get<{ id: number }>("SELECT id FROM runs WHERE task_id = 1");
+		assert.ok(f.store.getMeta(`wait_noted:disk:${run?.id}`) !== undefined, "the engine does not tell it again");
+		const status = f.send(BOB, "/status 1");
+		assert.match(
+			f.reply(status.messageId),
+			/\nQueue position 1\. Waiting for room on the task disk: its new worktree needs about 1\.0 GiB on the task disk/,
+		);
+		const summary = f.send(BOB, "/status");
+		assert.match(
+			f.reply(summary.messageId),
+			/Task 1 · alpha · queued · queue position 1 · waiting for room on the task disk/,
+		);
+		// A follow-up run reuses its task's worktree: no task disk note.
+		f.toReview(1);
+		const followup = f.send(ANA, "more", { replyTo: f.post(1) });
+		assert.equal(
+			f.reply(followup.messageId),
+			"Follow-up started another run of Task 1 on the same branch and pull request. Queue position 1.",
+		);
+		// Without a hold, no note and no mark.
+		f.store.tx(() => f.store.run("DELETE FROM meta WHERE key = ?", TASK_DISK_WAIT_KEY));
+		const plain = f.send(BOB, "/task beta two");
+		assert.equal(f.reply(plain.messageId), "Task 2 accepted for agent beta. Queue position 1.");
+		const second = f.store.get<{ id: number }>("SELECT id FROM runs WHERE task_id = 2");
+		assert.equal(f.store.getMeta(`wait_noted:disk:${second?.id}`), undefined);
 	});
 
 	test("ack says when the task waits for open reviews or an execution slot", () => {

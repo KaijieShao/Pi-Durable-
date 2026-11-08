@@ -79,6 +79,25 @@ test("ensureRepo creates a bare repository without template hooks, idempotently;
 	assert.equal(await s.git.fetchBase(), moved);
 });
 
+test("checkoutBytes: every file of a commit rounded up to 4 KiB blocks, nested paths included; bad revisions refused", async () => {
+	const s = await setup({
+		"empty.txt": "",
+		"small.txt": "x".repeat(10),
+		"exact.bin": "y".repeat(4096),
+		"nested/deeper/big.txt": "z".repeat(5000),
+		"with space\tand tab.txt": "w",
+	});
+	const base = await s.git.fetchBase();
+	// 1 + 1 + 1 + 2 + 1 blocks (an empty file counts one block).
+	assert.equal(await s.git.checkoutBytes(base), 6 * 4096);
+	assert.equal(await s.git.checkoutBytes(s.git.baseRef), 6 * 4096, "the fetched main by its ref");
+	const grown = await commitOnOrigin(s.bare, "main", { "more.txt": "m".repeat(9000) });
+	await s.git.fetchBase();
+	assert.equal(await s.git.checkoutBytes(grown), 9 * 4096);
+	await assert.rejects(s.git.checkoutBytes("--output=/tmp/x"), /invalid revision/);
+	await assert.rejects(s.git.checkoutBytes("0123456789abcdef0123456789abcdef01234567"), GitError);
+});
+
 test("createWorktree checks out the base on a new branch; repeating it is a no-op; a different base is refused", async () => {
 	const s = await setup();
 	const { path, base } = await withWorktree(s);

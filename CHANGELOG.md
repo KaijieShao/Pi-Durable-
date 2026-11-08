@@ -53,6 +53,16 @@
   Coordinator pushes without force and posts the kept head for review (or archives the cancelled task). `/status`,
   the review reminder and `owner status` show held tasks. A push whose outcome stays unknown still freezes the group.
 
+- Disk limits (Capacity § Disk). A new `/task` is rejected while the boot disk (`PI_DATA_DIR`) has less free than
+  `PI_BOOT_DISK_MIN_FREE` (default 1 GiB), with the free and required amounts; follow-ups, `/status`, `/cancel` and
+  `/approve` still work, and unreadable free space rejects too. **Changed:** a low task disk no longer rejects a
+  `/task`. Instead, before main is fetched and again right before a task's worktree is created, its size (checked-out
+  files + `PI_WORKTREE_HEADROOM`, default 1 GiB) must leave `PI_TASK_DISK_MIN_FREE` (default 1 GiB) free and, if set,
+  fit in `PI_TASK_DISK_BUDGET`;
+  otherwise the task stays queued at its position without a slot, the bot says once why, and it starts by itself
+  once there is room (measured again every 30 s and when a worktree is archived). Follow-up runs are not held.
+  `owner status` shows both disks, the limits and what the database and Pi's stores take.
+
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 

@@ -8,13 +8,15 @@
  * git, container and IPC work happens outside transactions. A tick (on kick, every second, and after each piece of
  * work) runs, in order: frozen-group cancels, the post-unfreeze recheck, the watchdog's late answer, recovery jobs,
  * cancels, steers, review reminders, the merge worker, the look at tasks held because their branch changed on GitHub
- * (engine/held.ts), and dispatch. Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's
- * verified watchdog sweep and a fresh watchdog heartbeat (engine/watchdog.ts).
+ * (engine/held.ts), the look at a task disk too full for a new worktree (engine/task-disk.ts), and dispatch.
+ * Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's verified watchdog sweep and a fresh
+ * watchdog heartbeat (engine/watchdog.ts).
  */
 
 import type { Logger } from "../runtime/log.ts";
 import { readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import { diskSettings, systemDiskProbe } from "./disk.ts";
 import { processCancels } from "./engine/cancel.ts";
 import {
 	type ActiveRun,
@@ -34,7 +36,6 @@ import { retryHeldTasks } from "./engine/held.ts";
 import { mergeTask, nextMergeTask } from "./engine/merge.ts";
 import { type RecoveryJob, reconcile, runRecoveryJob } from "./engine/recovery.ts";
 import {
-	defaultFreeBytes,
 	limitReason,
 	newActiveRun,
 	onCapReached,
@@ -42,6 +43,7 @@ import {
 	runLifecycle,
 	sendPendingSteers,
 } from "./engine/runs.ts";
+import { liftTaskDiskHold, recheckTaskDisk, TASK_DISK_RECHECK_MS } from "./engine/task-disk.ts";
 import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
 import { holdNote, rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
 import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
@@ -381,11 +383,13 @@ function tickOnce(ctx: Ctx, state: EngineState): boolean {
 	sendPendingSteers(ctx);
 	reminders(ctx, state);
 	// Merges first: a merge waiting for a check slot gets the next free one before new runs. Both need the watchdog;
-	// so does a held task's review step (its tests), while a held archive only pushes.
+	// so does a held task's review step (its tests), while a held archive only pushes. A task disk too full for a new
+	// worktree is measured again (no slot, no container) before dispatch looks at the queue.
 	if (dispatchOpen(ctx, state)) {
 		const ready = watchdogReady(ctx);
 		if (ready) did.push(maybeMerge(ctx, state));
 		did.push(retryHeldTasks(ctx, ready));
+		did.push(recheckTaskDisk(ctx));
 		if (ready) did.push(dispatchAll(ctx, state));
 	}
 	return did.some(Boolean);
@@ -477,7 +481,12 @@ export function createEngine(options: EngineOptions): Engine {
 		branchRecheckMs: options.branchRecheckMs ?? BRANCH_RECHECK_MS,
 		heldDue: new Map<number, number>(),
 		heldRestored: new Set<number>(),
-		freeBytes: options.freeBytes ?? defaultFreeBytes,
+		diskProbe: options.diskProbe ?? systemDiskProbe,
+		disk: diskSettings(options.config, options.limits),
+		diskRecheckMs: options.diskRecheckMs ?? TASK_DISK_RECHECK_MS,
+		taskDiskHold: undefined,
+		taskDiskChecking: false,
+		creatingWorktrees: new Set<number>(),
 		onOutbox: options.onOutbox ?? (() => {}),
 		watchdog: options.watchdog,
 		watchdogGate: newWatchdogGate(),
@@ -487,7 +496,6 @@ export function createEngine(options: EngineOptions): Engine {
 		busy: new Map<number, string>(),
 		enforcement: undefined,
 		recoveryPending: 0,
-		deferred: new Map<number, number>(),
 		track: (kind, taskId, work) => track(ctx, state, kind, taskId, work),
 		kick,
 	};
@@ -516,6 +524,8 @@ export function createEngine(options: EngineOptions): Engine {
 		},
 		kick,
 		async recover(): Promise<void> {
+			// A hold on new worktrees lives in memory: a note left by the previous process no longer applies.
+			liftTaskDiskHold(ctx, "start");
 			addRecoveryJobs(ctx, state, await reconcile(ctx, "coordinator_start"));
 		},
 		start(): void {

@@ -22,7 +22,7 @@ plugins, OAuth login and a patched Pi Durable). That code is removed; Pi Durable
 
 | Send | What happens |
 |---|---|
-| `/task@smule_code_bot <agent> <text>` | A new task for that agent, acknowledged with its id and queue position, or refused with the reason (queue full, unknown agent, group frozen, low disk...) |
+| `/task@smule_code_bot <agent> <text>` | A new task for that agent, acknowledged with its id and queue position, or refused with the reason (queue full, unknown agent, group frozen, boot disk low...) |
 | a reply to one of the bot's messages about a task | A follow-up: steered into the task while it runs; while it is in review, another run on the same branch and pull request. Only the creator or the owner. |
 | `/status@smule_code_bot [task]` | Group state, execution slots in use, open and queued tasks with their pull requests; or one task's details |
 | `/cancel@smule_code_bot <task>` | Creator or owner: stops the task, pushes its work, closes its pull request, keeps the branch |
@@ -40,6 +40,10 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
   deployment-wide and 1 per agent; 2 waiting tasks per agent, 4 per group, 4 per user; 4 open tasks per group;
   30 model requests and 10 minutes per run; 48K input / 16K output tokens per request; an owner-set project token
   ceiling; 5 follow-ups per task of 4,000 characters each.
+- **Disks** ([configuration](docs/configuration.md#disk-limits)): a new task is refused while the boot disk (the
+  database and Pi's stores) is low on free space. A task whose new worktree would not fit on the task disk (its
+  free-space floor, or `PI_TASK_DISK_BUDGET`) stays queued without taking a slot, the bot says once why, and it starts
+  by itself once another task's worktree is archived. Follow-up runs reuse their worktree and are not held.
 - **One Pi process per run** (Pi Durable 1.5.0, one SQLite file per conversation). Its model is reached only through
   the Coordinator's local relay with a run key that works only while the run is open; the relay counts requests,
   checks input size and reserves budget. The model's tools are `read`, `edit`, `write` and `run_check` with a fixed
@@ -90,7 +94,9 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 
 Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; the
 owner CLI's local socket and read-only inspection of quarantined conversations; reconciliation of uncertain file
-edits after a crash; task-disk-full handling beyond the free-space check; trial reset and the stress test.
+edits after a crash; a task disk that fills up during a run (only a new worktree is checked against the task disk);
+size limits and retention rules for the boot disk's budgets (database, Pi's stores, logs, retained trials: `owner
+status` only reports their usage); trial reset and the stress test.
 Measurements in the spec are planned, not results. Pi processes run as their own user in a dedicated systemd slice on Linux, and as your own user
 on a Mac (the weaker local mode): see [docs/isolation.md](docs/isolation.md).
 

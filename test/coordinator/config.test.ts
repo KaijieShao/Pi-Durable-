@@ -368,3 +368,44 @@ test("systemd isolation refuses the Coordinator's own user as the Pi user", () =
 	assert.equal(summary.runner_user, "pi-runner");
 	assert.equal(summary.runner_slice, "pi-durable-runs.slice");
 });
+
+test("disk limits: unset by default (DEMO_LIMITS apply, no task disk budget); sizes in bytes or K/M/G/T", () => {
+	assert.deepEqual(parse().disk, {
+		bootMinFreeBytes: undefined,
+		taskMinFreeBytes: undefined,
+		taskBudgetBytes: undefined,
+		worktreeHeadroomBytes: undefined,
+	});
+	const config = parse({
+		PI_BOOT_DISK_MIN_FREE: "2GiB",
+		PI_TASK_DISK_MIN_FREE: "512M",
+		PI_TASK_DISK_BUDGET: "1073741824",
+		PI_WORKTREE_HEADROOM: "0",
+	});
+	assert.deepEqual(config.disk, {
+		bootMinFreeBytes: 2 * 1024 ** 3,
+		taskMinFreeBytes: 512 * 1024 ** 2,
+		taskBudgetBytes: 1024 ** 3,
+		worktreeHeadroomBytes: 0,
+	});
+	assert.equal(parse({ PI_TASK_DISK_BUDGET: "30 GB" }).disk.taskBudgetBytes, 30 * 1024 ** 3);
+	assert.equal(parse({ PI_TASK_DISK_BUDGET: "1t" }).disk.taskBudgetBytes, 1024 ** 4);
+	assert.equal(parse({ PI_WORKTREE_HEADROOM: "64KiB" }).disk.worktreeHeadroomBytes, 64 * 1024);
+	const summary = describeConfig(config);
+	assert.equal(summary.boot_disk_min_free, 2 * 1024 ** 3);
+	assert.equal(summary.task_disk_budget, 1024 ** 3);
+	assert.equal(describeConfig(parse()).task_disk_budget, undefined);
+	// A floor or a budget of 0 would switch a check off: refused, like every other malformed size.
+	for (const [name, value] of [
+		["PI_BOOT_DISK_MIN_FREE", "0"],
+		["PI_TASK_DISK_MIN_FREE", "0K"],
+		["PI_TASK_DISK_BUDGET", "0"],
+		["PI_TASK_DISK_BUDGET", "-5"],
+		["PI_TASK_DISK_BUDGET", "1.5G"],
+		["PI_WORKTREE_HEADROOM", "lots"],
+		["PI_WORKTREE_HEADROOM", "5P"],
+		["PI_BOOT_DISK_MIN_FREE", "99999999999999999T"],
+	] as const) {
+		assert.deepEqual(variables({ ...VALID, [name]: value }), [name], `${name}=${value}`);
+	}
+});

@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { type Coordinator, startCoordinator } from "../../src/coordinator/coordinator.ts";
+import type { DiskProbe } from "../../src/coordinator/disk.ts";
 import { createGit, type Git } from "../../src/coordinator/git.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
 import type { RunLauncher, Sandbox } from "../../src/coordinator/ports.ts";
@@ -111,6 +112,11 @@ export type StackOptions = {
 	 * Coordinator's own, it shows the watchdog stopping a run on its own.
 	 */
 	readonly watchdogRunDeadlineMs?: number;
+	/**
+	 * How the Coordinator measures the boot disk and the task disk (deps.diskProbe, TEST ONLY): a full or unreadable
+	 * disk without filling one. Default: the real filesystems, as in production.
+	 */
+	readonly diskProbe?: DiskProbe;
 };
 
 export type BotMatch = RegExp | ((message: ServerMessage) => boolean);
@@ -375,6 +381,9 @@ export async function startStack(options: StackOptions = {}) {
 		retryDelayMs: 50,
 		// Test-only: a task held because its branch changed on GitHub is looked at every second (30 s in production).
 		branchRecheckMs: 1000,
+		// Test-only: a task disk too full for a new worktree is measured again every second (30 s in production).
+		diskRecheckMs: 1000,
+		...optional("diskProbe", options.diskProbe),
 		...optional("onFatal", options.onFatal),
 		...optional("watchdog", options.watchdogTimings),
 	};

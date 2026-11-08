@@ -13,6 +13,7 @@ import type { Update } from "grammy/types";
 import { admitRun } from "../../src/coordinator/admission.ts";
 import { ConfigError, type CoordinatorConfig, parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { startCoordinator } from "../../src/coordinator/coordinator.ts";
+import type { DiskProbe } from "../../src/coordinator/disk.ts";
 import type { WatchdogOptions } from "../../src/coordinator/engine/context.ts";
 import { INTERRUPTED_NOTE } from "../../src/coordinator/engine/review.ts";
 import { createEngine, type Engine } from "../../src/coordinator/engine.ts";
@@ -227,6 +228,14 @@ function createWorld() {
 		},
 		async showFile(rev, path) {
 			return files(rev).get(path);
+		},
+		async checkoutBytes(rev) {
+			// Like the real one: each file rounded up to whole 4 KiB blocks (the fetched main stands for its ref).
+			const snapshot = files(rev === "refs/remotes/origin/main" ? state.main : rev);
+			return [...snapshot.values()].reduce(
+				(sum, text) => sum + Math.max(1, Math.ceil(Buffer.byteLength(text) / 4096)) * 4096,
+				0,
+			);
 		},
 	};
 
@@ -477,6 +486,19 @@ function testConfig(dir: string): CoordinatorConfig {
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
+/** Not about the disks unless a test passes a probe: a terabyte free on both, the task disk a mount point. */
+const PLENTY_OF_DISK: DiskProbe = {
+	space: () => ({ free: 1e12, size: 2e12, used: 1e12 }),
+	isMountPoint: async () => true,
+	treeBytes: async () => 0,
+};
+
+/** The engine's disk options: the test's probe (else PLENTY_OF_DISK) and recheck interval (else production's). */
+const diskOf = (options: { readonly diskProbe?: DiskProbe; readonly diskRecheckMs?: number }) => ({
+	diskProbe: options.diskProbe ?? PLENTY_OF_DISK,
+	...(options.diskRecheckMs === undefined ? {} : { diskRecheckMs: options.diskRecheckMs }),
+});
+
 /** Not about the watchdog unless a test passes one: every sweep is verified at once, the heartbeat always fresh. */
 const watchdogOf = (options: { readonly watchdog?: WatchdogOptions }): WatchdogOptions =>
 	options.watchdog ?? verifiedWatchdog();
@@ -495,6 +517,10 @@ async function harness(
 		sandbox?: (sandbox: Sandbox) => Sandbox;
 		/** The watchdog link and timings (default: every sweep verified at once, the heartbeat always fresh). */
 		watchdog?: WatchdogOptions;
+		/** How the disks are measured (default: plenty of room on both). */
+		diskProbe?: DiskProbe;
+		/** How often a task disk too full for a new worktree is measured again (default the production 30 s). */
+		diskRecheckMs?: number;
 	} = {},
 ) {
 	const dir = options.dir ?? (await mkdtemp(join(tmpdir(), "engine-test-")));
@@ -532,7 +558,7 @@ async function harness(
 		launcher: fake.launcher,
 		log: silentLogger,
 		retryDelayMs: 5,
-		freeBytes: async () => 1e12,
+		...diskOf(options),
 		// Not about the watchdog: every sweep is verified at once (its own tests: test/watchdog/, test/e2e/watchdog).
 		watchdog: watchdogOf(options),
 		...(options.now === undefined ? {} : { now: options.now }),
@@ -2439,4 +2465,204 @@ test("startCoordinator refuses a bot whose username does not match and releases 
 	};
 	await assert.rejects(startCoordinator(config, deps), (error: unknown) => error instanceof ConfigError);
 	await assert.rejects(startCoordinator(config, deps), (error: unknown) => error instanceof ConfigError);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Capacity § Disk: a new worktree that does not fit on the task disk (engine/task-disk.ts)
+
+const GiB = 1024 ** 3;
+
+/** A task disk whose free space the test sets; `fail` makes every measurement throw (unreadable). */
+function taskDiskProbe(initialFree: number): { probe: DiskProbe; state: { free: number; fail: boolean } } {
+	const state = { free: initialFree, fail: false };
+	const probe: DiskProbe = {
+		space: () => {
+			if (state.fail) throw new Error("EIO");
+			return { free: state.free, size: 2e12, used: 2e12 - state.free };
+		},
+		isMountPoint: async () => true,
+		treeBytes: async () => 0,
+	};
+	return { probe, state };
+}
+
+const diskWaits = (h: Harness, taskId: number) =>
+	messages(h, "task_waiting").filter((row) => row.task_id === taskId && /stays queued/.test(row.text));
+
+test("task disk too full for a new worktree: the run stays queued and is told once; no slot, no worktree; follow-ups still run; it starts once there is room", async (t) => {
+	const disk = taskDiskProbe(1e12);
+	// The real 1 GiB floor (the harness sets 0); headroom is DEMO_LIMITS' 1 GiB.
+	const h = await harness(t, { limits: { minFreeDiskBytes: GiB }, diskProbe: disk.probe, diskRecheckMs: 50 });
+	const first = await runToReview(h, "alpha", "first");
+	// 1.5 GiB free: the new worktree (two small files, 8 KiB, plus 1 GiB headroom) would leave less than 1 GiB.
+	disk.state.free = 1.5 * GiB;
+	const second = submitTask(h, "beta", "second");
+	const third = submitTask(h, "gamma", "third");
+	h.engine.kick();
+	await h.engine.idle();
+	// Both found it out right before their worktree was created: back in the queue, their slots released.
+	const fourth = submitTask(h, "delta", "fourth");
+	h.engine.kick();
+	await h.engine.idle();
+	for (const id of [second, third, fourth]) {
+		assert.equal(taskRow(h, id).state, "queued");
+		assert.equal(taskRow(h, id).worktree_path, null);
+		assert.equal(runsOf(h, id)[0]?.state, "queued");
+		assert.ok(!existsSync(join(h.config.paths.taskDir, "worktrees", `task-${id}`)), "no worktree folder");
+		const told = diskWaits(h, id);
+		assert.equal(told.length, 1, `task ${id} told once`);
+		assert.match(
+			told[0]?.text ?? "",
+			new RegExp(
+				`^Task ${id} stays queued: its new worktree needs about 1\\.0 GiB on the task disk, but only 1\\.5 GiB is ` +
+					"free and 1\\.0 GiB must stay free\\. It starts by itself once there is room",
+			),
+		);
+	}
+	assert.equal(slotCount(h), 0, "no slot is held while they wait");
+	assert.equal(count(h.world.calls, "createWorktree"), 1, "only the first task's worktree");
+	// Checked before main is fetched (at the main fetched last): nothing is written to a task disk without room.
+	assert.equal(count(h.world.calls, "fetchBase"), 1, "only the first task fetched main");
+	// While new worktrees are held, a run that needs one takes no slot at all.
+	assert.equal(runsOf(h, fourth)[0]?.dispatched_at, null);
+	assert.match(h.store.getMeta("task_disk_wait") ?? "", /^its new worktree needs about 1\.0 GiB/);
+
+	// Measured again (no slot) every 50 ms while they wait: still no room, nothing said twice.
+	for (let round = 0; round < 3; round++) {
+		await sleep(70);
+		h.engine.kick();
+		await h.engine.idle();
+	}
+	assert.deepEqual(
+		[second, third, fourth].map((id) => diskWaits(h, id).length),
+		[1, 1, 1],
+	);
+	assert.equal(slotCount(h), 0);
+	assert.equal(runsOf(h, fourth)[0]?.dispatched_at, null);
+
+	// A follow-up run of the first task reuses its worktree: the task disk does not hold it.
+	followupRun(h, first, "and the docs");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual(
+		runsOf(h, first).map((run) => run.state),
+		["finished", "finished"],
+	);
+	assert.equal(taskRow(h, first).state, "review");
+	assert.equal(taskRow(h, second).state, "queued");
+
+	// Room again: at the next measurement they start, oldest first, and the note is gone.
+	disk.state.free = 1e12;
+	await sleep(70);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.deepEqual(
+		[second, third, fourth].map((id) => taskRow(h, id).state),
+		["review", "review", "review"],
+	);
+	assert.equal(count(h.world.calls, "createWorktree"), 4);
+	assert.equal(h.store.getMeta("task_disk_wait"), undefined);
+	assert.deepEqual(
+		[second, third, fourth].map((id) => diskWaits(h, id).length),
+		[1, 1, 1],
+		"nothing said again",
+	);
+});
+
+test("task disk unreadable: fail closed (the task waits, told once); an archived worktree has it measured again at once", async (t) => {
+	const disk = taskDiskProbe(1e12);
+	// The production interval (30 s): within this test only an archive can trigger the next measurement.
+	const h = await harness(t, { limits: { minFreeDiskBytes: GiB }, diskProbe: disk.probe });
+	const first = await runToReview(h, "alpha", "first");
+	disk.state.fail = true;
+	const second = submitTask(h, "beta", "second");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, second).state, "queued");
+	assert.equal(taskRow(h, second).worktree_path, null);
+	assert.equal(slotCount(h), 0);
+	const told = diskWaits(h, second);
+	assert.equal(told.length, 1);
+	assert.match(
+		told[0]?.text ?? "",
+		/^Task 2 stays queued: the free space of the task disk or the size of its new worktree cannot be measured\./,
+	);
+	// Readable again, but not measured again yet (nothing changed, 30 s not over): still waiting.
+	disk.state.fail = false;
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, second).state, "queued");
+	// Cancelling the first task archives its worktree: measured again at once, and the second task starts.
+	requestCancel(h, first);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, first).state, "cancelled");
+	assert.equal(taskRow(h, second).state, "review");
+	assert.equal(diskWaits(h, second).length, 1);
+});
+
+test("task disk without room: a first run is held before main is fetched, so a fetch failing on the full disk does not fail the task", async (t) => {
+	const disk = taskDiskProbe(1e12);
+	const h = await harness(t, { limits: { minFreeDiskBytes: GiB }, diskProbe: disk.probe, diskRecheckMs: 50 });
+	await runToReview(h, "alpha", "first");
+	// The disk fills up: 1.5 GiB free leaves no room for a new worktree (1 GiB headroom, 1 GiB floor), and a fetch
+	// onto it would fail (no space left on the device).
+	disk.state.free = 1.5 * GiB;
+	const fetchBase = h.world.git.fetchBase;
+	let fetches = 0;
+	h.world.git.fetchBase = async () => {
+		fetches++;
+		throw new GitError("failed", "git fetch failed (exit 128)");
+	};
+	const second = submitTask(h, "beta", "second");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(fetches, 0, "main is not fetched onto a disk without room");
+	assert.equal(taskRow(h, second).state, "queued", "the task stays queued, it does not fail");
+	assert.equal(runsOf(h, second)[0]?.state, "queued");
+	assert.equal(slotCount(h), 0);
+	assert.equal(diskWaits(h, second).length, 1);
+	assert.match(diskWaits(h, second)[0]?.text ?? "", /needs about 1\.0 GiB on the task disk, but only 1\.5 GiB is free/);
+	// Room again: it starts by itself, fetching main as usual.
+	h.world.git.fetchBase = fetchBase;
+	disk.state.free = 1e12;
+	await waitFor(
+		() => {
+			h.engine.kick();
+			return taskRow(h, second).state === "review";
+		},
+		{ what: "the held task ran" },
+	);
+	assert.equal(diskWaits(h, second).length, 1, "told once");
+});
+
+test("two new worktrees checked at the same time with room for one: one is let through, the other waits until it is created", async (t) => {
+	// 2.5 GiB free, a 1 GiB floor, each new worktree about 1 GiB: one fits, two do not.
+	const disk = taskDiskProbe(2.5 * GiB);
+	const h = await harness(t, { limits: { minFreeDiskBytes: GiB }, diskProbe: disk.probe });
+	h.fake.control.script = holdScript();
+	const a = submitTask(h, "alpha", "first");
+	const b = submitTask(h, "beta", "second");
+	h.engine.kick();
+	// Both are dispatched in one pass and check the disk concurrently; the second check counts the first as pending.
+	await waitFor(() => h.fake.runs.length === 1, { what: "one run started" });
+	await sleep(100);
+	const waiting = [a, b].filter((id) => diskWaits(h, id).length === 1);
+	assert.equal(waiting.length, 1, "exactly one of them was told it waits");
+	const [held] = waiting;
+	assert.equal(count(h.world.calls, "createWorktree"), 1, "only one worktree created");
+	assert.equal(taskRow(h, held as number).worktree_path, null);
+	// The fake disk does not fill up: once the first worktree is created, the held one is measured again at the next
+	// tick (every second in production; kicked here) and starts, without waiting the 30 s interval.
+	await waitFor(
+		() => {
+			h.engine.kick();
+			return h.fake.runs.length === 2;
+		},
+		{ what: "the held task started" },
+	);
+	for (const run of h.fake.runs) run.release();
+	await h.engine.idle();
+	assert.deepEqual([taskRow(h, a).state, taskRow(h, b).state], ["review", "review"]);
+	assert.equal(diskWaits(h, held as number).length, 1);
 });

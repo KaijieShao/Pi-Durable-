@@ -307,6 +307,12 @@ resumes.
 - `PI_TASK_DIR` (default `<PI_DATA_DIR>/tasks`): `repo.git` (the Coordinator's clone), `worktrees/task-<id>` (one per
   open task; deleted when the task is archived, the branch stays on GitHub), `scratch/` (check scratch space, wiped
   after each check).
+- Disk limits ([docs/configuration.md](docs/configuration.md#disk-limits)): a new `/task` is refused while the disk
+  of `PI_DATA_DIR` has less than 1 GiB free (`PI_BOOT_DISK_MIN_FREE`). A task's worktree is created only if it leaves
+  1 GiB free on the disk of `PI_TASK_DIR` (`PI_TASK_DISK_MIN_FREE`), counting its files plus 1 GiB of headroom
+  (`PI_WORKTREE_HEADROOM`), and fits in `PI_TASK_DISK_BUDGET` if you set one; otherwise the task waits in the queue
+  and the bot says why ("Task 3 stays queued: its new worktree needs about …"). On a Mac both folders are usually on
+  the same disk. `owner status` shows both disks and what the database and the conversations take.
 - `coordinator.sqlite` is shared with the watchdog (its own connection): sweep requests and answers
   (`watchdog_sweeps`) and its heartbeat. The watchdog creates nothing in `PI_DATA_DIR`.
 - Logs: stdout and stderr of the Coordinator and of the watchdog.

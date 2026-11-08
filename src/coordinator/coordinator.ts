@@ -23,6 +23,7 @@ import { createLogger, errorSummary, type Logger } from "../runtime/log.ts";
 import { ensurePrivateDir, makePrivate } from "../runtime/private-dir.ts";
 import { handleUpdate } from "./commands.ts";
 import { ConfigError, type CoordinatorConfig, describeConfig } from "./config.ts";
+import type { DiskProbe } from "./disk.ts";
 import { createEngine, type Enforcement, type Engine, enforcementAvailable } from "./engine.ts";
 import { createGit, type Git } from "./git.ts";
 import { createGitHub } from "./github.ts";
@@ -64,6 +65,13 @@ export type CoordinatorDeps = {
 	readonly retryDelayMs?: number;
 	/** Tests: how often a task held because its branch changed on GitHub is looked at again (30 s in production). */
 	readonly branchRecheckMs?: number;
+	/**
+	 * Tests only: how the boot disk and the task disk are measured (a full or unreadable disk without filling one).
+	 * Production always measures the real filesystems (disk.ts systemDiskProbe); there is no setting for it.
+	 */
+	readonly diskProbe?: DiskProbe;
+	/** Tests: how often a task disk too full for a new worktree is measured again (30 s in production). */
+	readonly diskRecheckMs?: number;
 	/**
 	 * Called when the Coordinator can no longer do its job and must not keep running half-alive, e.g. the poller hit
 	 * a 401 from getUpdates (token revoked) or crashed: command intake has stopped. The CLI stops the Coordinator
@@ -257,7 +265,12 @@ function startRelayFor(setup: Setup, store: Store, engine: Engine) {
 
 function startPollerFor(setup: Setup, store: Store, telegram: TelegramApi, engine: Engine, outbox: OutboxSender) {
 	const { config, deps, log, limits } = setup;
-	const commandContext = { config, limits, log };
+	const commandContext = {
+		config,
+		limits,
+		log,
+		...(deps.diskProbe === undefined ? {} : { diskProbe: deps.diskProbe }),
+	};
 	return startPoller({
 		store,
 		api: telegram,
@@ -336,6 +349,8 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 		onOutbox: () => outboxKick(),
 		...(deps.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs }),
 		...(deps.branchRecheckMs === undefined ? {} : { branchRecheckMs: deps.branchRecheckMs }),
+		...(deps.diskProbe === undefined ? {} : { diskProbe: deps.diskProbe }),
+		...(deps.diskRecheckMs === undefined ? {} : { diskRecheckMs: deps.diskRecheckMs }),
 		watchdog: {
 			link: deps.watchdog?.link ?? createStoreWatchdogLink(store),
 			answerTimeoutMs: deps.watchdog?.answerTimeoutMs ?? WATCHDOG_ANSWER_TIMEOUT_MS,

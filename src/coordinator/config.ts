@@ -81,6 +81,20 @@ export type CoordinatorConfig = {
 		 */
 		readonly stateGroup: string | undefined;
 	};
+	/**
+	 * Disk limits (Capacity § Disk; src/coordinator/disk.ts). Undefined = the DEMO_LIMITS default (minFreeDiskBytes,
+	 * worktreeHeadroomBytes); no budget = the task disk's own size is its budget (only the free-space floor applies).
+	 */
+	readonly disk: {
+		/** PI_BOOT_DISK_MIN_FREE: new /task requests are rejected while PI_DATA_DIR's filesystem has less free. */
+		readonly bootMinFreeBytes: number | undefined;
+		/** PI_TASK_DISK_MIN_FREE: a new worktree is created only if at least this much stays free on the task disk. */
+		readonly taskMinFreeBytes: number | undefined;
+		/** PI_TASK_DISK_BUDGET: a new worktree is created only if the task disk's usage plus it stays within this. */
+		readonly taskBudgetBytes: number | undefined;
+		/** PI_WORKTREE_HEADROOM: room a new worktree is assumed to need beyond its checked-out files. */
+		readonly worktreeHeadroomBytes: number | undefined;
+	};
 	readonly docker: {
 		readonly bin: string;
 		readonly agentImage: string;
@@ -163,8 +177,9 @@ export function parseCoordinatorConfig(
 	const github = parseGitHub(env, out);
 	const local = parseLocal(env, out, defaults);
 	const runner = parseRunner(env, out, defaults);
+	const disk = parseDisk(env, out);
 	if (out.problems.length > 0) throw new ConfigError(out.problems);
-	return { telegram, agents, model, ...github, ...local, runner };
+	return { telegram, agents, model, ...github, ...local, disk, runner };
 }
 
 function parseTelegram(env: Env, out: Collector): CoordinatorConfig["telegram"] {
@@ -267,6 +282,30 @@ function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorC
 	};
 }
 
+function parseDisk(env: Env, out: Collector): CoordinatorConfig["disk"] {
+	return {
+		bootMinFreeBytes: parseBytes(env, "PI_BOOT_DISK_MIN_FREE", out, 1),
+		taskMinFreeBytes: parseBytes(env, "PI_TASK_DISK_MIN_FREE", out, 1),
+		taskBudgetBytes: parseBytes(env, "PI_TASK_DISK_BUDGET", out, 1),
+		worktreeHeadroomBytes: parseBytes(env, "PI_WORKTREE_HEADROOM", out, 0),
+	};
+}
+
+const BYTE_UNITS: Readonly<Record<string, number>> = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 };
+
+/** Bytes: digits, optionally with K, M, G or T (powers of 1024; "GiB" and "GB" alike); at least `min`. */
+function parseBytes(env: Env, name: string, out: Collector, min: number): number | undefined {
+	const raw = nonEmpty(env[name]);
+	if (raw === undefined) return undefined;
+	const match = /^(\d{1,16})\s*(?:([KMGT])(?:i?B)?)?$/i.exec(raw);
+	const value = match === null ? Number.NaN : Number(match[1]) * (BYTE_UNITS[(match[2] ?? "").toLowerCase()] ?? 0);
+	if (!Number.isSafeInteger(value) || value < min) {
+		out.add(name, `a size in bytes${min > 0 ? " above 0" : ""}, e.g. 1073741824, 512MiB or 2GiB`);
+		return undefined;
+	}
+	return value;
+}
+
 function parseStateGroup(env: Env, out: Collector): string | undefined {
 	const value = nonEmpty(env.PI_STATE_GROUP);
 	if (value === undefined) return undefined;
@@ -302,6 +341,7 @@ export function describeConfig(config: CoordinatorConfig): Record<string, unknow
 		data: config.paths.dataDir,
 		tasks: config.paths.taskDir,
 		...(config.paths.stateGroup === undefined ? {} : { state_group: config.paths.stateGroup }),
+		...diskSummary(config.disk),
 		agent_image: config.docker.agentImage,
 		check_image: config.docker.checkImage,
 		runner_isolation: config.runner.isolation,
@@ -309,6 +349,16 @@ export function describeConfig(config: CoordinatorConfig): Record<string, unknow
 			? { runner_user: config.runner.user, runner_group: config.runner.group, runner_slice: config.runner.slice }
 			: {}),
 	};
+}
+
+/** The disk settings that are set (bytes), for the startup log. */
+function diskSummary(disk: CoordinatorConfig["disk"]): Record<string, number> {
+	const set: Record<string, number> = {};
+	if (disk.bootMinFreeBytes !== undefined) set.boot_disk_min_free = disk.bootMinFreeBytes;
+	if (disk.taskMinFreeBytes !== undefined) set.task_disk_min_free = disk.taskMinFreeBytes;
+	if (disk.taskBudgetBytes !== undefined) set.task_disk_budget = disk.taskBudgetBytes;
+	if (disk.worktreeHeadroomBytes !== undefined) set.worktree_headroom = disk.worktreeHeadroomBytes;
+	return set;
 }
 
 /** Thinking levels the configured model supports, for a startup check against the pi-ai catalog. */

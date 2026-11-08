@@ -71,6 +71,11 @@ export type Git = {
 	diffSummary(path: string, base: string, maxBytes: number): Promise<string>;
 	/** A file's content at `rev` (capped at 1 MiB), or undefined if it is not a file there. */
 	showFile(rev: string, path: string): Promise<string | undefined>;
+	/**
+	 * Bytes a checkout of `rev` takes on disk, estimated from the sizes git records: every file rounded up to whole
+	 * 4 KiB blocks (an empty file counts one block); submodules count nothing (Capacity § Disk, src/coordinator/disk.ts).
+	 */
+	checkoutBytes(rev: string): Promise<number>;
 	/** refs/remotes/origin/<base> */
 	readonly baseRef: string;
 };
@@ -94,6 +99,8 @@ export type GitOptions = {
 /** Git's well-known empty tree: used as the attribute source so the worktree's .gitattributes are never read. */
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const SHOW_FILE_MAX_BYTES = 1024 * 1024;
+/** The block a checked-out file is rounded up to in checkoutBytes(). */
+const CHECKOUT_BLOCK_BYTES = 4096;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const TRUNCATED = "\n[truncated]";
@@ -667,6 +674,21 @@ export function createGit(options: GitOptions): Git {
 		return blob.stdout;
 	}
 
+	async function checkout(rev: string): Promise<number> {
+		assertRev(rev);
+		const result = await exec([...repo, "ls-tree", "-r", "-l", "-z", rev], { op: "ls-tree" });
+		let total = 0;
+		for (const entry of nulList(result.stdout)) {
+			// "<mode> SP <type> SP <object> SP <size, padded> TAB <path>"
+			const [, type, , size] = entry.slice(0, entry.indexOf("\t")).trim().split(/\s+/);
+			if (type !== "blob") continue;
+			const bytes = Number(size);
+			if (!Number.isSafeInteger(bytes) || bytes < 0) throw new GitError("failed", "unexpected git ls-tree output");
+			total += Math.max(1, Math.ceil(bytes / CHECKOUT_BLOCK_BYTES)) * CHECKOUT_BLOCK_BYTES;
+		}
+		return total;
+	}
+
 	const wtKey = (path: string) => `wt:${resolve(path)}`;
 
 	return {
@@ -697,6 +719,7 @@ export function createGit(options: GitOptions): Git {
 		},
 		diffSummary: (path, base, maxBytes) => serialized(wtKey(path), () => diff(path, base, maxBytes)),
 		showFile: (rev, file) => show(rev, file),
+		checkoutBytes: (rev) => checkout(rev),
 	};
 }
 

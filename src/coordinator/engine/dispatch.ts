@@ -1,10 +1,13 @@
 /**
  * Dispatch (Architecture § Request Flow; Capacity § Concurrency and Resource Limits): before every run, in ONE
  * transaction, check the agent is idle and reserve a deployment-wide execution slot; a new task's first run also
- * needs its group to have fewer than the open-task limit; the budget must not be exhausted. The reservation bumps the
- * task's generation, which labels the run's key and containers.
+ * needs its group to have fewer than the open-task limit and no hold on new worktrees (the task disk is too full:
+ * engine/task-disk.ts); the budget must not be exhausted. The reservation bumps the task's generation, which labels
+ * the run's key and containers.
  */
 import { openTaskCount } from "../admission.ts";
+import { taskDiskToldKey } from "../disk.ts";
+import { taskDiskWait } from "../messages.ts";
 import { projectTokensSpent } from "../relay.ts";
 import { type Ctx, enqueueTask, groupHeld, loadTask, slotsInUse, taskRef } from "./context.ts";
 
@@ -33,11 +36,9 @@ function count(ctx: Ctx, sql: string, ...params: (string | number)[]): number {
 	return ctx.store.get<{ n: number }>(sql, ...params)?.n ?? 0;
 }
 
-/** Per-candidate checks that need no group-wide count: cancel, deferral, task state, in-flight work, held slots. */
-function candidateBlocked(ctx: Ctx, c: Candidate, now: number): boolean {
+/** Per-candidate checks that need no group-wide count: cancel, task state, in-flight work, held slots. */
+function candidateBlocked(ctx: Ctx, c: Candidate): boolean {
 	if (c.cancel_requested === 1 || !DISPATCHABLE_TASK_STATES.has(c.task_state) || ctx.busy.has(c.task_id)) return true;
-	const notBefore = ctx.deferred.get(c.run_id);
-	if (notBefore !== undefined && notBefore > now) return true;
 	if (count(ctx, "SELECT COUNT(*) AS n FROM slots WHERE task_id = ?", c.task_id) > 0) return true;
 	return (
 		count(ctx, "SELECT COUNT(*) AS n FROM slots WHERE kind = 'run' AND agent_id = ?", c.agent_id) >=
@@ -47,7 +48,6 @@ function candidateBlocked(ctx: Ctx, c: Candidate, now: number): boolean {
 
 /** Reserve the slot, bump the generation, mark the run starting. Inside the dispatch transaction. */
 function reserve(ctx: Ctx, c: Candidate, now: number): Reservation {
-	ctx.deferred.delete(c.run_id);
 	const slotId = ctx.store.run(
 		"INSERT INTO slots(kind, task_id, run_id, agent_id, acquired_at) VALUES ('run', ?, ?, ?, ?)",
 		c.task_id,
@@ -102,12 +102,38 @@ export function dispatchOnce(ctx: Ctx): Reservation | undefined {
 		);
 		const now = ctx.now();
 		const open = openTasks(ctx);
-		const first = candidates.find(
-			(c) => !candidateBlocked(ctx, c, now) && (c.worktree_path !== null || open < ctx.limits.openTasksPerGroup),
-		);
-		if (first === undefined) noteWaitingForReviews(ctx, candidates, now, open);
+		// A run that needs a new worktree also needs a free open-task place and no hold on new worktrees.
+		const newWorktree = open < ctx.limits.openTasksPerGroup && ctx.taskDiskHold === undefined;
+		const first = candidates.find((c) => !candidateBlocked(ctx, c) && (c.worktree_path !== null || newWorktree));
+		if (first === undefined) {
+			noteWaitingForReviews(ctx, candidates, open);
+			noteWaitingForTaskDisk(ctx, candidates, now, open);
+		}
 		return first === undefined ? undefined : reserve(ctx, first, now);
 	});
+}
+
+/**
+ * Capacity § Disk: "If a new worktree would exceed it, the task stays queued and the bot says why." Each run held
+ * only by the task disk (its agent is idle, a slot and an open-task place are free) is told once per task, unless it
+ * was told already (when it was requeued, or in its acknowledgement). Inside the dispatch tx.
+ */
+function noteWaitingForTaskDisk(ctx: Ctx, candidates: readonly Candidate[], now: number, open: number): void {
+	const hold = ctx.taskDiskHold;
+	if (hold === undefined || open >= ctx.limits.openTasksPerGroup) return;
+	for (const c of candidates) {
+		if (c.worktree_path !== null || candidateBlocked(ctx, c)) continue;
+		const told = taskDiskToldKey(c.run_id);
+		if (ctx.store.getMeta(told) !== undefined) continue;
+		ctx.store.setMeta(told, String(now));
+		enqueueTask(
+			ctx,
+			loadTask(ctx, c.task_id),
+			"task_waiting",
+			`${taskRef(c.task_id)} stays queued: ${taskDiskWait(hold.shortfall)}.`,
+		);
+		ctx.onOutbox();
+	}
 }
 
 /**
@@ -115,10 +141,10 @@ export function dispatchOnce(ctx: Ctx): Reservation | undefined {
  * open-task limit holds (its agent is idle and a slot is free) is told once, unless the task was told already (its
  * acknowledgement carried the same note when it was accepted while the group was full). Inside the dispatch tx.
  */
-function noteWaitingForReviews(ctx: Ctx, candidates: readonly Candidate[], now: number, open: number): void {
+function noteWaitingForReviews(ctx: Ctx, candidates: readonly Candidate[], open: number): void {
 	if (open < ctx.limits.openTasksPerGroup) return;
 	for (const c of candidates) {
-		if (c.worktree_path !== null || candidateBlocked(ctx, c, now)) continue;
+		if (c.worktree_path !== null || candidateBlocked(ctx, c)) continue;
 		const told = count(
 			ctx,
 			"SELECT COUNT(*) AS n FROM outbox WHERE task_id = ? AND text LIKE '%waiting for open reviews to finish%'",

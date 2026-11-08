@@ -104,16 +104,63 @@ export function tooLong(what: "task" | "follow-up", length: number, limit: numbe
 	return `the ${what} text is too long (${length} characters; the limit is ${limit})`;
 }
 
-export function diskLow(which: "data" | "task", freeBytes: number, minBytes: number): string {
+const BOOT_DISK_STILL_WORKS = "follow-ups, /status, /cancel and /approve still work";
+
+/**
+ * Capacity § Disk: "When its free space runs low, new tasks are rejected with a reason." The boot disk holds the
+ * Coordinator database, the outbox, Pi's stores and the logs (PI_DATA_DIR).
+ */
+export function bootDiskLow(freeBytes: number, minBytes: number): string {
 	return (
-		`disk low: free space on the ${which} disk is ${formatBytes(freeBytes)}, ` +
-		`below the ${formatBytes(minBytes)} needed for new tasks`
+		`the boot disk is low on free space: ${formatBytes(freeBytes)} free, at least ${formatBytes(minBytes)} needed ` +
+		`for new tasks; ${BOOT_DISK_STILL_WORKS}`
 	);
 }
 
 /** Fail closed: free space that cannot be measured counts as low. */
-export function diskUnknown(which: "data" | "task"): string {
-	return `disk low: free space on the ${which} disk cannot be read, so new tasks are refused`;
+export function bootDiskUnknown(): string {
+	return `the free space of the boot disk cannot be read, so new tasks are refused; ${BOOT_DISK_STILL_WORKS}`;
+}
+
+/** Why a new worktree does not fit on the task disk now (src/coordinator/disk.ts). */
+export type TaskDiskShortfall =
+	| { readonly kind: "floor"; readonly needed: number; readonly free: number; readonly floor: number }
+	| { readonly kind: "budget"; readonly needed: number; readonly used: number; readonly budget: number }
+	| { readonly kind: "unknown" };
+
+/** The shortfall in one clause (numbers only, no task text). */
+export function taskDiskDetail(shortfall: TaskDiskShortfall): string {
+	switch (shortfall.kind) {
+		case "floor":
+			return (
+				`its new worktree needs about ${formatBytes(shortfall.needed)} on the task disk, but only ` +
+				`${formatBytes(shortfall.free)} is free and ${formatBytes(shortfall.floor)} must stay free`
+			);
+		case "budget":
+			return (
+				`its new worktree needs about ${formatBytes(shortfall.needed)}, but the task disk budget of ` +
+				`${formatBytes(shortfall.budget)} has only ${formatBytes(shortfall.budget - shortfall.used)} left ` +
+				`(${formatBytes(shortfall.used)} in use)`
+			);
+		case "unknown":
+			return "the free space of the task disk or the size of its new worktree cannot be measured";
+	}
+}
+
+/**
+ * Capacity § Disk: "If a new worktree would exceed it, the task stays queued and the bot says why." Told once per
+ * task; `taskRef(id) stays queued: <this>.`
+ */
+export function taskDiskWait(shortfall: TaskDiskShortfall): string {
+	return (
+		`${taskDiskDetail(shortfall)}. It starts by itself once there is room, for example when another task is merged ` +
+		"or cancelled and its worktree is archived"
+	);
+}
+
+/** The /status and acknowledgement note of a first run held by the task disk (`detail`: taskDiskDetail()). */
+export function waitingForTaskDisk(detail: string): string {
+	return `Waiting for room on the task disk: ${detail}`;
 }
 
 export function noSuchTask(id: number): string {
@@ -783,8 +830,12 @@ export function helpText(agents: readonly string[], bot: string, limits: Limits 
 	);
 }
 
-function formatBytes(bytes: number): string {
-	const gib = bytes / 1024 ** 3;
-	if (gib >= 1) return `${gib.toFixed(1)} GiB`;
-	return `${Math.max(0, Math.round(bytes / 1024 ** 2))} MiB`;
+/** "1.5 GiB", "300 MiB", "12 KiB", "0 bytes". */
+export function formatBytes(bytes: number): string {
+	const value = Math.max(0, bytes);
+	if (value >= 1024 ** 4) return `${(value / 1024 ** 4).toFixed(1)} TiB`;
+	if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GiB`;
+	if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+	if (value >= 1024) return `${Math.round(value / 1024)} KiB`;
+	return `${Math.round(value)} bytes`;
 }

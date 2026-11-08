@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { FromRunner } from "../../runner/protocol.ts";
 import type { Logger } from "../../runtime/log.ts";
 import type { CoordinatorConfig } from "../config.ts";
+import type { DiskProbe, DiskSettings } from "../disk.ts";
 import type { Git } from "../git.ts";
 import type { Limits } from "../limits.ts";
 import { taskRef } from "../messages.ts";
@@ -21,6 +22,7 @@ import {
 } from "../ports.ts";
 import type { OutboxMessage, Store } from "../store.ts";
 import type { WatchdogTimings } from "../watchdog-link.ts";
+import type { TaskDiskHold } from "./task-disk.ts";
 
 export type TaskState = "queued" | "running" | "review" | "merging" | "merged" | "failed" | "cancelled";
 export type RunState = "queued" | "starting" | "running" | "finalizing" | "finished" | "failed" | "cancelled";
@@ -174,8 +176,13 @@ export type EngineOptions = {
 	 * (engine/held.ts; default BRANCH_RECHECK_MS). Tests shorten it.
 	 */
 	readonly branchRecheckMs?: number;
-	/** Free bytes of the task disk; defaults to statfs. */
-	readonly freeBytes?: (path: string) => Promise<number>;
+	/** How the task disk is measured (src/coordinator/disk.ts); default the system's (statfs, a directory walk). */
+	readonly diskProbe?: DiskProbe;
+	/**
+	 * How often a task disk too full for a new worktree is measured again (engine/task-disk.ts; default
+	 * TASK_DISK_RECHECK_MS). Tests shorten it.
+	 */
+	readonly diskRecheckMs?: number;
 	/** The watchdog: its link (the Coordinator's SQLite in production) and how long to wait for it. */
 	readonly watchdog: WatchdogOptions;
 };
@@ -212,7 +219,17 @@ export type Ctx = {
 	readonly heldDue: Map<number, number>;
 	/** Held reviews whose branch was seen restored: their review step waits for a check slot (engine/held.ts). */
 	readonly heldRestored: Set<number>;
-	readonly freeBytes: (path: string) => Promise<number>;
+	readonly diskProbe: DiskProbe;
+	/** The effective disk limits (configuration, else DEMO_LIMITS). */
+	readonly disk: DiskSettings;
+	/** See EngineOptions.diskRecheckMs. */
+	readonly diskRecheckMs: number;
+	/** New worktrees do not fit on the task disk: runs that need one stay queued (engine/task-disk.ts). */
+	taskDiskHold: TaskDiskHold | undefined;
+	/** A measurement of the held task disk is in flight. */
+	taskDiskChecking: boolean;
+	/** Runs whose new worktree passed the task disk check and is being created (with its setup), by run id. */
+	readonly creatingWorktrees: Set<number>;
 	readonly onOutbox: () => void;
 	readonly watchdog: WatchdogOptions;
 	readonly watchdogGate: WatchdogGate;
@@ -226,8 +243,6 @@ export type Ctx = {
 	enforcement: { ok: boolean; reason: string | undefined; checkedAt: number } | undefined;
 	/** Recovery jobs (review / archive redo) not yet completed; dispatch and merges wait for them. */
 	recoveryPending: number;
-	/** Queued runs that may not be dispatched before a time (run id → epoch ms), e.g. while the task disk is low. */
-	readonly deferred: Map<number, number>;
 	/** Run queued work in the background, tracked for idle(); marks `taskId` busy while it runs. */
 	track(kind: string, taskId: number | undefined, work: () => Promise<void>): void;
 	kick(): void;

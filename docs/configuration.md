@@ -58,6 +58,30 @@ Pi processes and containers never receive them.
 
 Relative paths are resolved from the current directory.
 
+## Disk limits
+
+[Capacity § Disk](../spec/capacity.md#disk): the boot disk holds `PI_DATA_DIR` (the database, the outbox, Pi's
+conversation stores); the task disk holds `PI_TASK_DIR` (the git repository, one worktree per open task, check
+scratch space, and on the VM Docker's data). Sizes are bytes, or a number with `K`, `M`, `G` or `T` (powers of 1024;
+`GiB` and `GB` mean the same).
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PI_BOOT_DISK_MIN_FREE` | no | `1GiB` | A new `/task` is rejected while the filesystem of `PI_DATA_DIR` has less free; the reply names the boot disk, its free space and this amount. Follow-ups, `/status`, `/cancel` and `/approve` still work. Free space that cannot be read rejects new tasks too |
+| `PI_TASK_DISK_MIN_FREE` | no | `1GiB` | Before a task's worktree is created, it must leave at least this much free on the task disk |
+| `PI_TASK_DISK_BUDGET` | no | unset | The task disk's usage plus a new worktree must stay within this. Usage is the filesystem's when `PI_TASK_DIR` is a mount point (Docker's data included), else everything under `PI_TASK_DIR`. Unset: the task disk's own size is the budget, so only `PI_TASK_DISK_MIN_FREE` applies (on the VM the task disk is a disk of its own) |
+| `PI_WORKTREE_HEADROOM` | no | `1GiB` | A new worktree is estimated at its checked-out files (each rounded up to 4 KiB) plus this, for dependencies and build output. `0` allowed |
+
+The check runs before main is fetched (sized at the main fetched last, so nothing is written to a disk without room)
+and again right before the worktree is created. A task whose worktree does not fit is accepted and stays queued at its
+position: its slot is released, nothing is created, and while new worktrees are held no task takes a slot for one.
+The bot says once why it waits (which limit, how much the worktree needs, how much is free or left). Its
+acknowledgement and `/status` show the same note while new worktrees are held. The Coordinator measures again every
+30 s and at once when a worktree is archived (a task merged, cancelled or failed), and starts the oldest waiting task
+when there is room. Follow-up and conflict-fix runs reuse their task's worktree and are not held. A measurement that
+fails holds new worktrees (fails closed). `owner status` shows both disks, the limits in use and what the database
+and Pi's stores take. The defaults are provisional: the stress test sets the task disk's size.
+
 ## Containers
 
 | Variable | Required | Default | Meaning |

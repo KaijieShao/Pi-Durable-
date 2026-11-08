@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -383,6 +384,66 @@ test("owner CLI: loads the config, opens <PI_DATA_DIR>/coordinator.sqlite, refus
 		assert.match(out.join(""), /Group -1001234567890: normal; recovery recheck pending/);
 		const printed = out.join("") + err.join("");
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!printed.includes(secret));
+	} finally {
+		await cleanup();
+	}
+});
+
+test("owner status reports both disks: free space, the limits applied, and what each boot-disk budget holds", async () => {
+	const { dir, cleanup } = await tempDir();
+	try {
+		const out: string[] = [];
+		const io = { stdout: (text: string) => out.push(text), stderr: (text: string) => out.push(text) };
+		const store = new Store(join(dir, COORDINATOR_DB));
+		seed(store);
+		store.close();
+		mkdirSync(join(dir, "conversations"));
+		writeFileSync(join(dir, "conversations", "c1.sqlite"), Buffer.alloc(64 * 1024));
+		assert.equal(runOwnerCommand("status", { env: validEnv(dir), ...io }), 0);
+		const status = out.join("");
+		assert.match(
+			status,
+			/\nBoot disk \(PI_DATA_DIR\): \d+\.\d [GT]iB free of \d+\.\d [GT]iB; new tasks are rejected below 1\.0 GiB free\n/,
+		);
+		assert.match(
+			status,
+			/\n {2}Database \(coordinator\.sqlite with its WAL\): \d+(\.\d)? [KM]iB; no retention rule enforced yet\n/,
+		);
+		assert.match(
+			status,
+			/\n {2}Pi raw-content store \(conversations\/\): (6[4-9]|[7-9]\d|1\d\d) KiB in 1 files, 1 conversations; no retention rule/,
+		);
+		assert.match(status, /\n {2}Metadata logs: stdout and stderr .*not measured\n {2}Retained trials: none/);
+		assert.match(
+			status,
+			/\nTask disk \(PI_TASK_DIR, not a mount point\): .* free of .*, .* under PI_TASK_DIR in use; \d+ worktrees; budget none \(the disk's own size\); a new worktree needs its files \+ 1\.0 GiB headroom and 1\.0 GiB must stay free/,
+		);
+		assert.ok(!status.includes("New worktrees are held"));
+
+		// The configured limits, and a hold on new worktrees, are shown as such.
+		out.length = 0;
+		const held = new Store(join(dir, COORDINATOR_DB));
+		held.tx(() => held.setMeta("task_disk_wait", "its new worktree needs about 1.0 GiB, but the task disk budget …"));
+		held.close();
+		const env = {
+			...validEnv(dir),
+			PI_BOOT_DISK_MIN_FREE: "3GiB",
+			PI_TASK_DISK_BUDGET: "30GiB",
+			PI_TASK_DISK_MIN_FREE: "2G",
+			PI_WORKTREE_HEADROOM: "256MiB",
+		};
+		assert.equal(runOwnerCommand("status", { env, ...io }), 0);
+		const configured = out.join("");
+		assert.match(configured, /new tasks are rejected below 3\.0 GiB free\n/);
+		assert.match(
+			configured,
+			/; budget 30\.0 GiB; a new worktree needs its files \+ 256\.0 MiB headroom and 2\.0 GiB must stay free/,
+		);
+		assert.match(
+			configured,
+			/\n {2}New worktrees are held: its new worktree needs about 1\.0 GiB, but the task disk budget …$/m,
+		);
+		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!configured.includes(secret));
 	} finally {
 		await cleanup();
 	}

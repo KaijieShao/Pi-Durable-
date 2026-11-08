@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { readBranchHold } from "../coordinator/branch-hold.ts";
+import type { CoordinatorConfig } from "../coordinator/config.ts";
 import { DEMO_LIMITS } from "../coordinator/limits.ts";
 import { Store } from "../coordinator/store.ts";
 import { createStoreWatchdogLink, WATCHDOG_HEARTBEAT_MAX_AGE_MS } from "../coordinator/watchdog-link.ts";
@@ -8,6 +9,7 @@ import { errorSummary } from "../runtime/log.ts";
 import { redact } from "../runtime/redact.ts";
 import { type SweepRow, WATCHDOG_PID_KEY } from "../watchdog/protocol.ts";
 import type { OwnerAction } from "./args.ts";
+import { diskReport } from "./disk-report.ts";
 import { readConfig } from "./run.ts";
 
 // STUB(spec: interfaces-and-storage § Owner CLI): local socket; inspection of quarantined conversations.
@@ -38,7 +40,7 @@ export function runOwnerCommand(action: OwnerAction, options: OwnerOptions = {})
 	let store: Store | undefined;
 	try {
 		store = new Store(path);
-		const result = OWNER_COMMANDS[action](store, config.telegram.groupChatId);
+		const result = OWNER_COMMANDS[action](store, config);
 		stdout(`${result.text}\n`);
 		return result.ok ? 0 : 1;
 	} catch (error) {
@@ -51,9 +53,12 @@ export function runOwnerCommand(action: OwnerAction, options: OwnerOptions = {})
 
 export type OwnerResult = { readonly ok: boolean; readonly text: string };
 
-const OWNER_COMMANDS: Record<OwnerAction, (store: Store, chatId: number) => OwnerResult> = {
-	status: (store, chatId) => ({ ok: true, text: ownerStatus(store, chatId) }),
-	unfreeze: ownerUnfreeze,
+const OWNER_COMMANDS: Record<OwnerAction, (store: Store, config: CoordinatorConfig) => OwnerResult> = {
+	status: (store, config) => ({
+		ok: true,
+		text: ownerStatus(store, config.telegram.groupChatId, diskReport(store, config)),
+	}),
+	unfreeze: (store, config) => ownerUnfreeze(store, config.telegram.groupChatId),
 	"failed-events": (store) => ({ ok: true, text: ownerFailedEvents(store) }),
 };
 
@@ -72,8 +77,11 @@ type Count = { n: number };
 const TERMINAL = "('merged','failed','cancelled')";
 const RECENT_TERMINAL = 10;
 
-/** Group state, execution slots, open tasks and the most recent finished ones. Metadata only: no task text. */
-export function ownerStatus(store: Store, chatId: number): string {
+/**
+ * Group state, execution slots, open tasks and the most recent finished ones, then `disk` (the CLI passes
+ * diskReport(): free space and usage of both disks). Metadata only: no task text.
+ */
+export function ownerStatus(store: Store, chatId: number, disk: readonly string[] = []): string {
 	const lines = [groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
 	const queued = store.get<Count>("SELECT COUNT(*) AS n FROM runs WHERE state = 'queued'")?.n ?? 0;
 	lines.push(`Queued runs: ${queued}`);
@@ -90,7 +98,7 @@ export function ownerStatus(store: Store, chatId: number): string {
 		RECENT_TERMINAL,
 	);
 	if (recent.length > 0) lines.push(`Recent finished tasks (last ${RECENT_TERMINAL}):`, ...recent.map(taskLine));
-	lines.push(...heldLines(store, chatId), ...housekeepingLines(store));
+	lines.push(...heldLines(store, chatId), ...housekeepingLines(store), ...disk);
 	return lines.join("\n");
 }
 

@@ -10,10 +10,11 @@
  * decision is made, and is finalized.
  */
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, statfs } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { FromRunner, RunnerStart, ToRunner } from "../../runner/protocol.ts";
-import { clip } from "../messages.ts";
+import { type TaskDiskShortfall, taskDiskToldKey } from "../disk.ts";
+import { clip, taskDiskWait } from "../messages.ts";
 import type { RunnerHandle } from "../ports.ts";
 import {
 	type ActiveRun,
@@ -41,13 +42,12 @@ import {
 import type { Reservation } from "./dispatch.ts";
 import { applyDelivered, decide, deliverFollowup, expireFollowup, finalizeRun } from "./finalize.ts";
 import { closeRunKeys, newRunKey, openRunKey } from "./keys.ts";
+import { holdNewWorktrees, measureNewWorktree, roomForNewWorktree } from "./task-disk.ts";
 import { executeTool } from "./tools.ts";
 
 const AGENTS_MD_BYTES = 8 * 1024;
 const DIFF_SUMMARY_BYTES = 12 * 1024;
 const CONTAINER_LIFETIME_MARGIN_MS = 60_000;
-/** A run requeued because the task disk is low is offered again after this. */
-const DISK_RETRY_MS = 30_000;
 /** After the Pi process exits, wait this long for messages still in the IPC channel before calling it a failure. */
 const EXIT_MESSAGE_GRACE_MS = 500;
 
@@ -142,13 +142,6 @@ function checkStop(active: ActiveRun): void {
 	if (active.decision !== undefined) throw new Stopped();
 }
 
-async function defaultFreeBytes(path: string): Promise<number> {
-	const stats = await statfs(path);
-	return Number(stats.bavail) * Number(stats.bsize);
-}
-
-export { defaultFreeBytes };
-
 async function isRegularFile(path: string): Promise<boolean> {
 	try {
 		return (await lstat(path)).isFile();
@@ -157,8 +150,11 @@ async function isRegularFile(path: string): Promise<boolean> {
 	}
 }
 
-/** Put a run whose worktree cannot be created yet back in the queue (Capacity § Disk), and say why once. */
-function requeue(ctx: Ctx, active: ActiveRun, why: string, kind: "disk" | "enforcement"): void {
+/**
+ * Put a run that cannot start yet back in the queue at its position (Capacity § Disk; enforcement unavailable), and
+ * say why once (`toldKey`: the meta key that records it was said).
+ */
+function requeue(ctx: Ctx, active: ActiveRun, why: string, toldKey: string): void {
 	tx(ctx, () => {
 		const now = ctx.now();
 		// Nothing reached Pi: the run goes back to the queue (never resubmitted after it ran).
@@ -171,9 +167,8 @@ function requeue(ctx: Ctx, active: ActiveRun, why: string, kind: "disk" | "enfor
 		);
 		ctx.store.run("DELETE FROM slots WHERE id = ?", active.slotId);
 		const task = loadTask(ctx, active.taskId);
-		const notedKey = `wait_noted:${kind}:${active.runId}`;
-		if (ctx.store.getMeta(notedKey) === undefined) {
-			ctx.store.setMeta(notedKey, String(now));
+		if (ctx.store.getMeta(toldKey) === undefined) {
+			ctx.store.setMeta(toldKey, String(now));
 			enqueueTask(ctx, task, "task_waiting", `${taskRef(task.id)} stays queued: ${why}.`);
 		}
 	});
@@ -225,7 +220,12 @@ async function prepare(ctx: Ctx, active: ActiveRun): Promise<Prepared | "requeue
 			.catch(() => ({ ok: false as const, reason: "sandbox check failed" }));
 		if (!available.ok && active.decision === undefined) {
 			ctx.enforcement = { ok: false, reason: available.reason, checkedAt: ctx.now() };
-			requeue(ctx, active, "container enforcement is unavailable, so no run starts", "enforcement");
+			requeue(
+				ctx,
+				active,
+				"container enforcement is unavailable, so no run starts",
+				`wait_noted:enforcement:${active.runId}`,
+			);
 			return "requeued";
 		}
 		throw new PrepareError("the agent container could not be started");
@@ -269,16 +269,45 @@ async function step<T>(ctx: Ctx, active: ActiveRun, event: string, reason: strin
 	}
 }
 
-/** Capacity § Disk: if a new worktree would not fit, the task stays queued and the bot says why. */
-async function taskDiskLow(ctx: Ctx, active: ActiveRun): Promise<boolean> {
-	// STUB(spec: capacity.md § Disk; evaluation.md § Fault Track "Task disk full"): only this free-space check before
-	// a worktree is created; a task disk that fills up during a run is not detected separately (writes fail in the
-	// container and the run ends on its own terms).
-	const free = await ctx.freeBytes(ctx.config.paths.taskDir).catch(() => 0);
-	if (free >= ctx.limits.minFreeDiskBytes) return false;
-	requeue(ctx, active, "the task disk is low on free space, so its worktree cannot be created yet", "disk");
-	ctx.deferred.set(active.runId, ctx.now() + DISK_RETRY_MS);
-	ctx.log.warn("run_requeued_disk", { run: active.runId, task: active.taskId });
+/**
+ * Capacity § Disk: "If a new worktree would exceed it, the task stays queued and the bot says why." The worktree
+ * checked out at `base` must fit on the task disk (engine/task-disk.ts): if it does, it is let through
+ * (ctx.creatingWorktrees: the caller removes it once created); if not, the run goes back to the queue (its slot
+ * released, nothing created, told once) and new worktrees are held. True if requeued.
+ */
+async function newWorktreeHeld(ctx: Ctx, active: ActiveRun, base: string): Promise<boolean> {
+	// STUB(spec: evaluation.md § Fault Track "Task disk full"): only this check before a worktree is created; a task
+	// disk that fills up during a run is not detected separately (writes fail in the container and the run ends on its
+	// own terms).
+	const measured = await measureNewWorktree(ctx, () => ctx.git.checkoutBytes(base));
+	// Decided and let through in one synchronous step: a check running at the same time counts this one as pending.
+	const room = roomForNewWorktree(ctx, measured);
+	if (room.ok) {
+		ctx.creatingWorktrees.add(active.runId);
+		return false;
+	}
+	return requeueForTaskDisk(ctx, active, room.shortfall);
+}
+
+/**
+ * The same check before main is fetched, sized at the main fetched last: a task disk without room holds the run before
+ * anything is written to it (a fetch onto a full disk would fail the task instead of keeping it queued). Nothing is let
+ * through here; the check after the fetch decides. Main not fetched yet (its size cannot be read): decided after the
+ * fetch only.
+ */
+async function heldBeforeFetch(ctx: Ctx, active: ActiveRun): Promise<boolean> {
+	const checkout = await ctx.git.checkoutBytes(ctx.git.baseRef).catch(() => undefined);
+	if (checkout === undefined) return false;
+	const room = roomForNewWorktree(ctx, await measureNewWorktree(ctx, async () => checkout));
+	return !room.ok && requeueForTaskDisk(ctx, active, room.shortfall);
+}
+
+/** Back to the queue (slot released, told once) and hold new worktrees; false if the run was stopped meanwhile. */
+function requeueForTaskDisk(ctx: Ctx, active: ActiveRun, shortfall: TaskDiskShortfall): boolean {
+	if (active.decision !== undefined) return false;
+	requeue(ctx, active, taskDiskWait(shortfall), taskDiskToldKey(active.runId));
+	holdNewWorktrees(ctx, shortfall);
+	ctx.log.warn("run_requeued_disk", { run: active.runId, task: active.taskId, shortfall: shortfall.kind });
 	return true;
 }
 
@@ -320,13 +349,29 @@ async function runSetup(ctx: Ctx, active: ActiveRun, task: TaskRow, path: string
 	if (outcome !== "passed") throw new PrepareError(`the setup script ended: ${outcome}`);
 }
 
-/** First run: fetch main, create the task's branch and worktree from it, run the setup script. */
+/**
+ * First run: check the new worktree fits on the task disk, fetch main, check again at the fetched main, create the
+ * task's branch and worktree from main, run the setup script. While it is created (until its setup ends) it counts as
+ * pending for other checks.
+ */
 async function createWorktree(ctx: Ctx, active: ActiveRun, task: TaskRow): Promise<"requeued" | undefined> {
-	if (await taskDiskLow(ctx, active)) return "requeued";
+	if (await heldBeforeFetch(ctx, active)) return "requeued";
+	checkStop(active);
 	const baseCommit = await step(ctx, active, "fetch_base_failed", "the latest main branch could not be fetched", () =>
 		ctx.git.fetchBase(),
 	);
 	checkStop(active);
+	if (await newWorktreeHeld(ctx, active, baseCommit)) return "requeued";
+	try {
+		checkStop(active);
+		await createAt(ctx, active, task, baseCommit);
+	} finally {
+		ctx.creatingWorktrees.delete(active.runId);
+	}
+	return undefined;
+}
+
+async function createAt(ctx: Ctx, active: ActiveRun, task: TaskRow, baseCommit: string): Promise<void> {
 	const branch = branchName(ctx, task.id);
 	const remote = await step(ctx, active, "remote_branch_check_failed", `branch ${branch} could not be checked`, () =>
 		ctx.git.remoteBranchSha(branch),
@@ -355,7 +400,6 @@ async function createWorktree(ctx: Ctx, active: ActiveRun, task: TaskRow): Promi
 	ctx.log.info("worktree_created", { task: task.id, base: baseCommit });
 	checkStop(active);
 	await runSetup(ctx, active, task, path);
-	return undefined;
 }
 
 type ChosenConversation = {
