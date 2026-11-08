@@ -6,6 +6,7 @@ import { piAgentDir, resolveAuthFile } from "./pi-home.ts";
 export type Config = {
 	readonly botToken: string;
 	readonly allowedUserIds: readonly number[];
+	readonly telegramGroup: TelegramGroup | undefined;
 	readonly provider: string;
 	readonly modelId: string;
 	readonly thinkingLevel: ModelThinkingLevel;
@@ -23,6 +24,9 @@ export type Config = {
 	/** `PI_PLUGINS`: built-in names, paths or npm package names, in load order. */
 	readonly plugins: readonly string[];
 };
+
+/** One explicitly enabled group/topic; sender authorization still uses the user allowlist. */
+export type TelegramGroup = { readonly chatId: number; readonly topicId: number; readonly botUsername: string };
 
 export type ConfigProblem = { readonly variable: string; readonly message: string };
 
@@ -71,6 +75,7 @@ export function parseConfig(env: Env, defaults: ConfigDefaults = { cwd: process.
 	const out = collector();
 	const botToken = parseBotToken(env.TELEGRAM_BOT_TOKEN, out);
 	const allowedUserIds = parseAllowedUserIds(env.TELEGRAM_ALLOWED_USER_IDS, out);
+	const telegramGroup = parseTelegramGroup(env, out);
 	const provider = parseProvider(env.PI_PROVIDER, out);
 	const modelId = parseNonEmpty("PI_MODEL", env.PI_MODEL, DEFAULT_MODEL, out);
 	const thinkingLevel = parseEnum("PI_THINKING", env.PI_THINKING, THINKING_LEVELS, DEFAULT_THINKING, out);
@@ -88,6 +93,7 @@ export function parseConfig(env: Env, defaults: ConfigDefaults = { cwd: process.
 	return {
 		botToken,
 		allowedUserIds,
+		telegramGroup,
 		provider,
 		modelId,
 		thinkingLevel,
@@ -102,6 +108,31 @@ export function parseConfig(env: Env, defaults: ConfigDefaults = { cwd: process.
 		contextCap,
 		plugins,
 	};
+}
+
+function parseTelegramGroup(env: Env, out: Collector): TelegramGroup | undefined {
+	const chat = nonEmpty(env.TELEGRAM_GROUP_CHAT_ID);
+	const topic = nonEmpty(env.TELEGRAM_GROUP_TOPIC_ID);
+	const username = nonEmpty(env.TELEGRAM_BOT_USERNAME)?.replace(/^@/, "");
+	if (chat === undefined && topic === undefined && username === undefined) return undefined;
+	const chatId = Number(chat);
+	if (chat === undefined || !/^-[1-9]\d*$/.test(chat) || !Number.isSafeInteger(chatId)) {
+		out.add("TELEGRAM_GROUP_CHAT_ID", "required: a negative numeric group chat id");
+	}
+	const topicId = parseTopicId(topic, out);
+	if (username === undefined || !/^[A-Za-z0-9_]{5,32}$/.test(username)) {
+		out.add("TELEGRAM_BOT_USERNAME", "required: the group bot's username, without @");
+	}
+	return { chatId, topicId, botUsername: username ?? "" };
+}
+
+function parseTopicId(topic: string | undefined, out: Collector): number {
+	if (topic === undefined) return 1;
+	const id = Number(topic);
+	if (!/^[1-9]\d*$/.test(topic) || !Number.isSafeInteger(id)) {
+		out.add("TELEGRAM_GROUP_TOPIC_ID", "must be a positive topic id (1 is General)");
+	}
+	return id;
 }
 
 /** A comma-separated list: items trimmed, blanks and repeats dropped, first-appearance order kept. */

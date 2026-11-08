@@ -3,6 +3,7 @@ import type { Models, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Extension, Harness, ModelRef } from "@earendil-works/pi-durable";
 import { Bot, GrammyError } from "grammy";
 import type { Update } from "grammy/types";
+import type { TelegramGroup } from "../config/schema.ts";
 import { createCompactReportTask } from "../delivery/compact-report.ts";
 import { createDeliverTask } from "../delivery/task.ts";
 import type { DeliveryDeps } from "../delivery/types.ts";
@@ -26,6 +27,7 @@ export type TelegramChannelOptions = {
 	readonly botToken: string;
 	/** Telegram user ids allowed to talk to the agent; must not be empty. */
 	readonly allowedUserIds: readonly number[];
+	readonly group?: TelegramGroup;
 	/** The agent's working directory; attachments go to `<workdir>/inbox/`. */
 	readonly workdir: string;
 	readonly model: ModelRef;
@@ -105,7 +107,14 @@ export function createTelegramChannel(options: TelegramChannelOptions): Telegram
 	const apiRoot = options.apiRoot ?? "https://api.telegram.org";
 	const bot = new Bot(options.botToken, { client: { apiRoot, timeoutSeconds: 75 } });
 	bot.api.config.use(createRetryTransformer());
-	const port = options.port ?? createGrammyPort({ token: options.botToken, apiRoot, api: bot.api });
+	const port =
+		options.port ??
+		createGrammyPort({
+			token: options.botToken,
+			apiRoot,
+			api: bot.api,
+			group: options.group,
+		});
 	let harness: Harness | undefined;
 	const deps: DeliveryDeps = {
 		port: () => port,
@@ -116,7 +125,7 @@ export function createTelegramChannel(options: TelegramChannelOptions): Telegram
 		log,
 		model: options.model,
 		onFatal,
-		rich: options.rich === true,
+		rich: options.rich === true && options.group === undefined,
 		...(options.previewIntervalMs === undefined ? {} : { previewIntervalMs: options.previewIntervalMs }),
 		...(options.editRetryDelaysMs === undefined ? {} : { editRetryDelaysMs: options.editRetryDelaysMs }),
 	};
@@ -127,7 +136,7 @@ export function createTelegramChannel(options: TelegramChannelOptions): Telegram
 		compactReport,
 		port: () => port,
 		log,
-		allowed: new Set(options.allowedUserIds),
+		allowed: new Set([...options.allowedUserIds, ...(options.group === undefined ? [] : [options.group.chatId])]),
 		...(options.limits?.uploadBytes === undefined ? {} : { uploadLimit: options.limits.uploadBytes }),
 	});
 	const lifecycle = new Lifecycle({ options, log, onFatal, bot, port, deliver, compactReport });
@@ -173,6 +182,7 @@ class Lifecycle {
 	}
 
 	async start(harness: Harness, context: Context, polling: boolean, plugins: PluginReport): Promise<void> {
+		if (polling) await this.#checkGroupBot();
 		const rt = this.#runtime(harness, plugins);
 		this.#rt = rt;
 		// A failed Session aborts running work before it can report; this is the one place it becomes fatal.
@@ -187,6 +197,15 @@ class Lifecycle {
 		harness.resume();
 		if (polling) await this.#startPolling(rt);
 		this.#notifyPlugins(rt);
+	}
+
+	async #checkGroupBot(): Promise<void> {
+		const { bot, options } = this.#d;
+		if (options.group === undefined) return;
+		await bot.init();
+		if (options.group.botUsername.toLowerCase() !== bot.botInfo.username.toLowerCase()) {
+			throw new Error("TELEGRAM_BOT_USERNAME does not match the configured bot token");
+		}
 	}
 
 	/** Once per start, not durable: each allowed user gets one line per plugin problem. */
@@ -210,6 +229,7 @@ class Lifecycle {
 			port,
 			log,
 			allowed: new Set(options.allowedUserIds),
+			...(options.group === undefined ? {} : { group: options.group }),
 			workdir: options.workdir,
 			stt: options.stt,
 			models: options.models,
@@ -239,7 +259,12 @@ class Lifecycle {
 					allowed_updates: ["message", "callback_query", "stopped_message_generation"],
 					onStart: (info) => {
 						started = true;
-						log.info("polling_started", { bot: info.username, allowed_users: rt.allowed.size });
+						log.info("polling_started", {
+							bot: info.username,
+							allowed_users: rt.allowed.size,
+							group: rt.group?.chatId,
+							topic: rt.group?.topicId,
+						});
 						resolve();
 					},
 				})

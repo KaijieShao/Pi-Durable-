@@ -8,6 +8,8 @@ export type GrammyPortOptions = {
 	readonly apiRoot: string;
 	/** The bot's API instance (with retries); a separate instance without retries serves `fast` calls. */
 	readonly api?: Api;
+	/** A single configured forum destination; General uses Telegram's default route. */
+	readonly group?: { readonly chatId: number; readonly topicId: number } | undefined;
 };
 
 /** Create the retrying Bot API client the bot and the port share. */
@@ -23,16 +25,24 @@ export function createGrammyPort(options: GrammyPortOptions): TelegramPort {
 	const fast = new Api(options.token, { apiRoot: options.apiRoot, timeoutSeconds: 30 });
 	fast.config.use(createRetryTransformer({ fast: true }));
 	const pick = (o: SendOptions) => (o.fast === true ? fast : api);
+	const topic = (chatId: number) =>
+		options.group?.chatId === chatId && options.group.topicId !== 1 ? { message_thread_id: options.group.topicId } : {};
 	return {
 		sendMessage: (chatId, text, o, signal) =>
 			o.rich === true
 				? guard("sendRichMessage", async () => {
-						const sent = await pick(o).sendRichMessage(chatId, { markdown: text }, replyExtra(o), gs(signal));
+						const sent = await pick(o).sendRichMessage(
+							chatId,
+							{ markdown: text },
+							{ ...replyExtra(o), ...topic(chatId) },
+							gs(signal),
+						);
 						return sent.message_id;
 					})
 				: guard(
 						"sendMessage",
-						async () => (await pick(o).sendMessage(chatId, text, sendExtra(o), gs(signal))).message_id,
+						async () =>
+							(await pick(o).sendMessage(chatId, text, { ...sendExtra(o), ...topic(chatId) }, gs(signal))).message_id,
 					),
 		editMessageText: (chatId, messageId, text, o, signal) =>
 			guard("editMessageText", async () => {
@@ -55,17 +65,27 @@ export function createGrammyPort(options: GrammyPortOptions): TelegramPort {
 			}),
 		sendChatAction: (chatId, action: ChatAction, signal) =>
 			guard("sendChatAction", async () => {
-				await fast.sendChatAction(chatId, action, {}, gs(signal));
+				await fast.sendChatAction(chatId, action, topic(chatId), gs(signal));
 			}),
 		sendPhoto: (chatId, path, caption, signal) =>
 			guard(
 				"sendPhoto",
-				async () => (await api.sendPhoto(chatId, new InputFile(path), captionExtra(caption), gs(signal))).message_id,
+				async () =>
+					(await api.sendPhoto(chatId, new InputFile(path), { ...captionExtra(caption), ...topic(chatId) }, gs(signal)))
+						.message_id,
 			),
 		sendDocument: (chatId, path, caption, signal) =>
 			guard(
 				"sendDocument",
-				async () => (await api.sendDocument(chatId, new InputFile(path), captionExtra(caption), gs(signal))).message_id,
+				async () =>
+					(
+						await api.sendDocument(
+							chatId,
+							new InputFile(path),
+							{ ...captionExtra(caption), ...topic(chatId) },
+							gs(signal),
+						)
+					).message_id,
 			),
 		getFile: (fileId, signal) =>
 			guard("getFile", async () => {

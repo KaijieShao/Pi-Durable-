@@ -48,7 +48,7 @@ export async function handleUpdate(rt: ChannelRuntime, update: Update): Promise<
 }
 
 async function route(rt: ChannelRuntime, update: Update): Promise<void> {
-	const access = checkAccess(update, rt.allowed);
+	const access = checkAccess(update, rt.allowed, rt.group);
 	if (!access.allowed) {
 		rt.log.info("update_ignored", access.fields);
 		return;
@@ -117,6 +117,10 @@ async function runCommand(scope: MessageScope, name: string, args: string): Prom
 			return detach(scope, "stop", () => runStop(scope));
 		case "compact":
 			return detach(scope, "compact", () => runCompact(scope, args));
+		case "task":
+			if (args.trim() === "") return reply(scope, "Use /task@<bot_username> followed by your request.");
+			await admitContent(scope, args);
+			return;
 		default:
 			// Unknown commands go to the model as text: skills and prompts often use their own slash words.
 			await admitContent(scope, scope.message.text ?? `/${name}`);

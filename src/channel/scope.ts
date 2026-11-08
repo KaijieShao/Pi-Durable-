@@ -1,6 +1,7 @@
 import type { Models } from "@earendil-works/pi-ai";
 import type { Conversation, Harness, ModelRef } from "@earendil-works/pi-durable";
 import type { Message } from "grammy/types";
+import type { TelegramGroup } from "../config/schema.ts";
 import type { CompactReportTask } from "../delivery/compact-report.ts";
 import type { DeliverTask } from "../delivery/task.ts";
 import type { Stt } from "../media/stt.ts";
@@ -18,6 +19,7 @@ export type ChannelRuntime = {
 	readonly port: TelegramPort;
 	readonly log: Logger;
 	readonly allowed: ReadonlySet<number>;
+	readonly group?: TelegramGroup;
 	readonly workdir: string;
 	readonly stt: Stt | undefined;
 	readonly models: Models | undefined;

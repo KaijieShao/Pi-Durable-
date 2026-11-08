@@ -7,8 +7,13 @@ variables win over the file). Invalid values stop the daemon at start with one l
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | yes | | Bot token from @BotFather |
 | `TELEGRAM_ALLOWED_USER_IDS` | yes | | Comma-separated Telegram user ids allowed to use the bot |
+| `TELEGRAM_GROUP_CHAT_ID` | no | private chats only | Negative chat id of one group the bot may serve; the sender must still be in `TELEGRAM_ALLOWED_USER_IDS` |
+| `TELEGRAM_GROUP_TOPIC_ID` | no | `1` (General) | Only this forum topic is admitted; replies, typing and file sends stay in that topic |
+| `TELEGRAM_BOT_USERNAME` | with group | | Exact bot username, without `@`; checked against Telegram on startup |
 | `PI_PROVIDER` | no | pi's default, else `anthropic` | pi-ai provider id |
 | `PI_MODEL` | no | pi's default, else `claude-opus-5-5` | Model id of the provider |
+| `OPENAI_BASE_URL` | no | OpenAI's standard endpoint | With `PI_PROVIDER=openai`, use an HTTPS Responses-compatible gateway (or HTTP on localhost) and `OPENAI_API_KEY`; applies to every model request |
+| `OPENAI_CODEX_GATEWAY` | no | off | Set to `1` only for a custom endpoint backed by Codex: sends top-level instructions, streams responses and omits unsupported sampling/cache settings |
 | `PI_THINKING` | no | pi's default, else `high` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; checked against the model |
 | `PI_WORKDIR` | no | current directory | The agent's working directory |
 | `PI_DATA_DIR` | no | `$XDG_STATE_HOME/pi-durable-telegram` or `~/.local/state/pi-durable-telegram` | SQLite storage and lock |
@@ -43,6 +48,19 @@ DEEPGRAM_API_KEY=...
 PI_PLUGINS=search,skills
 TAVILY_API_KEY=...
 ```
+
+---
+
+## Optional Group Chat
+
+Add the existing bot to the intended group with normal member permissions. Keep Telegram privacy mode enabled;
+do not grant administrator access merely to receive commands. Configure the group's numeric chat id, topic id
+(`1` is General), bot username and the numeric user ids authorized to control this coding agent.
+
+Send `/task@your_bot your request` or reply to the bot's own message. Bare group chatter, commands addressed to
+another bot, other groups/topics and unlisted senders are ignored. A configured group uses ordinary HTML messages,
+not private-chat rich drafts. One group/topic is supported per running bot, with a shared conversation for its
+authorized senders. Do not change its topic while work or reminders are pending. Private chats remain separate.
 
 ---
 

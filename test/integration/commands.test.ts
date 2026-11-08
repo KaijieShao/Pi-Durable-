@@ -40,7 +40,7 @@ test("commands are registered; /start and /help reply once with the command list
 	const { t, port } = await setup(newFaux());
 	assert.deepEqual(
 		port.commands.map((c) => c.command),
-		["new", "stop", "compact", "status", "help"],
+		["task", "new", "stop", "compact", "status", "help"],
 	);
 	await t.agent.channel.handleUpdate(textUpdate(CHAT, 1, "/start"));
 	await t.agent.channel.handleUpdate(textUpdate(CHAT, 2, "/help"));

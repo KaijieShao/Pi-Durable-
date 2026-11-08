@@ -54,6 +54,13 @@ More in [docs/install.md](docs/install.md).
 
 </details>
 
+### Local development in Conductor
+
+For macOS workspaces, use the tracked Setup, Bot, Doctor, Login and Archive actions in
+[.conductor/settings.toml](.conductor/settings.toml). See [.conductor/README.md](.conductor/README.md) for local
+credentials, automatic startup and persistent SQLite storage. This bot uses outbound Telegram polling, so it has
+no localhost web page or inbound port.
+
 ## What you can do
 
 - **Ask from anywhere.** "Check why the site is down", "what is eating the disk". The agent works on the server and
@@ -149,7 +156,9 @@ Yes. Add their Telegram ids to the settings and each person gets a private conve
 same power over the server.
 
 **Does it work in group chats?**
-Not yet, only in private chats.
+Yes, optionally. Configure one explicit group/topic and keep a sender allowlist. In the group use
+`/task@your_bot your request` or reply to the bot. Privacy mode can stay enabled; no administrator permission is
+needed. Other groups, topics and senders are ignored. See [configuration](docs/configuration.md#optional-group-chat).
 
 **Does it understand voice messages?**
 Yes, if you add a [Deepgram](https://deepgram.com) key during installation.

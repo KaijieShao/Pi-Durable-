@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Opt in to one Telegram group/topic with independent sender authorization, addressed commands, `/task` requests
+  and topic-preserving text, typing and file delivery. Private-only behavior remains the default.
+
+- Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
+
+- Add macOS Conductor setup, automatic bot startup, configuration checks, provider login and graceful archive.
+  Keep bot credentials in the main checkout's ignored local env file and preserve per-workspace SQLite history.
+
 ## 0.1.10 (2026-11-03)
 
 - Messages received while busy steer the current run at its next boundary, including tool rounds.

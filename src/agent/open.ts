@@ -61,6 +61,7 @@ export async function openAgent(config: Config, deps: OpenAgentDeps = {}): Promi
 	const models = deps.models ?? (await defaultModels(config, deps.authContext));
 	const ref = { provider: config.provider, modelId: config.modelId };
 	const model = resolveModel(models, ref, config.thinkingLevel);
+	const rich = config.telegramRich === "auto" && config.telegramGroup === undefined;
 	if ((await models.checkAuth(config.provider)) === undefined) {
 		throw new StartupError(`not logged in: run \`pi-durable-telegram login ${config.provider}\``, 4);
 	}
@@ -71,10 +72,11 @@ export async function openAgent(config: Config, deps: OpenAgentDeps = {}): Promi
 		model: ref,
 		thinkingLevel: config.thinkingLevel,
 		apiRoot: config.telegramApiRoot,
-		rich: config.telegramRich === "auto",
+		rich,
 		log,
 		models,
 		...optional({
+			group: config.telegramGroup,
 			stt: deps.stt ?? sttFor(config),
 			port: deps.port,
 			onFatal: deps.onFatal,
@@ -85,9 +87,7 @@ export async function openAgent(config: Config, deps: OpenAgentDeps = {}): Promi
 	});
 	const registry = createRegistry();
 	registry.install(createWorkspaceTools({ env: buildSafeEnv(deps.shellEnv ?? process.env) }));
-	registry.install(
-		createPromptExtension({ instructionsPath: config.instructionsPath, rich: config.telegramRich === "auto" }),
-	);
+	registry.install(createPromptExtension({ instructionsPath: config.instructionsPath, rich }));
 	registry.install(createEmptyAnswerExtension());
 	registry.install(channel.extension);
 	const snapshot = registry.snapshot();

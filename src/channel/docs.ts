@@ -1,6 +1,6 @@
 import { defineDoc } from "@earendil-works/pi-durable";
 
-/** Telegram chat id → durable conversation id; one conversation per allowed private chat. */
+/** Telegram chat id → durable conversation id; one per private chat or explicitly configured group topic. */
 export const ChatMap = defineDoc<{ chats: Record<string, number> }>({
 	kind: "tg.chats",
 	version: 1,
