@@ -9,6 +9,7 @@ import { statSync } from "node:fs";
 import { redact } from "../../runtime/redact.ts";
 import { type SweepRow, WATCHDOG_PID_KEY } from "../../watchdog/protocol.ts";
 import { readBranchHold } from "../branch-hold.ts";
+import { evaluationLines } from "../evaluation.ts";
 import { DEMO_LIMITS } from "../limits.ts";
 import { formatBytes } from "../messages.ts";
 import type { Store } from "../store.ts";
@@ -30,8 +31,9 @@ const TERMINAL = "('merged','failed','cancelled')";
 const RECENT_TERMINAL = 10;
 
 /**
- * Group state, execution slots, open tasks and the most recent finished ones, then `disk` (diskReport(): free space and
- * usage of both disks). Metadata only: no task text.
+ * Group state, execution slots, open tasks and the most recent finished ones, held tasks, uncertain changes, the
+ * outbox, the evaluation in progress (sealing) and the last one, then `disk` (diskReport(): free space and usage of
+ * both disks). Metadata only: no task text.
  */
 export function ownerStatus(store: Store, chatId: number, disk: readonly string[] = []): string {
 	const lines = [groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
@@ -50,7 +52,8 @@ export function ownerStatus(store: Store, chatId: number, disk: readonly string[
 		RECENT_TERMINAL,
 	);
 	if (recent.length > 0) lines.push(`Recent finished tasks (last ${RECENT_TERMINAL}):`, ...recent.map(taskLine));
-	lines.push(...heldLines(store, chatId), ...effectLines(store, chatId), ...housekeepingLines(store), ...disk);
+	lines.push(...heldLines(store, chatId), ...effectLines(store, chatId), ...housekeepingLines(store));
+	lines.push(...evaluationLines(store, chatId), ...disk);
 	return lines.join("\n");
 }
 

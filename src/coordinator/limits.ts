@@ -44,6 +44,15 @@ export type Limits = {
 	readonly checkMemoryMiB: number;
 	readonly checkPids: number;
 	/**
+	 * The isolated evaluator (Capacity § Provisional container limits: "Evaluator, exclusive phase 2 vCPU 2 GiB"; Agent
+	 * Execution § Containers): one container after sealing, its suites one after another, stopped at this deadline (a
+	 * provisional figure: the docs set none; each suite also has its own bound in the image's suite list).
+	 */
+	readonly evaluatorCpus: number;
+	readonly evaluatorMemoryMiB: number;
+	readonly evaluatorPids: number;
+	readonly evaluatorDeadlineMs: number;
+	/**
 	 * Free-space floor of both disks (Capacity § Disk), the default of PI_BOOT_DISK_MIN_FREE and PI_TASK_DISK_MIN_FREE:
 	 * new /task requests are rejected while the boot disk (PI_DATA_DIR) has less free; a new worktree is created only if
 	 * at least this much stays free on the task disk (PI_TASK_DIR) after it (src/coordinator/disk.ts).
@@ -83,6 +92,10 @@ export const DEMO_LIMITS: Limits = Object.freeze({
 	checkCpus: 1,
 	checkMemoryMiB: 1024,
 	checkPids: 256,
+	evaluatorCpus: 2,
+	evaluatorMemoryMiB: 2048,
+	evaluatorPids: 512,
+	evaluatorDeadlineMs: 30 * 60_000,
 	minFreeDiskBytes: 1024 * 1024 * 1024,
 	worktreeHeadroomBytes: 1024 * 1024 * 1024,
 	reviewReminderMs: 24 * 60 * 60_000,

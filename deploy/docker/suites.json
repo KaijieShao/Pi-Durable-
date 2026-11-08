@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "suites": [
+    {
+      "name": "module:{name}",
+      "each": "modules",
+      "hidden": "modules/{name}",
+      "argv": ["node", "--test", "{tests}"],
+      "timeoutMs": 600000
+    },
+    {
+      "name": "integration",
+      "hidden": "integration",
+      "argv": ["node", "--test", "{tests}"],
+      "timeoutMs": 600000
+    },
+    {
+      "name": "baseline",
+      "hidden": "baseline",
+      "argv": ["node", "--test", "{tests}"],
+      "timeoutMs": 600000
+    }
+  ]
+}

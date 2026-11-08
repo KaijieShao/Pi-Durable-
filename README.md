@@ -72,6 +72,12 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
 - **The watchdog**, a separate process, is the stop path that survives the Coordinator: it kills and verifies every
   leftover Pi process and container before dispatch reopens after any restart, removes what a crashed Coordinator
   left, and enforces each run's deadline on its own; an unconfirmed stop freezes the group.
+- **Sealing and the isolated evaluator** (the trial harness, `owner seal`): once the trial's tasks have merged, the
+  group seals. Dispatch, merges and follow-up delivery are held across the deployment (new `/task` requests and
+  replies are saved and queued), the runs and merge tests in progress finish, and a read-only snapshot of main is
+  graded by a separate trusted container (no network, no credentials, 2 vCPU / 2 GiB) with the hidden tests, one
+  suite after another; "passed" comes only from it. The result is recorded and posted, and dispatch reopens only after
+  the evaluator has exited and its cleanup is verified.
 
 ## Command line
 
@@ -80,6 +86,7 @@ pi-durable-telegram watchdog [--env-file <path>]
 pi-durable-telegram run [--env-file <path>]
 pi-durable-telegram owner status|unfreeze [<group>]|resolve <change>...|failed-events [--env-file <path>]
 pi-durable-telegram owner conversations [<task>]|inspect <conversation> [--env-file <path>]
+pi-durable-telegram owner seal [<group>] [--trial <id>] [--tasks <id,...>] [--env-file <path>]
 ```
 
 `watchdog` is the independent stop path, its own process (its own systemd unit and user in production): start it
@@ -91,8 +98,10 @@ From the sources: `node src/cli/main.ts …` (Node 22 strips the types). `owner`
 its owner-only local socket, `<PI_DATA_DIR>/owner/owner.sock`; run it as the Coordinator's user. `owner unfreeze`
 makes the Coordinator repeat its recovery checks and unfreezes the group only if all pass; `owner resolve` records
 your review of an uncertain file change; `owner inspect` prints a quarantined conversation's transcript, read without
-writing anything. Without a running Coordinator it says so and exits 3 (`owner status` adds a labelled read-only
-status from the database) ([RUN-LOCAL.md](RUN-LOCAL.md#owner-cli), [security.md](docs/security.md#the-owner-socket)).
+writing anything; `owner seal` is the trial harness: it seals the group and has the isolated evaluator grade a
+snapshot of main ([RUN-LOCAL.md](RUN-LOCAL.md#trial-evaluation-sealing)). Without a running Coordinator it says so and
+exits 3 (`owner status` adds a labelled read-only status from the database) ([RUN-LOCAL.md](RUN-LOCAL.md#owner-cli),
+[security.md](docs/security.md#the-owner-socket)).
 
 ## Model endpoint (OPENAI_BASE_URL)
 
@@ -106,10 +115,10 @@ settings. The endpoint handling lives in [src/agent/providers.ts](src/agent/prov
 
 ## Not built yet
 
-Marked `STUB(spec: …)` in the code: sealing and the isolated evaluator; GCP deploy scripts; a task disk that fills up during a
-run (only a new worktree is checked against the task disk); size limits and retention rules for the boot disk's
-budgets (database, Pi's stores, logs, retained trials: `owner status` only reports their usage); trial reset and the
-stress test.
+Marked `STUB(spec: …)` in the code: GCP deploy scripts; a task disk that fills up during a run (only a new worktree is
+checked against the task disk); size limits and retention rules for the boot disk's budgets and the sealed snapshots
+(database, Pi's stores, logs, retained trials: `owner status` only reports their usage); trial reset and the stress
+test.
 Measurements in the spec are planned, not results. Pi processes run as their own user in a dedicated systemd slice on Linux, and as your own user
 on a Mac (the weaker local mode): see [docs/isolation.md](docs/isolation.md).
 

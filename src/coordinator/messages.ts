@@ -612,6 +612,20 @@ export function followupSteered(p: { taskId: number; running: boolean; position:
 		: `Follow-up saved; it will be steered into ${taskRef(p.taskId)} when its run starts. Queue position ${p.position}.`;
 }
 
+/** A reply to a running task while sealing holds follow-up delivery (Architecture § Sealing). */
+export function followupHeld(taskId: number): string {
+	return (
+		`Follow-up saved, not delivered yet: the group is sealing for an evaluation, which holds follow-up delivery. If ` +
+		`the running ${taskRef(taskId)} completes first, this reply starts another run of it on the same branch once ` +
+		"dispatch reopens; if that run fails or is cancelled, the reply expires with it."
+	);
+}
+
+/** The waiting note while sealing holds dispatch deployment-wide (Capacity § Waiting: sealing makes waits longer). */
+export function sealingWait(): string {
+	return "Waiting: dispatch is held while the group is sealed for an evaluation; it starts once dispatch reopens";
+}
+
 export function followupStarted(p: {
 	taskId: number;
 	position: number;
@@ -810,11 +824,19 @@ export function cancelling(id: number, state: TaskState): string {
 	return `Cancelling ${taskRef(id)}… You will get a message once ${what}.`;
 }
 
-export function approved(p: { taskId: number; head: string; position: number; testsPassed: boolean }): string {
+export function approved(p: {
+	taskId: number;
+	head: string;
+	position: number;
+	testsPassed: boolean;
+	held?: boolean;
+}): string {
 	const tests = p.testsPassed ? "" : " Tests have not passed at this head, so the merge stops unless they pass.";
+	const held =
+		p.held === true ? " Merges are held while the group is sealed for an evaluation; it merges after that." : "";
 	return (
 		`Approved ${taskRef(p.taskId)} at ${sha7(p.head)}; merging when the merge queue reaches it. ` +
-		`Merge queue position ${p.position}.${tests}`
+		`Merge queue position ${p.position}.${tests}${held}`
 	);
 }
 

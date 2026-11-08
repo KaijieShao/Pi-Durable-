@@ -97,6 +97,19 @@ and Pi's stores take. The defaults are provisional: the stress test sets the tas
 | `DOCKER_BIN` | no | `docker` | The Docker CLI |
 | `RELAY_PORT` | no | `0` (any free port) | Port of the relay on 127.0.0.1 |
 
+## Trial evaluation
+
+Used only when the owner seals the group for a trial (`owner seal`, [RUN-LOCAL.md](../RUN-LOCAL.md#trial-evaluation-sealing)).
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PI_EVAL_HIDDEN_TESTS_DIR` | no (sealing is refused without it) | unset | The hidden tests on the host: `modules/<module>/`, `integration/`, `baseline/`, each with `*.test.js` (`.mjs`, `.cjs`) files. Mounted read-only in the evaluator container only. Must be outside `PI_DATA_DIR` and `PI_TASK_DIR` (the agent and check containers mount worktrees and scratch space from there); a path with a comma, quote or newline is refused. Keep it readable by the Coordinator's user (it hashes the hidden tests for the trial record) and by `CONTAINER_USER`, not by the Pi user |
+| `EVALUATOR_IMAGE` | no | `pi-durable-evaluator:demo` | The trusted evaluator image (`scripts/build-images.sh`): its launcher and fixed suite list (`/opt/pi-eval/suites.json`) grade the snapshot one suite after another. It runs as `CONTAINER_USER` with no network and no credentials, 2 vCPU / 2 GiB |
+
+Fixed, not configurable: the evaluation's 30-minute deadline (each suite also has its own bound in the image's suite
+list), the evaluator's container limits (2 vCPU, 2 GiB without swap, 512 processes), and where the sealed snapshots
+are kept (`<PI_TASK_DIR>/snapshots/`).
+
 ## Pi processes
 
 How each run's Pi process is isolated; see [isolation.md](isolation.md) for both modes and the one-time host setup.

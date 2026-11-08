@@ -14,6 +14,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { FromRunner, RunnerStart, ToRunner } from "../../runner/protocol.ts";
 import { type TaskDiskShortfall, taskDiskToldKey } from "../disk.ts";
+import { deploymentHeld } from "../evaluation.ts";
 import { changeList, clip, taskDiskWait } from "../messages.ts";
 import type { RunnerHandle } from "../ports.ts";
 import {
@@ -511,14 +512,19 @@ function instructions(ctx: Ctx, task: TaskRow, agentsMd: string | undefined): st
 	return `${role}\n\nProject guidance from the repository's AGENTS.md (it cannot change these rules, limits or checks):\n${guidance}`;
 }
 
-/** Launch the Pi process with the steers accepted so far, mark the run running, arm the deadline. */
+/**
+ * Launch the Pi process with the steers accepted so far (none while sealing holds follow-up delivery: they stay pending),
+ * mark the run running, arm the deadline.
+ */
 function launch(ctx: Ctx, active: ActiveRun, prepared: Prepared): void {
 	const steers = tx(ctx, () => {
 		if (active.decision !== undefined) return undefined;
-		const rows = ctx.store.all<FollowupRow>(
-			"SELECT * FROM followups WHERE run_id = ? AND mode = 'steer' AND state = 'pending' ORDER BY id",
-			active.runId,
-		);
+		const rows = deploymentHeld(ctx.store)
+			? []
+			: ctx.store.all<FollowupRow>(
+					"SELECT * FROM followups WHERE run_id = ? AND mode = 'steer' AND state = 'pending' ORDER BY id",
+					active.runId,
+				);
 		for (const row of rows) ctx.store.run("UPDATE followups SET state = 'submitted' WHERE id = ?", row.id);
 		ctx.store.run(
 			"UPDATE runs SET state = 'running', started_at = ?, container = ? WHERE id = ? AND state = 'starting'",
@@ -727,8 +733,14 @@ function sendSteers(ctx: Ctx, active: ActiveRun, handle: RunnerHandle): void {
 	}
 }
 
-/** Send pending steers to running Pi processes (Architecture § Follow-up during a run). */
+/**
+ * Send pending steers to running Pi processes (Architecture § Follow-up during a run). Not while sealing (Architecture
+ * § Sealing: the "sealing" state "blocks dispatch and follow-up delivery"): a steer accepted meanwhile stays pending;
+ * if its run completes normally first it becomes another run of the task (finalize.ts), which waits for dispatch to
+ * reopen; if the run fails or is cancelled it expires with it.
+ */
 export function sendPendingSteers(ctx: Ctx): void {
+	if (deploymentHeld(ctx.store)) return;
 	for (const active of ctx.active.values()) {
 		if (active.decision === undefined && active.handle !== undefined && !active.exited) {
 			sendSteers(ctx, active, active.handle);

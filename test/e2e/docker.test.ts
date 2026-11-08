@@ -21,7 +21,9 @@
  *
  * Also, without Docker: the production wiring. startCoordinator without a sandbox dependency builds the Docker sandbox
  * from its config (a fake docker CLI records what it is asked), and a run whose agent container cannot start never
- * reaches the model (no host fallback).
+ * reaches the model (no host fallback); `owner seal` uses the Docker evaluator built from the config, which is not
+ * probed at startup and refuses the seal while its image is missing (the real evaluator image:
+ * test/coordinator/evaluator-docker.test.ts).
  */
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
@@ -712,8 +714,13 @@ function assertHardenedArgv(args: readonly string[]): void {
 async function productionWiring(t: TestContext): Promise<void> {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-e2e-wiring-")));
 	const fake = await fakeDocker(base);
-	// No sandbox dependency: startCoordinator builds the Docker sandbox from the config (DOCKER_BIN, images, user).
-	const stack = await startStack({ sandbox: "docker", env: { DOCKER_BIN: fake.bin } });
+	// No sandbox dependency: startCoordinator builds the Docker sandbox from the config (DOCKER_BIN, images, user), and
+	// no evaluator dependency: the Docker evaluator too (EVALUATOR_IMAGE).
+	const stack = await startStack({
+		sandbox: "docker",
+		env: { DOCKER_BIN: fake.bin },
+		hiddenTests: { "baseline/version.test.js": "// hidden\n" },
+	});
 	t.after(async () => {
 		await stack.stop();
 		await rm(base, { recursive: true, force: true });
@@ -755,10 +762,27 @@ async function productionWiring(t: TestContext): Promise<void> {
 	assert.ok(hasPair(agentRun, "--label", `${LABEL_TASK}=1`));
 	assert.ok(agentRun.includes(fake.agentId), "the agent image is pinned by ID");
 	assert.equal(stack.model.requests.length, 0, "no host fallback: the model was never called");
+
+	// The trial harness uses the Docker evaluator built from the config; it is not probed at startup. Its image is
+	// missing here: the seal is refused and nothing changes (fails closed), no evaluator container is asked for.
+	assert.ok(!startup.some((args) => args.includes("pi-durable-evaluator:demo")), "not probed at startup");
+	const seal = await stack.owner("seal", "--trial", "w1");
+	assert.equal(seal.code, 1);
+	assert.match(
+		seal.stderr,
+		/refused: the evaluator is not available: evaluator image pi-durable-evaluator:demo is missing \(build it with scripts\/build-images\.sh\)/,
+	);
+	const evaluatorCalls = fake.calls().filter((args) => args.includes("pi-durable-evaluator:demo"));
+	assert.deepEqual(
+		evaluatorCalls.map((args) => args.slice(0, 2)),
+		[["image", "inspect"]],
+	);
+	assert.equal(stack.coordinator.store.groupState(stack.config.telegram.groupChatId).state, "normal");
+	assert.equal(stack.coordinator.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM evaluations")?.n, 0);
 }
 
 test(
-	"production wiring: without a sandbox dependency the Coordinator uses the Docker sandbox, never the host",
+	"production wiring: without a sandbox dependency the Coordinator uses the Docker sandbox, never the host; and the Docker evaluator",
 	{
 		timeout: 60_000,
 		skip: process.platform === "win32" ? "needs a POSIX shell for the fake docker CLI" : false,

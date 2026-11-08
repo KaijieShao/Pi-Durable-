@@ -6,7 +6,14 @@ export type OwnerInvocation =
 	| { readonly action: "resolve"; readonly intents: readonly number[] }
 	| { readonly action: "failed-events" }
 	| { readonly action: "conversations"; readonly task?: number }
-	| { readonly action: "inspect"; readonly conversation: string };
+	| { readonly action: "inspect"; readonly conversation: string }
+	/** `group` as for unfreeze; `trial`: --trial <id>; `tasks`: --tasks <id,id,...> (the trial's tasks). */
+	| {
+			readonly action: "seal";
+			readonly group?: number;
+			readonly trial?: string;
+			readonly tasks?: readonly number[];
+	  };
 
 export type OwnerAction = OwnerInvocation["action"];
 
@@ -17,6 +24,7 @@ export const OWNER_ACTIONS: readonly OwnerAction[] = [
 	"failed-events",
 	"conversations",
 	"inspect",
+	"seal",
 ];
 
 export type CliArgs =
@@ -37,10 +45,37 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 	if (rest.includes("--version") || rest.includes("-v")) return { command: "version" };
 	const envFile = takeOption(rest, "--env-file");
 	if (envFile === null) return { command: "invalid", message: "--env-file needs a path" };
+	const seal = sealOptions(rest);
+	if (typeof seal === "string") return { command: "invalid", message: seal };
 	// A negative number is an argument (a group chat id), not an option.
 	const unknown = rest.find((arg) => arg.startsWith("-") && !/^-\d+$/.test(arg));
 	if (unknown !== undefined) return { command: "invalid", message: `unknown option: ${unknown}` };
-	return parseCommand(rest, envFile === undefined ? {} : { envFile });
+	return withSealOptions(parseCommand(rest, envFile === undefined ? {} : { envFile }), seal);
+}
+
+/** The seal options belong to `owner seal` only. */
+function withSealOptions(parsed: CliArgs, seal: { trial?: string; tasks?: number[] }): CliArgs {
+	if (Object.keys(seal).length === 0) return parsed;
+	if (parsed.command !== "owner" || parsed.action !== "seal")
+		return { command: "invalid", message: "--trial and --tasks go with owner seal only" };
+	return { ...parsed, ...seal };
+}
+
+const TRIAL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** `--trial <id>` and `--tasks <id,id,...>` (owner seal), taken out of `args`; a string is the problem. */
+function sealOptions(args: string[]): { trial?: string; tasks?: number[] } | string {
+	const trial = takeOption(args, "--trial");
+	const tasks = takeOption(args, "--tasks");
+	if (trial === null || (trial !== undefined && !TRIAL.test(trial)))
+		return "--trial needs a trial id (letters, digits, '.', '_' or '-'; at most 64)";
+	const ids = tasks?.split(",").map((part) => part.trim());
+	if (tasks === null || (ids !== undefined && !ids.every((id) => POSITIVE.test(id))))
+		return "--tasks needs task numbers separated by commas, e.g. --tasks 3,4";
+	return {
+		...(trial === undefined ? {} : { trial }),
+		...(ids === undefined ? {} : { tasks: ids.map(Number) }),
+	};
 }
 
 function parseCommand(rest: readonly string[], withFile: { envFile?: string }): CliArgs {
@@ -93,6 +128,7 @@ const OWNER_PARSERS: Readonly<Record<OwnerAction, OwnerParser>> = {
 			? { action: "inspect", conversation: id }
 			: undefined;
 	},
+	seal: (args) => optionalArg(args, CHAT_ID, { action: "seal" }, (group) => ({ action: "seal", group: Number(group) })),
 };
 
 /** `owner <action> [args]`, or undefined when the arguments do not fit the action. */
@@ -108,6 +144,9 @@ export const OWNER_USAGE = `  pi-durable-telegram owner status                  
   pi-durable-telegram owner failed-events              Telegram messages that could not be delivered
   pi-durable-telegram owner conversations [<task>]     quarantined conversations
   pi-durable-telegram owner inspect <conversation>     a quarantined conversation's transcript, opened read-only
+  pi-durable-telegram owner seal [<group>] [--trial <id>] [--tasks <id,...>]
+                                                       trial harness: seal the group, grade a snapshot of main in
+                                                       the isolated evaluator, then reopen dispatch
   (each with [--env-file <path>]; run as the Coordinator's user: it talks to <PI_DATA_DIR>/owner/owner.sock)`;
 
 /** Remove `--name value` or `--name=value` from `args`; null when the value is missing. */

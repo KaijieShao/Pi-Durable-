@@ -14,6 +14,13 @@ import type { ToolName } from "./protocol.ts";
 
 export const TOOL_NAMES: readonly ToolName[] = Object.freeze(["read", "edit", "write", "run_check"]);
 
+/**
+ * The tool policy's version, recorded with every trial (Evaluation § Frozen Before Trial 1: "the tool policy
+ * version"). Bump it whenever the tool surface, these allow rules, the container's file-operation confinement
+ * (deploy/docker/fsop.mjs) or the run_check launcher's rules change; the agent and check image ids are recorded too.
+ */
+export const TOOL_POLICY_VERSION = "1";
+
 /** Bounds on arguments, matching the container's file operation (deploy/docker/fsop.mjs). */
 export const POLICY_LIMITS = Object.freeze({
 	/** UTF-8 bytes of a whole path. */

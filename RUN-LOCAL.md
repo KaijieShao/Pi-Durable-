@@ -30,7 +30,8 @@ npm ci
 There is no `postinstall` step any more: Pi Durable 1.5.0 is used unmodified. (`npm ci` also replaces a
 `node_modules` that an older version of this package had patched.)
 
-Build the two container images. They are built from `node:22-slim` (pinned by tag), so pull the base once first:
+Build the three container images (the agent and check images for runs, the evaluator image for a trial evaluation).
+They are built from `node:22-slim` (pinned by tag), so pull the base once first:
 
 ```sh
 docker pull node:22-slim
@@ -38,13 +39,14 @@ scripts/build-images.sh
 docker image ls --format '{{.Repository}}:{{.Tag}}' | grep pi-durable
 # pi-durable-agent:demo
 # pi-durable-check:demo
+# pi-durable-evaluator:demo
 ```
 
 The images were last built here from `node:22-slim` with digest
 `sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d`. Record yours with
 `docker image inspect --format '{{index .RepoDigests 0}}' node:22-slim` and rebuild the images whenever it changes.
-If either image is missing, the Coordinator still starts but refuses to run tasks (it fails closed) and says so in
-the log and the group.
+If the agent or check image is missing, the Coordinator still starts but refuses to run tasks (it fails closed) and
+says so in the log and the group; without the evaluator image `owner seal` is refused.
 
 ## 3. GitHub test repository
 
@@ -173,8 +175,9 @@ tokens or URLs with secrets):
   repo=OWNER/REPO base=main data=… tasks=… agent_image=pi-durable-agent:demo check_image=pi-durable-check:demo`
 - the getMe check, with **`can_read_all_group_messages=false`** while the bot's privacy mode is on (see
   [Privacy mode](#privacy-mode));
-- the container check (Docker and both images available; otherwise task dispatch is disabled and the reason is
-  logged), the git fetch of `main`, restart recovery, the relay on `127.0.0.1`, and polling started;
+- the container check (Docker and the agent and check images available; otherwise task dispatch is disabled and the
+  reason is logged; the evaluator image is checked only by `owner seal`), the git fetch of `main`, restart recovery,
+  the relay on `127.0.0.1`, and polling started;
 - `info coordinator_running group=-100… agents=2`.
 
 The watchdog's terminal shows `info watchdog_database_open`, then for this start `info watchdog_sweep request=…
@@ -302,6 +305,7 @@ node src/cli/main.ts owner unfreeze --env-file .env.local            # recovery 
 node src/cli/main.ts owner resolve 7 --env-file .env.local           # accept uncertain file change 7 as it is now
 node src/cli/main.ts owner conversations --env-file .env.local       # quarantined conversations (optionally: <task>)
 node src/cli/main.ts owner inspect <conversation> --env-file .env.local   # its transcript, opened read-only
+node src/cli/main.ts owner seal --trial trial-1 --env-file .env.local     # trial evaluation (see below)
 ```
 
 Exit codes: 0 done, 1 refused or failed (for example a recovery check failed), 2 configuration error, 3 the
@@ -348,6 +352,75 @@ transcript (inputs, the model's answers and tool calls, tool results) to your te
 anything to the conversation's files (no `-wal` or `-shm` file is created; a WAL left by a killed Pi process is read
 from a private copy that is deleted at once). Control characters are escaped and known secret shapes masked.
 
+## Trial evaluation (sealing)
+
+The trial harness's trigger is the owner CLI: `owner seal` seals the group and has the **isolated evaluator** grade a
+snapshot of `main` with the hidden tests ([docs/security.md](docs/security.md#the-isolated-evaluator)). Nothing in
+Telegram starts it.
+
+1. **Hidden tests.** Put them in a folder outside `PI_DATA_DIR` and `PI_TASK_DIR` (the Coordinator refuses to start
+   otherwise), readable by your user, and point `PI_EVAL_HIDDEN_TESTS_DIR` at it in `.env.local`:
+
+   ```
+   hidden-tests/
+     modules/signup/*.test.js     one suite per folder of modules/ (each module's hidden tests)
+     integration/*.test.js        the signup-flow integration test across agents A and B
+     baseline/*.test.js           behaviour that existed before the trial
+   ```
+
+   Each suite runs in a fresh copy of the snapshot with its folder copied to `hidden-tests/<folder>/` (a
+   `hidden-tests/` folder of the project itself is removed from the copy first), with `node --test` from the copy's
+   root, so a hidden test requires the project as `require("../../signup.js")`. A suite whose
+   folder is missing or holds no `*.test.js` (`.mjs`, `.cjs`) file counts as an error, never as a pass. The suite list
+   itself is fixed in the evaluator image (`deploy/docker/suites.json`, built into `/opt/pi-eval/suites.json`):
+   change the commands there and rebuild the image (`scripts/build-images.sh`) to change how suites run.
+2. **Restart the Coordinator** with the new variable, and let the trial's tasks run, get approved and merge.
+3. **Seal**, in a second terminal:
+
+   ```sh
+   node src/cli/main.ts owner seal --trial trial-1 --env-file .env.local
+   # or name the trial's tasks: owner seal --trial trial-1 --tasks 3,4 --env-file .env.local
+   ```
+
+   The trial's tasks are those named with `--tasks`, else every task of the group created since the last evaluation.
+   The seal is refused (nothing changes) while any of them is not merged, while the group is frozen or already
+   sealing, for a trial id that was evaluated before (a trial is evaluated once, never rerun), or without the hidden
+   tests or the evaluator image; the CLI says why. Otherwise the group turns **sealing** and the bot says so.
+4. **While sealing**, dispatch, merges and follow-up delivery are held across the deployment: `/task` requests are
+   accepted and queued ("Waiting: dispatch is held while the group is sealed…"), `/approve` is accepted and its merge
+   waits, a reply to a running task is saved but not delivered (when that run completes it starts another run of the
+   task, which also waits; if the run fails it expires). Runs and merge tests already in progress finish first.
+   `owner status` shows the progress: `Evaluation in progress: trial trial-1, sealing … waiting for 1 active run to
+   finish`.
+5. Then the Coordinator verifies nothing executes any more (its own kills and the watchdog's sweep), fetches `main`,
+   checks it contains every trial task's merge, exports it read-only to `<PI_TASK_DIR>/snapshots/trial-1-<commit>`
+   (with `trial-1-<commit>.manifest.json`: commit, git tree, content hash) and starts the evaluator container
+   (`pi-durable-evaluator:demo`, no network, 2 vCPU / 2 GiB, the snapshot and hidden tests read-only, a scratch
+   directory under `<PI_TASK_DIR>/eval-scratch/`). The suites run one after another (30-minute deadline).
+6. **The result** is posted to the group, for example `Evaluation of trial trial-1: PASSED. Snapshot of main at
+   1a2b3c4. Trial tasks: Task 3, Task 4. Suites (3 of 3 passed): module:signup passed, integration passed, baseline
+   passed. Dispatch has reopened.`, and recorded: `owner status` shows `Last evaluation: …` with the per-suite
+   outcomes. The database (`evaluations`) also keeps what the trial records: the snapshot's commit and hashes, the
+   Pi Durable, scaffold and Node versions (no patches), the image ids, the tool policy version, the container limits
+   and the hidden tests' hash. Dispatch reopens only after the evaluator container is verified gone and its scratch
+   directory wiped; queued tasks then start.
+
+If the evaluator cannot start, or its cleanup cannot be verified, the group **freezes** instead (the result is still
+recorded): check `docker ps -a --filter label=pi-durable.kind=evaluator` and the scratch folder, then `owner
+unfreeze`. A restart during the evaluation records it as interrupted (not graded) and reopens dispatch once the
+cleanup is verified; seal again with a new trial id. A freeze while sealing ends the sealing without grading.
+
+To look at a failing suite, run the launcher on the snapshot yourself (the same suites, without the container):
+
+```sh
+mkdir -p /tmp/eval-scratch
+node deploy/docker/run-eval.mjs --snapshot "$PI_TASK_DIR/snapshots/trial-1-<commit>" \
+  --hidden /path/to/hidden-tests --scratch /tmp/eval-scratch --suites "$PWD/deploy/docker/suites.json"
+```
+
+It prints one JSON line per suite; the test output itself is discarded (also in the container), so rerun a suite's
+`node --test` by hand in a copy of the snapshot to see it.
+
 ## Where the data lives
 
 - `PI_DATA_DIR` (default `~/.local/state/pi-durable-coordinator`, mode 700): `coordinator.sqlite` (tasks, runs,
@@ -357,7 +430,8 @@ from a private copy that is deleted at once). Control characters are escaped and
   processes), `owner/` (mode 700: the owner socket and its token while the Coordinator runs) and the lock file.
 - `PI_TASK_DIR` (default `<PI_DATA_DIR>/tasks`): `repo.git` (the Coordinator's clone), `worktrees/task-<id>` (one per
   open task; deleted when the task is archived, the branch stays on GitHub), `scratch/` (check scratch space, wiped
-  after each check).
+  after each check), `snapshots/` (the sealed snapshots of trial evaluations, read-only, kept: remove one with
+  `chmod -R u+w` first) and `eval-scratch/` (the evaluator's scratch space, wiped after each evaluation).
 - Disk limits ([docs/configuration.md](docs/configuration.md#disk-limits)): a new `/task` is refused while the disk
   of `PI_DATA_DIR` has less than 1 GiB free (`PI_BOOT_DISK_MIN_FREE`). A task's worktree is created only if it leaves
   1 GiB free on the disk of `PI_TASK_DIR` (`PI_TASK_DISK_MIN_FREE`), counting its files plus 1 GiB of headroom
@@ -373,8 +447,8 @@ from a private copy that is deleted at once). Control characters are escaped and
 1. Stop the Coordinator (Ctrl-C), let the watchdog clean up, stop the watchdog, and check nothing is left behind
    (see [Stop](#stop)); remove leftovers with
    `docker rm -f $(docker ps -aq --filter label=pi-durable.managed=1)`.
-2. Delete the data and task folders: `rm -rf ~/.local/state/pi-durable-coordinator` (or your `PI_DATA_DIR` and
-   `PI_TASK_DIR`).
+2. Delete the data and task folders: `chmod -R u+w ~/.local/state/pi-durable-coordinator && rm -rf
+   ~/.local/state/pi-durable-coordinator` (or your `PI_DATA_DIR` and `PI_TASK_DIR`; sealed snapshots are read-only).
 3. On GitHub, close the test pull requests and delete the `task/*` branches (`gh pr list`, `gh pr close N
    --delete-branch` with your own login); reset `main` of the test repository to the fixture if a test merged into
    it, or recreate the repository.

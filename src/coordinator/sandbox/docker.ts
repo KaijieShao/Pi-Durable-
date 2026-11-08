@@ -17,7 +17,8 @@
  *
  * Deviation from the design text: the agent container is started with --rm (it disappears by itself when its
  * lifetime ends); the check container is not, so its exit state (OOMKilled) can be read before it is removed.
- * STUB(spec: agent-execution.md § Containers, Evaluator column): no evaluator container (sealing is not built).
+ * The evaluator container (Agent Execution § Containers, Evaluator column) is src/coordinator/sandbox/evaluator.ts; it
+ * shares the hardening below (hardeningArgs) and the managed label, so recovery and the watchdog remove it too.
  * Containers also end by themselves (agent: `sleep <lifetime>`; check: the launcher's own deadline); recovery and the
  * watchdog (src/watchdog/reapers.ts, by the pi-durable.managed label) remove every labelled container.
  */
@@ -62,10 +63,10 @@ export const LABEL_KIND = "pi-durable.kind";
 const LAUNCHER_DEADLINE_SLACK_MS = 5_000;
 /** After a stop is requested, the attached docker client gets this long to exit before it is killed. */
 const CLIENT_EXIT_GRACE_MS = 10_000;
-const DOCKER_QUICK_MS = 20_000;
-const DOCKER_START_MS = 60_000;
-const MOUNT_UNSAFE = /[,"\n\r\0]/;
-const USER_PATTERN = /^[1-9]\d*:\d+$/;
+export const DOCKER_QUICK_MS = 20_000;
+export const DOCKER_START_MS = 60_000;
+export const MOUNT_UNSAFE = /[,"\n\r\0]/;
+export const USER_PATTERN = /^[1-9]\d*:\d+$/;
 const DOCKER_ENV_KEYS = [
 	"PATH",
 	"HOME",
@@ -99,7 +100,7 @@ type Ready = {
 	readonly ops: Readonly<Record<string, readonly string[]>>;
 };
 
-type DockerOutput = {
+export type DockerOutput = {
 	readonly code: number | null;
 	readonly stdout: string;
 	readonly stderr: string;
@@ -127,6 +128,44 @@ export function dockerEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Proce
 	const env: NodeJS.ProcessEnv = {};
 	for (const key of DOCKER_ENV_KEYS) if (source[key] !== undefined) env[key] = source[key];
 	return env;
+}
+
+/**
+ * The hardening every container gets (agent, check, evaluator): no pull, no network, read-only root with a small
+ * /tmp tmpfs, all capabilities dropped, no privilege escalation, pids / cpu / memory (no swap) limits, no core dumps,
+ * no Docker log, a non-root user.
+ * STUB(spec: capacity.md § Disk): no per-container disk quota; worktree and scratch writes are bounded only by the
+ * task disk (a separate mount) and the check made before each new worktree (its floor and budget,
+ * engine/task-disk.ts); the read-only root and the 64 MiB /tmp tmpfs keep container writes off the boot disk.
+ */
+export function hardeningArgs(p: { user: string; cpus: number; memoryMiB: number; pids: number }): string[] {
+	return [
+		"--pull",
+		"never",
+		"--network",
+		"none",
+		"--read-only",
+		"--tmpfs",
+		"/tmp:rw,size=64m,mode=1777,nosuid,nodev",
+		"--cap-drop",
+		"ALL",
+		"--security-opt",
+		"no-new-privileges",
+		"--pids-limit",
+		String(p.pids),
+		"--cpus",
+		String(p.cpus),
+		"--memory",
+		`${p.memoryMiB}m`,
+		"--memory-swap",
+		`${p.memoryMiB}m`,
+		"--ulimit",
+		"core=0",
+		"--log-driver",
+		"none",
+		"--user",
+		p.user,
+	];
 }
 
 /** Run one docker command (argv, no shell) with a deadline; output bounded. Never throws. */
@@ -166,7 +205,7 @@ function firstLine(text: string): string {
 	return (text.split("\n").find((line) => line.trim() !== "") ?? "").trim().slice(0, 200);
 }
 
-function describeFailure(output: DockerOutput): string {
+export function describeFailure(output: DockerOutput): string {
 	if (output.spawnFailed) return "docker command not found";
 	if (output.timedOut) return "docker did not answer in time";
 	return firstLine(output.stderr) || `exit ${output.code}`;
@@ -223,36 +262,8 @@ export function createDockerSandbox(options: DockerSandboxOptions): Sandbox {
 		`${LABEL_KIND}=${kind}`,
 	];
 
-	// STUB(spec: capacity.md § Disk): no per-container disk quota; worktree and scratch writes are bounded only by
-	// the task disk (a separate mount) and the check made before each new worktree (its floor and budget,
-	// engine/task-disk.ts); the read-only root and the 64 MiB /tmp tmpfs keep container writes off the boot disk.
-	const hardening = (cpus: number, memoryMiB: number, pids: number): string[] => [
-		"--pull",
-		"never",
-		"--network",
-		"none",
-		"--read-only",
-		"--tmpfs",
-		"/tmp:rw,size=64m,mode=1777,nosuid,nodev",
-		"--cap-drop",
-		"ALL",
-		"--security-opt",
-		"no-new-privileges",
-		"--pids-limit",
-		String(pids),
-		"--cpus",
-		String(cpus),
-		"--memory",
-		`${memoryMiB}m`,
-		"--memory-swap",
-		`${memoryMiB}m`,
-		"--ulimit",
-		"core=0",
-		"--log-driver",
-		"none",
-		"--user",
-		user,
-	];
+	const hardening = (cpus: number, memoryMiB: number, pids: number): string[] =>
+		hardeningArgs({ user, cpus, memoryMiB, pids });
 
 	const configProblem = (): string | undefined => {
 		if (!USER_PATTERN.test(user)) return "container user must be uid:gid with a non-root uid";
@@ -701,5 +712,6 @@ export function createDockerSandbox(options: DockerSandboxOptions): Sandbox {
 		checkOps: () => knownOps,
 		killAll,
 		live,
+		images: () => (ready === undefined ? undefined : { agent: ready.agentImageId, check: ready.checkImageId }),
 	};
 }

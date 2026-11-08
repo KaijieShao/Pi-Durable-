@@ -88,6 +88,14 @@ export type Git = {
 	 * 4 KiB blocks (an empty file counts one block); submodules count nothing (Capacity § Disk, src/coordinator/disk.ts).
 	 */
 	checkoutBytes(rev: string): Promise<number>;
+	/** The tree id of commit `rev` (the git object hash of its content). */
+	treeId(rev: string): Promise<string>;
+	/**
+	 * Write the files of commit `rev` into `dest`, an existing empty directory inside the task directory (not the
+	 * repository): the tree `git archive` would hold, without any git data. Through a scratch index (read-tree, then
+	 * checkout-index into `dest`), so git's own path checks apply and the repository's index is never touched.
+	 */
+	exportTree(rev: string, dest: string): Promise<void>;
 	/** refs/remotes/origin/<base> */
 	readonly baseRef: string;
 };
@@ -739,6 +747,24 @@ export function createGit(options: GitOptions): Git {
 		return total;
 	}
 
+	async function exportCommit(rev: string, dest: string): Promise<void> {
+		assertRev(rev);
+		const target = resolve(dest);
+		await assertDeletable(target);
+		if (!(await lstat(target)).isDirectory()) throw new GitError("failed", "export target is not a directory");
+		const indexFile = join(repoDir, `pi-export-${randomBytes(8).toString("hex")}.index`);
+		try {
+			await exec([...repo, "read-tree", `${rev}^{tree}`], { op: "read-tree", indexFile });
+			await exec([...repo, "--work-tree", target, "checkout-index", "--all", "--force"], {
+				op: "checkout-index",
+				indexFile,
+			});
+		} finally {
+			await rm(indexFile, { force: true });
+			await rm(`${indexFile}.lock`, { force: true });
+		}
+	}
+
 	const wtKey = (path: string) => `wt:${resolve(path)}`;
 
 	return {
@@ -771,6 +797,11 @@ export function createGit(options: GitOptions): Git {
 		uncommittedChanges: (path) => serialized(wtKey(path), () => uncommitted(path)),
 		showFile: (rev, file) => show(rev, file),
 		checkoutBytes: (rev) => checkout(rev),
+		treeId: async (rev) => {
+			assertRev(rev);
+			return (await exec([...repo, "rev-parse", "--verify", `${rev}^{tree}`], { op: "rev-parse" })).stdout.trim();
+		},
+		exportTree: (rev, dest) => serialized("repo", () => exportCommit(rev, dest)),
 	};
 }
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Sealing and the isolated evaluator** (the trial harness): `owner seal [<group>] [--trial <id>] [--tasks <id,...>]`
+  seals the group once the trial's tasks (named, or every task since the last evaluation) have merged. Dispatch,
+  merges and follow-up delivery are then held deployment-wide (new `/task` requests and replies are saved and queued),
+  the runs and merge tests in progress finish, execution is verified stopped, and a read-only snapshot of main (with a
+  manifest and content hash, under `<PI_TASK_DIR>/snapshots/`) is graded by the new trusted evaluator image
+  (`pi-durable-evaluator:demo`, built by `scripts/build-images.sh`): no network, no credentials, 2 vCPU / 2 GiB, the
+  snapshot and the hidden tests read-only plus scratch, each module's hidden tests, the integration test and the
+  baseline suite one after another. The per-suite result and what the trial records (versions, image digests, tool
+  policy version, container limits) are stored and posted, and dispatch reopens only after the evaluator has exited
+  and its cleanup is verified; an evaluator that cannot start or a cleanup that cannot be verified freezes the group.
+  New `PI_EVAL_HIDDEN_TESTS_DIR` (outside the data and task directories) and `EVALUATOR_IMAGE`; `owner status` shows
+  the sealing progress and the last evaluation. Schema version 4 (table `evaluations`).
+
 - **Breaking: the private-chat gateway is replaced by a multi-user group Coordinator.** One configured Telegram group
   (and optional topic) submits `/task <agent> <text>` to configured agent ids; replies to the bot's task messages are
   follow-ups (steered while a run is busy, another run while the task is in review); `/status`, `/cancel` and

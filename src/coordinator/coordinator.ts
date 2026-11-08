@@ -15,8 +15,8 @@
  * Secrets stay in `config` (memory only) and go only to the relay (model key), git/GitHub (GitHub token) and the
  * Telegram client (bot token); each Pi process gets only its run key. Production defaults: Docker sandbox, Pi
  * processes as transient systemd units in the Pi slice as the Pi user on Linux (PI_RUNNER_ISOLATION=systemd; the
- * weaker local "process" mode elsewhere), real git and GitHub, real Telegram, DEMO_LIMITS; the local test sandbox is
- * only ever passed in by tests.
+ * weaker local "process" mode elsewhere), real git and GitHub, real Telegram, DEMO_LIMITS, the Docker evaluator (used only
+ * after `owner seal`); the local test sandbox and the local test evaluator are only ever passed in by tests.
  */
 import { closeSync, openSync } from "node:fs";
 import { chmod, mkdir, stat } from "node:fs/promises";
@@ -35,11 +35,12 @@ import { type OutboxSender, startOutbox } from "./outbox.ts";
 import { removeScratchCopies } from "./owner/inspect.ts";
 import { ownerService } from "./owner/service.ts";
 import { type OwnerSocket, startOwnerSocket } from "./owner/socket.ts";
-import type { GitHubApi, RunLauncher, Sandbox, TelegramApi, WatchdogLink } from "./ports.ts";
+import type { Evaluator, GitHubApi, RunLauncher, Sandbox, TelegramApi, WatchdogLink } from "./ports.ts";
 import { startRelay } from "./relay.ts";
 import { createRunLauncher } from "./runner-launcher.ts";
 import { createSystemdRunLauncher } from "./runner-systemd.ts";
 import { createDockerSandbox } from "./sandbox/docker.ts";
+import { createDockerEvaluator } from "./sandbox/evaluator.ts";
 import { shareState } from "./state-share.ts";
 import { Store } from "./store.ts";
 import { createTelegramApi } from "./telegram/api.ts";
@@ -56,6 +57,11 @@ export type CoordinatorDeps = {
 	readonly github?: GitHubApi;
 	readonly git?: Git;
 	readonly sandbox?: Sandbox;
+	/**
+	 * Tests only: the isolated evaluator (a local test evaluator, sandbox/local.ts). Production always builds the Docker
+	 * evaluator from the config (EVALUATOR_IMAGE, CONTAINER_USER, DOCKER_BIN); there is no setting for another one.
+	 */
+	readonly evaluator?: Evaluator;
 	readonly launcher?: RunLauncher;
 	/** Tests only: shorter deadlines, smaller caps. Production always uses DEMO_LIMITS. */
 	readonly limits?: Limits;
@@ -346,6 +352,15 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 			...fetchOption(deps),
 		});
 	let outboxKick: () => void = () => {};
+	const evaluator =
+		deps.evaluator ??
+		createDockerEvaluator({
+			bin: config.docker.bin,
+			image: config.evaluation.image,
+			user: config.docker.user,
+			limits,
+			log,
+		});
 	const engine = createEngine({
 		store,
 		config,
@@ -354,6 +369,7 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 		github,
 		sandbox,
 		launcher,
+		evaluator,
 		log,
 		now,
 		onOutbox: () => outboxKick(),

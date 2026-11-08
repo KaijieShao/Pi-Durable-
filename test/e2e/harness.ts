@@ -35,10 +35,10 @@ import { type Coordinator, startCoordinator } from "../../src/coordinator/coordi
 import type { DiskProbe } from "../../src/coordinator/disk.ts";
 import { createGit, type Git } from "../../src/coordinator/git.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
-import type { RunLauncher, Sandbox } from "../../src/coordinator/ports.ts";
+import type { Evaluator, RunLauncher, Sandbox } from "../../src/coordinator/ports.ts";
 import { createRunLauncher } from "../../src/coordinator/runner-launcher.ts";
 import { createSystemdRunLauncher } from "../../src/coordinator/runner-systemd.ts";
-import { createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
+import { createLocalEvaluator, createLocalSandbox, type LocalCheck } from "../../src/coordinator/sandbox/local.ts";
 import type { Row } from "../../src/coordinator/store.ts";
 import type { WatchdogTimings } from "../../src/coordinator/watchdog-link.ts";
 import { createLogger, type Logger, silentLogger } from "../../src/runtime/log.ts";
@@ -46,6 +46,7 @@ import { dockerContainerReaper, type Reaper } from "../../src/watchdog/reapers.t
 import type { Watchdog } from "../../src/watchdog/watchdog.ts";
 import { FakeBotApi, type ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { sleep } from "../helpers/env.ts";
+import { hostLauncher, makeWritable } from "../helpers/evaluator.ts";
 import { createOriginRepo, FakeGitHub, originGit } from "../helpers/fake-github.ts";
 import { type FakeHandler, FakeModel, type FakeStep } from "../helpers/fake-model.ts";
 import { createSystemdShims, prepareSystemdLayout, type SystemdShims, testAccounts } from "../helpers/systemd-shims.ts";
@@ -102,7 +103,22 @@ export type StackOptions = {
 	 * Wrappers around the real git module (built as the Coordinator would build it) and the local sandbox, e.g. to
 	 * hold one step of a run's start. The wrapped objects go in as deps.git / deps.sandbox and survive restart().
 	 */
-	readonly wrap?: { readonly git?: (git: Git) => Git; readonly sandbox?: (sandbox: Sandbox) => Sandbox };
+	readonly wrap?: {
+		readonly git?: (git: Git) => Git;
+		readonly sandbox?: (sandbox: Sandbox) => Sandbox;
+		readonly evaluator?: (evaluator: Evaluator) => Evaluator;
+	};
+	/**
+	 * Hidden tests (path → content) written to `<dir>/hidden` (outside the data and task directories), which the stack
+	 * configures as PI_EVAL_HIDDEN_TESTS_DIR. Without them PI_EVAL_HIDDEN_TESTS_DIR is unset (sealing is refused).
+	 */
+	readonly hiddenTests?: Readonly<Record<string, string>>;
+	/**
+	 * The isolated evaluator (deps.evaluator, TEST ONLY): by default, with the local sandbox, the local test evaluator
+	 * running the image's launcher and suite list on the host (test/helpers/evaluator.ts hostLauncher). With
+	 * `sandbox: "docker"` none is injected: the Coordinator builds the production Docker evaluator.
+	 */
+	readonly evaluator?: Evaluator;
 	/** "in-process" (default): the real watchdog core in this process. "none": no watchdog runs. */
 	readonly watchdog?: "in-process" | "none";
 	/** Coordinator-side watchdog timings (deps.watchdog; production: 30 s answer, 15 s heartbeat). */
@@ -232,6 +248,21 @@ function stackConfig(dir: string, urls: { bot: string; github: string; model: st
 
 export type Stack = Awaited<ReturnType<typeof startStack>>;
 
+/** The hidden tests under `<dir>/hidden` and the variable naming them, or nothing. */
+async function writeHiddenTests(
+	dir: string,
+	files: Readonly<Record<string, string>> | undefined,
+): Promise<Record<string, string>> {
+	if (files === undefined) return {};
+	const root = join(dir, "hidden");
+	for (const [path, content] of Object.entries(files)) {
+		await mkdir(join(root, path, ".."), { recursive: true });
+		await writeFile(join(root, path), content);
+	}
+	await mkdir(root, { recursive: true });
+	return { PI_EVAL_HIDDEN_TESTS_DIR: root };
+}
+
 /** `{ [key]: value }`, or nothing when the value is undefined (an optional dependency). */
 function optional<K extends string, V>(key: K, value: V | undefined): { [P in K]?: V } {
 	return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
@@ -325,6 +356,13 @@ function stackLauncher(
 
 export type { SystemdShims };
 
+/** deps.evaluator: the test's, or the local test evaluator with the host launcher (none for the Docker variants). */
+function stackEvaluator(options: StackOptions): Evaluator | undefined {
+	const base =
+		options.evaluator ?? (options.sandbox === "docker" ? undefined : createLocalEvaluator({ run: hostLauncher }));
+	return base === undefined ? undefined : (options.wrap?.evaluator?.(base) ?? base);
+}
+
 export async function startStack(options: StackOptions = {}) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-e2e-"));
 	const bot = new FakeBotApi();
@@ -336,12 +374,18 @@ export async function startStack(options: StackOptions = {}) {
 	if (options.model !== undefined) model.script(options.model);
 	const urls = { bot: await bot.start(), github: await github.start(), model: await model.start() };
 	const containerUser = await dockerVariantEnv(options, dir);
+	const hiddenEnv = await writeHiddenTests(dir, options.hiddenTests);
 	const shims = options.runner === "systemd" ? await createSystemdShims(join(dir, "systemd")) : undefined;
 	const systemdEnv: Record<string, string> =
 		shims === undefined
 			? {}
 			: { PI_RUNNER_ISOLATION: "systemd", SYSTEMD_RUN_BIN: shims.systemdRun, SYSTEMCTL_BIN: shims.systemctl };
-	const config: CoordinatorConfig = stackConfig(dir, urls, { ...containerUser, ...systemdEnv, ...options.env });
+	const config: CoordinatorConfig = stackConfig(dir, urls, {
+		...containerUser,
+		...systemdEnv,
+		...hiddenEnv,
+		...options.env,
+	});
 	if (shims !== undefined) await prepareSystemdLayout(config.paths.dataDir);
 	const log = stackLogger();
 	const limits: Limits = { ...DEMO_LIMITS, ...options.limits };
@@ -353,6 +397,7 @@ export async function startStack(options: StackOptions = {}) {
 		return options.wrap?.sandbox?.(created) ?? created;
 	};
 	const localSandbox = options.sandbox === "docker" ? undefined : local();
+	const evaluator = stackEvaluator(options);
 	const watchdog = inProcessWatchdog(config, localSandbox, { log, limits, options });
 	const wrapGit = options.wrap?.git;
 	const wrappedGit =
@@ -373,6 +418,7 @@ export async function startStack(options: StackOptions = {}) {
 	const deps = {
 		remoteUrl: origin.bare,
 		...optional("sandbox", localSandbox),
+		...optional("evaluator", evaluator),
 		...wrappedGit,
 		...stackLauncher(options.runner, config, log),
 		limits,
@@ -392,6 +438,8 @@ export async function startStack(options: StackOptions = {}) {
 	const stopFakes = async (): Promise<void> => {
 		await watchdog.stop();
 		await Promise.allSettled([model.stop(), github.stop(), bot.stop()]);
+		// Sealed snapshots are read-only (directories 0555): writable again so the temp dir can go.
+		await makeWritable(join(config.paths.taskDir, "snapshots"));
 		await rm(dir, { recursive: true, force: true });
 	};
 	// The watchdog runs before the Coordinator (as its unit does): recovery waits for its verified sweep.

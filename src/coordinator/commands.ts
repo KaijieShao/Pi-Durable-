@@ -30,6 +30,7 @@ import {
 	TASK_DISK_WAIT_KEY,
 	taskDiskToldKey,
 } from "./disk.ts";
+import { deploymentHeld } from "./evaluation.ts";
 import type { Limits } from "./limits.ts";
 import {
 	approved,
@@ -38,6 +39,7 @@ import {
 	cannotFollowUp,
 	emptyText,
 	followupExpired,
+	followupHeld,
 	followupLimit,
 	followupStarted,
 	followupSteered,
@@ -62,6 +64,7 @@ import {
 	runAdmitted,
 	runStopping,
 	type StatusTaskLine,
+	sealingWait,
 	staleHead,
 	statusDetail,
 	statusSummary,
@@ -392,12 +395,14 @@ function steerFollowup(store: Store, task: TaskRow, reply: ReplyMessage, text: s
 	bumpFollowups(store, task.id, now);
 	const running = run.state !== "queued";
 	const position = running ? 0 : agentQueuePosition(store, run.id);
+	// Sealing holds follow-up delivery (Architecture § Sealing): saved now, delivered or run only after the evaluation.
+	const held = running && deploymentHeld(store);
 	return {
 		kind: "followup",
 		outcome: "accepted",
-		code: "steer",
+		code: held ? "steer_held" : "steer",
 		taskId: task.id,
-		reply: followupSteered({ taskId: task.id, running, position }),
+		reply: held ? followupHeld(task.id) : followupSteered({ taskId: task.id, running, position }),
 		kick: true,
 	};
 }
@@ -586,11 +591,13 @@ function onApprove(store: Store, ctx: CommandContext, cmd: CommandMessage): Resu
 			approvalId,
 		)?.n ?? 1;
 	const testsPassed = task.tests_passed_head === head;
+	// Merges are held while sealing (Architecture § Sealing); this one waits until dispatch reopens.
+	const held = deploymentHeld(store);
 	return {
 		kind: "approve",
 		outcome: "accepted",
 		taskId: task.id,
-		reply: approved({ taskId: task.id, head, position, testsPassed }),
+		reply: approved({ taskId: task.id, head, position, testsPassed, held }),
 		kick: true,
 	};
 }
@@ -762,8 +769,7 @@ function waitNote(
 	limits: Limits,
 	p: { chatId: number; agent: string; initial: boolean },
 ): string | undefined {
-	const group = store.groupState(p.chatId);
-	if (group.state === "sealing") return "Waiting: dispatch is held while the group is sealed";
+	if (deploymentHeld(store)) return sealingWait();
 	if (p.initial) {
 		const open = openTaskCount(store, p.chatId);
 		if (open >= limits.openTasksPerGroup) return waitingForReviews(open);

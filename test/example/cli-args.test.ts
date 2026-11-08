@@ -11,7 +11,7 @@ import { type CoordinatorHandle, EXIT, runCoordinatorCli, startupExitCode } from
 import { ConfigError, loadOwnerConfig } from "../../src/coordinator/config.ts";
 import { ownerFailedEvents, ownerStatus } from "../../src/coordinator/owner/report.ts";
 import { TelegramError } from "../../src/coordinator/ports.ts";
-import { Store } from "../../src/coordinator/store.ts";
+import { SCHEMA_VERSION, Store } from "../../src/coordinator/store.ts";
 import { LockHeld } from "../../src/runtime/lock.ts";
 import { createLogger } from "../../src/runtime/log.ts";
 import "../helpers/env.ts";
@@ -82,6 +82,20 @@ test("argv: run, watchdog, the owner commands, help, version; login is gone", ()
 		action: "inspect",
 		conversation: "0c8e-41",
 	});
+	assert.deepEqual(parseArgs(["owner", "seal"]), { command: "owner", action: "seal" });
+	assert.deepEqual(parseArgs(["owner", "seal", "-1001234567890", "--trial", "trial-3", "--tasks", "4,5"]), {
+		command: "owner",
+		action: "seal",
+		group: -1001234567890,
+		trial: "trial-3",
+		tasks: [4, 5],
+	});
+	assert.deepEqual(parseArgs(["owner", "seal", "--trial=t1", "--env-file", "/e"]), {
+		command: "owner",
+		action: "seal",
+		trial: "t1",
+		envFile: "/e",
+	});
 	for (const argv of [
 		["login", "anthropic"],
 		["owner"],
@@ -95,6 +109,13 @@ test("argv: run, watchdog, the owner commands, help, version; login is gone", ()
 		["owner", "conversations", "-3"],
 		["owner", "inspect"],
 		["owner", "inspect", "../etc"],
+		["owner", "seal", "now"],
+		["owner", "seal", "--trial"],
+		["owner", "seal", "--trial", "../x"],
+		["owner", "seal", "--tasks", "1,x"],
+		["owner", "seal", "--tasks", "0"],
+		["owner", "status", "--trial", "t1"],
+		["owner", "unfreeze", "--tasks", "1"],
 		["owner", "toString"],
 		["run", "now"],
 		["watchdog", "now"],
@@ -111,6 +132,7 @@ test("argv: run, watchdog, the owner commands, help, version; login is gone", ()
 		"resolve <change>",
 		"conversations \\[<task>\\]",
 		"inspect <conversation>",
+		"seal \\[<group>\\] \\[--trial <id>\\] \\[--tasks <id,...>\\]",
 	])
 		assert.match(USAGE, new RegExp(`owner ${command}`));
 	assert.match(USAGE, /watchdog \[--env-file <path>\]/);
@@ -469,7 +491,7 @@ test("the read-only fallback never migrates or writes: a database of another sch
 		const before = files(dir);
 		assert.throws(
 			() => new Store(join(dir, COORDINATOR_DB), Date.now, { readOnly: true }),
-			/has schema 2; this version reads schema 3/,
+			new RegExp(`has schema 2; this version reads schema ${SCHEMA_VERSION}`),
 		);
 		const err: string[] = [];
 		const code = await runOwnerCommand(
@@ -554,10 +576,10 @@ test("owner status reports both disks: free space, the limits applied, and what 
 			status,
 			/\n {2}Pi raw-content store \(conversations\/\): (6[4-9]|[7-9]\d|1\d\d) KiB in 1 files, 1 conversations; no retention rule/,
 		);
-		assert.match(status, /\n {2}Metadata logs: stdout and stderr .*not measured\n {2}Retained trials: none/);
+		assert.match(status, /\n {2}Metadata logs: stdout and stderr .*not measured\nTask disk/);
 		assert.match(
 			status,
-			/\nTask disk \(PI_TASK_DIR, not a mount point\): .* free of .*, .* under PI_TASK_DIR in use; \d+ worktrees; budget none \(the disk's own size\); a new worktree needs its files \+ 1\.0 GiB headroom and 1\.0 GiB must stay free/,
+			/\nTask disk \(PI_TASK_DIR, not a mount point\): .* free of .*, .* under PI_TASK_DIR in use; \d+ worktrees; budget none \(the disk's own size\); a new worktree needs its files \+ 1\.0 GiB headroom and 1\.0 GiB must stay free\n {2}Retained trials \(PI_TASK_DIR\/snapshots\): 0 sealed snapshots, 0 bytes; kept/,
 		);
 		assert.ok(!status.includes("New worktrees are held"));
 

@@ -238,6 +238,11 @@ test("bad requests get their reason: not JSON, not an object, another version, a
 		[JSON.stringify({ v: 1, token, command: "resolve", intents: [1, -2] }), /resolve needs 1 to 100/],
 		[JSON.stringify({ v: 1, token, command: "conversations", task: 0 }), /task must be a task number/],
 		[JSON.stringify({ v: 1, token, command: "inspect", conversation: "../../etc/passwd" }), /needs a conversation id/],
+		[JSON.stringify({ v: 1, token, command: "seal" }), /seal needs a group chat id/],
+		[JSON.stringify({ v: 1, token, command: "seal", group: -1, trial: "../x" }), /a trial id is letters/],
+		[JSON.stringify({ v: 1, token, command: "seal", group: -1, trial: 7 }), /a trial id is letters/],
+		[JSON.stringify({ v: 1, token, command: "seal", group: -1, tasks: [] }), /tasks must be 1 to 100 task numbers/],
+		[JSON.stringify({ v: 1, token, command: "seal", group: -1, tasks: [1, 0] }), /tasks must be 1 to 100 task numbers/],
 	];
 	for (const [line, reason] of cases) {
 		const response = await ask(line);
@@ -256,6 +261,15 @@ test("bad requests get their reason: not JSON, not an object, another version, a
 		token,
 		request: { command: "unfreeze", group: -1001 },
 	});
+	assert.deepEqual(parseOwnerRequest(JSON.stringify({ v: 1, token, command: "seal", group: -1001 })), {
+		ok: true,
+		token,
+		request: { command: "seal", group: -1001 },
+	});
+	assert.deepEqual(
+		parseOwnerRequest(JSON.stringify({ v: 1, token, command: "seal", group: -1001, trial: "t-1.a", tasks: [4, 3, 4] })),
+		{ ok: true, token, request: { command: "seal", group: -1001, trial: "t-1.a", tasks: [4, 3] } },
+	);
 });
 
 test("limits: a request over the size limit is refused and the connection closed; an incomplete one times out; one request per connection", async () => {

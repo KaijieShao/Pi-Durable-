@@ -9,6 +9,7 @@
  *             {"v":1,"token":"<hex>","command":"failed-events"}
  *             {"v":1,"token":"<hex>","command":"conversations","task":12}      (task optional)
  *             {"v":1,"token":"<hex>","command":"inspect","conversation":"<uuid>"}
+ *             {"v":1,"token":"<hex>","command":"seal","group":-100123,"trial":"t1","tasks":[3,4]}  (trial, tasks optional)
  *   response  {"ok":true,"text":"..."}  or  {"ok":false,"error":"<code>","text":"..."}
  *
  * Who may connect (src/coordinator/owner/socket.ts): the socket lives in its own directory, mode 0700, owned by the
@@ -52,7 +53,15 @@ export type OwnerRequest =
 	| { readonly command: "resolve"; readonly intents: readonly number[] }
 	| { readonly command: "failed-events" }
 	| { readonly command: "conversations"; readonly task?: number }
-	| { readonly command: "inspect"; readonly conversation: string };
+	| { readonly command: "inspect"; readonly conversation: string }
+	| {
+			readonly command: "seal";
+			readonly group: number;
+			/** The trial id; the Coordinator picks trial-<n> when absent. */
+			readonly trial?: string;
+			/** The trial's tasks; absent: every task of the group since the last evaluation. */
+			readonly tasks?: readonly number[];
+	  };
 
 export type OwnerCommandName = OwnerRequest["command"];
 
@@ -77,6 +86,9 @@ export type ParsedRequest =
 const CONVERSATION_ID = /^[A-Za-z0-9-]{1,64}$/;
 const TOKEN = /^[0-9a-f]{64}$/;
 const MAX_INTENTS = 100;
+/** A trial id (src/coordinator/evaluation.ts TRIAL_ID). */
+const TRIAL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MAX_TRIAL_TASKS = 100;
 
 const bad = (text: string): ParsedRequest => ({ ok: false, error: "bad_request", text });
 
@@ -107,9 +119,26 @@ function commandOf(fields: Fields): OwnerRequest | string {
 			return typeof fields.conversation === "string" && CONVERSATION_ID.test(fields.conversation)
 				? { command: "inspect", conversation: fields.conversation }
 				: "inspect needs a conversation id";
+		case "seal":
+			return sealOf(fields);
 		default:
 			return "unknown command";
 	}
+}
+
+function sealOf(fields: Fields): OwnerRequest | string {
+	if (!isChatId(fields.group)) return "seal needs a group chat id";
+	const { trial, tasks } = fields;
+	if (trial !== undefined && (typeof trial !== "string" || !TRIAL.test(trial)))
+		return "a trial id is letters, digits, '.', '_' or '-' (at most 64, starting with a letter or digit)";
+	const taskList = Array.isArray(tasks) && tasks.length > 0 && tasks.length <= MAX_TRIAL_TASKS && tasks.every(isId);
+	if (tasks !== undefined && !taskList) return `tasks must be 1 to ${MAX_TRIAL_TASKS} task numbers`;
+	return {
+		command: "seal",
+		group: fields.group,
+		...(trial === undefined ? {} : { trial: trial as string }),
+		...(tasks === undefined ? {} : { tasks: [...new Set(tasks as number[])] }),
+	};
 }
 
 function intentsOf(value: unknown): OwnerRequest | string {

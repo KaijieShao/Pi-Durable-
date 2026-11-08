@@ -16,7 +16,7 @@ import { splitTelegramText } from "./telegram/split.ts";
  * same. The Coordinator and the watchdog open this file each with their own connection; whichever comes first
  * migrates, inside one `BEGIN IMMEDIATE` transaction (the other waits, then finds the current version).
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** Version 1 of the schema, exactly as it shipped (exported for the upgrade test). */
 export const SCHEMA_V1 = `
@@ -275,6 +275,39 @@ CREATE TABLE effect_intents (
 );
 CREATE INDEX effect_intents_task ON effect_intents(task_id, state);
 CREATE INDEX effect_intents_run ON effect_intents(run_id);
+`,
+	// 3 → 4: sealing and the isolated evaluator (Architecture § Sealing, § Isolated evaluator; Evaluation § What's
+	// Graded, § Frozen Before Trial 1; src/coordinator/engine/seal.ts). One row per trial evaluation: its phase while
+	// the group is sealed (sealing → snapshot → evaluating → cleanup → done), the trial's tasks fixed at the request,
+	// the sealed snapshot (commit, git tree, content hash, path), the evaluator's per-suite outcomes and what the trial
+	// records (versions, image digests, tool policy version, container limits). Metadata only: no test output.
+	`
+CREATE TABLE evaluations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,                     -- the sealed group
+  trial TEXT NOT NULL UNIQUE,                   -- the trial id; a trial is evaluated once (never rerun or replaced)
+  state TEXT NOT NULL CHECK (state IN ('sealing','snapshot','evaluating','cleanup','done')),
+  detail TEXT,                                  -- what the current phase waits for (fixed words and counts)
+  tasks TEXT NOT NULL,                          -- JSON array of the trial's task ids, fixed at the request
+  tasks_named INTEGER NOT NULL DEFAULT 0,       -- 1: named in the request; 0: every task since the last evaluation
+  last_task_id INTEGER NOT NULL,                -- highest task id at the request (the next trial's tasks are later)
+  requested_at INTEGER NOT NULL,
+  sealed_at INTEGER,                            -- everything finalized and execution verified stopped
+  snapshot_commit TEXT,
+  snapshot_tree TEXT,                           -- the commit's git tree id
+  snapshot_hash TEXT,                           -- sha256 over the exported files ("sha256:<hex>")
+  snapshot_path TEXT,
+  scratch_path TEXT,                            -- the evaluator's scratch directory, wiped (and verified) after
+  started_ok INTEGER CHECK (started_ok IN (0, 1)),
+  started_at INTEGER,
+  finished_at INTEGER,
+  outcome TEXT CHECK (outcome IN ('passed','not_passed','interrupted','error')),
+  reason TEXT,
+  suites TEXT,                                  -- JSON [{name, outcome, exitCode, durationMs}]
+  facts TEXT,                                   -- JSON: versions, image digests, tool policy version, limits
+  cleanup_verified INTEGER CHECK (cleanup_verified IN (0, 1))
+);
+CREATE INDEX evaluations_state ON evaluations(state);
 `,
 ];
 

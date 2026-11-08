@@ -15,11 +15,16 @@
  *   conversations [task]  quarantined conversations of the group.
  *   inspect <conversation>  a quarantined conversation's transcript, read without writing (owner/inspect.ts). The
  *                       transcript goes back over the socket to the owner's terminal only; the log gets its size.
+ *   seal <group> [trial] [tasks]  the trial harness's trigger (Architecture § Sealing: "Evaluation runs only in the
+ *                       trial harness"): the group turns sealing and the isolated evaluator grades a snapshot of main
+ *                       (engine/seal.ts), or the request is refused with the reason. It answers once sealing started;
+ *                       status shows the progress and the result.
  */
 import { join } from "node:path";
 import { errorSummary, type Logger } from "../../runtime/log.ts";
 import type { CoordinatorConfig } from "../config.ts";
-import type { Engine, UnfreezeOutcome } from "../engine.ts";
+import type { Engine, SealOutcome, UnfreezeOutcome } from "../engine.ts";
+import { taskList } from "../evaluation.ts";
 import type { Store } from "../store.ts";
 import { diskReport } from "./disk-report.ts";
 import { inspectConversation } from "./inspect.ts";
@@ -105,6 +110,32 @@ async function unfreeze(deps: OwnerServiceDeps, group: number): Promise<OwnerRes
 	return unfreezeText(chatId, await engine.unfreeze());
 }
 
+function sealText(group: number, outcome: SealOutcome): OwnerResponse {
+	if (outcome.kind === "refused")
+		return refuse("refused", `Sealing of group ${group} refused: ${outcome.reason}. Nothing changed.`);
+	const which = outcome.named ? "named" : "every task of the group since the last evaluation";
+	const text = [
+		`Sealing started for trial ${outcome.trial} (group ${group}). Trial tasks (${which}): ${taskList(outcome.tasks)}, all merged.`,
+		"Dispatch, merges and follow-up delivery are held deployment-wide until the evaluator has exited and its cleanup",
+		"is verified; /task requests and replies are saved and queued meanwhile. Runs and merge tests in progress finish",
+		"first, then a snapshot of main is graded. owner status shows the progress and, at the end, the result.",
+	].join("\n");
+	return { ok: true, text };
+}
+
+async function seal(
+	deps: OwnerServiceDeps,
+	request: Extract<OwnerRequest, { command: "seal" }>,
+): Promise<OwnerResponse> {
+	const chatId = deps.config.telegram.groupChatId;
+	if (request.group !== chatId)
+		return refuse("refused", `This Coordinator serves group ${chatId} only, not ${request.group}.`);
+	const engine = deps.engine();
+	if (engine === undefined)
+		return refuse("unavailable", "The Coordinator is still starting (recovery in progress); try again in a moment.");
+	return sealText(chatId, await engine.seal({ trial: request.trial, tasks: request.tasks }));
+}
+
 type IntentState = { id: number; task_id: number; state: string; path: string | null; operation: string | null };
 
 /** Record the owner's resolution of unresolved file changes of this group; each other number is reported as such. */
@@ -184,6 +215,8 @@ export function ownerService(deps: OwnerServiceDeps): (request: OwnerRequest) =>
 					return { ok: true, text: ownerConversations(deps.store, chatId, request.task) };
 				case "inspect":
 					return await inspect(deps, request.conversation);
+				case "seal":
+					return await seal(deps, request);
 			}
 		} catch (error) {
 			deps.log.error("owner_command_failed", { command: request.command, error: errorSummary(error) });

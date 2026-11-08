@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseEnv } from "node:util";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
@@ -102,6 +102,20 @@ export type CoordinatorConfig = {
 		readonly checkImage: string;
 		/** uid:gid the containers run as; never root. */
 		readonly user: string;
+	};
+	/**
+	 * The isolated evaluator (Architecture § Isolated evaluator; src/coordinator/engine/seal.ts), started only after the
+	 * owner seals the group (`owner seal`).
+	 */
+	readonly evaluation: {
+		/**
+		 * PI_EVAL_HIDDEN_TESTS_DIR: the hidden tests on the host, mounted read-only in the evaluator container only (Agent
+		 * Execution § Protected files: never in an agent or check container). Outside PI_DATA_DIR and PI_TASK_DIR (whose
+		 * worktrees and scratch the agent and check containers mount). Unset: sealing is refused.
+		 */
+		readonly hiddenTestsDir: string | undefined;
+		/** EVALUATOR_IMAGE: the trusted evaluator image (default pi-durable-evaluator:demo, scripts/build-images.sh). */
+		readonly image: string;
 	};
 	readonly relay: {
 		/** 127.0.0.1 port; 0 = ephemeral. */
@@ -297,7 +311,7 @@ function parseLocal(
 	env: Env,
 	out: Collector,
 	defaults: Defaults,
-): Pick<CoordinatorConfig, "paths" | "docker" | "relay" | "setupScript" | "logLevel"> {
+): Pick<CoordinatorConfig, "paths" | "docker" | "evaluation" | "relay" | "setupScript" | "logLevel"> {
 	const dataDir = dataDirFrom(env.PI_DATA_DIR, defaults);
 	const taskDir = taskDirFrom(env, dataDir, defaults.cwd);
 	const user = parseContainerUser(env, out, defaults);
@@ -316,10 +330,44 @@ function parseLocal(
 			checkImage: nonEmpty(env.CHECK_IMAGE) ?? "pi-durable-check:demo",
 			user,
 		},
+		evaluation: {
+			hiddenTestsDir: parseHiddenTests(env, out, { dataDir, taskDir, cwd: defaults.cwd }),
+			image: nonEmpty(env.EVALUATOR_IMAGE) ?? "pi-durable-evaluator:demo",
+		},
 		relay: { port: parseInteger(env, "RELAY_PORT", out, { fallback: 0, allowZero: true }) },
 		setupScript,
 		logLevel,
 	};
+}
+
+/** True if `a` and `b` are the same directory or one contains the other (resolved paths, textually). */
+export function pathsOverlap(a: string, b: string): boolean {
+	const inside = (child: string, parent: string) =>
+		child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+	return inside(a, b) || inside(b, a);
+}
+
+/**
+ * PI_EVAL_HIDDEN_TESTS_DIR, resolved from `cwd`. It must not overlap PI_DATA_DIR or PI_TASK_DIR: the agent and check
+ * containers mount worktrees and scratch space from the task directory, so hidden tests there could be reached by a
+ * path or alias (Agent Execution § Protected files: "never mounted in any agent or run_check container view").
+ */
+function parseHiddenTests(
+	env: Env,
+	out: Collector,
+	where: { readonly dataDir: string; readonly taskDir: string; readonly cwd: string },
+): string | undefined {
+	const raw = nonEmpty(env.PI_EVAL_HIDDEN_TESTS_DIR);
+	if (raw === undefined) return undefined;
+	const dir = resolvePath(raw, where.cwd);
+	if (/[,"\n\r\0]/.test(dir))
+		out.add("PI_EVAL_HIDDEN_TESTS_DIR", "cannot be mounted safely (a comma, quote or newline)");
+	else if (pathsOverlap(dir, where.taskDir) || pathsOverlap(dir, where.dataDir))
+		out.add(
+			"PI_EVAL_HIDDEN_TESTS_DIR",
+			"must be outside PI_DATA_DIR and PI_TASK_DIR (agents' containers mount from there)",
+		);
+	return dir;
 }
 
 /** PI_TASK_DIR, resolved from `cwd`; default `<PI_DATA_DIR>/tasks`. */
@@ -410,6 +458,8 @@ export function describeConfig(config: CoordinatorConfig): Record<string, unknow
 		...diskSummary(config.disk),
 		agent_image: config.docker.agentImage,
 		check_image: config.docker.checkImage,
+		evaluator_image: config.evaluation.image,
+		hidden_tests: config.evaluation.hiddenTestsDir === undefined ? "unset" : "set",
 		runner_isolation: config.runner.isolation,
 		...(config.runner.isolation === "systemd"
 			? { runner_user: config.runner.user, runner_group: config.runner.group, runner_slice: config.runner.slice }

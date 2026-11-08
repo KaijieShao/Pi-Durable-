@@ -5,8 +5,9 @@
  * STUB(spec: capacity.md § Disk "separate budgets for retained trials, metadata-only logs, Pi's raw-content store and
  * the database, each with a retention rule"): the usage of each is reported here, but no budget size is set and no
  * retention rule deletes anything: conversations and the database grow until a trial reset (not built), logs follow
- * journald's own retention on the VM, and there are no retained trials (sealing is not built). The boot disk's
- * free-space floor (new tasks rejected) is the only boot-disk limit enforced.
+ * journald's own retention on the VM, and the sealed snapshots of trial evaluations (on the task disk,
+ * engine/snapshot.ts) are kept. The boot disk's free-space floor (new tasks rejected) is the only boot-disk limit
+ * enforced.
  *
  * The folders are walked asynchronously (treeBytes): `owner status` runs inside the Coordinator, whose event loop (the
  * poller, the relay, the runs) must not stall while a task folder that is not a mount point is measured.
@@ -16,6 +17,7 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { CoordinatorConfig } from "../config.ts";
 import { type DiskSettings, diskSettings, isMountPoint, statfsSpace, TASK_DISK_WAIT_KEY, treeBytes } from "../disk.ts";
+import { SNAPSHOTS_DIR } from "../engine/snapshot.ts";
 import { DEMO_LIMITS } from "../limits.ts";
 import { formatBytes } from "../messages.ts";
 import type { Store } from "../store.ts";
@@ -110,6 +112,17 @@ async function taskLine(store: Store, taskDir: string, settings: DiskSettings): 
 	);
 }
 
+/** The retained trials: the sealed snapshots on the task disk (kept: no retention rule). */
+async function snapshotsLine(store: Store, taskDir: string): Promise<string> {
+	const evaluations =
+		store.get<{ n: number }>("SELECT COUNT(*) AS n FROM evaluations WHERE snapshot_path IS NOT NULL")?.n ?? 0;
+	const size = await measuredAsync(async () => formatBytes(await bytesUnder(join(taskDir, SNAPSHOTS_DIR))));
+	return (
+		`  Retained trials (PI_TASK_DIR/${SNAPSHOTS_DIR}): ${evaluations} sealed snapshot${evaluations === 1 ? "" : "s"}, ` +
+		`${size}; kept, no retention rule enforced yet (trial reset is not built)`
+	);
+}
+
 /** What the disk lines need: the Coordinator's configuration, or the owner CLI's (no secrets). */
 export type DiskReportConfig = {
 	readonly paths: { readonly dataDir: string; readonly taskDir: string };
@@ -125,8 +138,8 @@ export async function diskReport(store: Store, config: DiskReportConfig): Promis
 		databaseLine(dataDir),
 		await piStoreLine(store, dataDir),
 		"  Metadata logs: stdout and stderr (journald on the VM, with its own retention); not on PI_DATA_DIR, not measured",
-		"  Retained trials: none (sealing and trial reset are not built)",
 		await taskLine(store, taskDir, settings),
+		await snapshotsLine(store, taskDir),
 	];
 	const held = store.getMeta(TASK_DISK_WAIT_KEY);
 	if (held !== undefined) lines.push(`  New worktrees are held: ${held}`);

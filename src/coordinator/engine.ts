@@ -11,7 +11,10 @@
  * branch changed on GitHub (engine/held.ts), the look at a task disk too full for a new worktree (engine/task-disk.ts),
  * and dispatch. Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's verified watchdog sweep
  * and a fresh watchdog heartbeat (engine/watchdog.ts). The owner's unfreeze (unfreeze(), engine/unfreeze.ts) runs the
- * recovery checks while the group is still frozen and turns it normal only if they all pass.
+ * recovery checks while the group is still frozen and turns it normal only if they all pass. The owner's seal (seal(),
+ * engine/seal.ts) turns the group sealing: dispatch, merges and follow-up delivery are held deployment-wide while each
+ * tick moves the evaluation on (everything in flight finalized, execution verified stopped, the snapshot, the
+ * evaluator, its verified cleanup), and the group turns normal again only after that.
  */
 
 import type { Logger } from "../runtime/log.ts";
@@ -44,9 +47,11 @@ import {
 	runLifecycle,
 	sendPendingSteers,
 } from "./engine/runs.ts";
+import { NO_EVALUATOR, requestSeal, type SealOutcome, type SealRequest, sealTick } from "./engine/seal.ts";
 import { liftTaskDiskHold, recheckTaskDisk, TASK_DISK_RECHECK_MS } from "./engine/task-disk.ts";
 import { UNFREEZE_QUIET_MS, type UnfreezeOutcome, unfreezeGroup } from "./engine/unfreeze.ts";
 import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
+import { deploymentHeld, evaluatorPhase } from "./evaluation.ts";
 import {
 	holdNote,
 	INTERRUPTED_KEPT_REASON,
@@ -59,6 +64,7 @@ import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
 
 export type { EngineOptions } from "./engine/context.ts";
+export type { SealOutcome, SealRequest } from "./engine/seal.ts";
 export type { UnfreezeOutcome } from "./engine/unfreeze.ts";
 
 export type Engine = {
@@ -92,6 +98,11 @@ export type Engine = {
 	 * reopen dispatch only if every one passes (engine/unfreeze.ts). Call after start().
 	 */
 	unfreeze(): Promise<UnfreezeOutcome>;
+	/**
+	 * The owner's seal request (owner socket; the trial harness's trigger): refused with the reason, or the group turns
+	 * sealing and the evaluation runs from the engine's ticks (engine/seal.ts). Call after start().
+	 */
+	seal(request: SealRequest): Promise<SealOutcome>;
 };
 
 const TICK_MS = 1000;
@@ -230,10 +241,34 @@ async function recheck(ctx: Ctx, state: EngineState): Promise<void> {
 	ctx.log.info("recheck_done", { chat: ctx.chatId, jobs: jobs.length });
 }
 
-/** Nothing of the engine in flight that the unfreeze checks could race: runs, merges, recovery jobs, cancels. */
+/**
+ * Nothing of the engine in flight that the unfreeze checks could race: runs, merges, recovery jobs, cancels, the seal
+ * machine (an evaluation stopped by the freeze is still cleaning up).
+ */
 function quiet(ctx: Ctx, state: EngineState): boolean {
-	if (ctx.active.size > 0 || state.merging || state.recoveryRunning) return false;
+	if (ctx.active.size > 0 || state.merging || state.recoveryRunning || ctx.seal.working) return false;
 	return ctx.busy.size === 0 && ctx.reconciling.size === 0;
+}
+
+function plural(n: number, one: string): string {
+	return `${n} ${one}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * What a sealing group still waits for before execution is verified stopped and the snapshot is taken (Architecture
+ * § Sealing: "all active runs and merge tests are finalized"), or undefined: no run, merge, slot, recovery job, cancel
+ * or reconciliation in flight, and the watchdog ready.
+ */
+function sealWaitingFor(ctx: Ctx, state: EngineState, group: GroupState): string | undefined {
+	if (ctx.active.size > 0) return `${plural(ctx.active.size, "active run")} to finish`;
+	if (state.merging) return "the merge in progress";
+	const slots = slotsInUse(ctx);
+	if (slots > 0) return `${plural(slots, "execution slot")} to be released`;
+	if (state.recoveryRunning || state.recoveryJobs.length > 0) return "the recovery jobs";
+	if (ctx.busy.size > 0) return "the cancels and archives in progress";
+	if (ctx.reconciling.size > 0 || state.recheckRunning || group.recheck) return "a reconciliation";
+	if (!watchdogReady(ctx)) return "the watchdog (a verified sweep and a fresh heartbeat)";
+	return undefined;
 }
 
 /**
@@ -268,6 +303,9 @@ function addRecoveryJobs(ctx: Ctx, state: EngineState, jobs: readonly RecoveryJo
 
 function maybeRecoveryJobs(ctx: Ctx, state: EngineState, group: GroupState): boolean {
 	if (state.recoveryJobs.length === 0 || state.recoveryRunning || state.recheckRunning) return false;
+	// Capacity § Exclusive phases: nothing starts a container while the evaluator runs or its cleanup (which removes
+	// every container) is due; a restart during an evaluation runs its recovery jobs only after that (engine/seal.ts).
+	if (ctx.seal.abort !== undefined || evaluatorPhase(ctx.store)) return false;
 	// Their checks run in containers: like merges and dispatch, they wait for the watchdog (verified, heartbeat fresh).
 	if (group.state === "frozen" || group.recheck || !watchdogReady(ctx)) return false;
 	return flagged(ctx, state, "recoveryRunning", undefined, () => runRecoveryJobs(ctx, state));
@@ -336,12 +374,14 @@ function checkEnforcement(ctx: Ctx, state: EngineState): void {
 	});
 }
 
-/** Dispatch and merges are open: group normal, no recheck or recovery job pending, the relay running. */
+/**
+ * Dispatch and merges are open: group normal, no recheck or recovery job pending, the relay running, and no sealing or
+ * evaluation anywhere in the deployment (Architecture § Request Flow: "Evaluation holds all deployment-wide dispatch
+ * from sealing until the evaluator exits and cleanup is verified"; engine/seal.ts).
+ */
 function dispatchOpen(ctx: Ctx, state: EngineState): boolean {
 	const group = ctx.store.groupState(ctx.chatId);
-	// STUB(spec: architecture.md § Sealing; capacity.md § Exclusive phases): sealing and the isolated evaluator are
-	// not built; a group in state 'sealing' only holds dispatch and merges here, nothing seals it.
-	if (group.state !== "normal" || group.recheck || state.recheckRunning) return false;
+	if (group.state !== "normal" || group.recheck || state.recheckRunning || deploymentHeld(ctx.store)) return false;
 	// Agent Execution § Uncertain Effects: "Dispatch stays blocked until reconciliation finishes".
 	return ctx.recoveryPending === 0 && ctx.reconciling.size === 0 && ctx.relayUrl !== undefined;
 }
@@ -427,6 +467,7 @@ function tickOnce(ctx: Ctx, state: EngineState): boolean {
 		pollWatchdog(ctx),
 		maybeRecoveryJobs(ctx, state, group),
 		processCancels(ctx),
+		sealTick(ctx, { waitingFor: () => sealWaitingFor(ctx, state, group), watchdogReady: () => watchdogReady(ctx) }),
 	];
 	sendPendingSteers(ctx);
 	reminders(ctx, state);
@@ -494,6 +535,8 @@ function abandonRun(ctx: Ctx, active: ActiveRun): Promise<unknown>[] {
 async function stopEngine(ctx: Ctx, state: EngineState): Promise<void> {
 	if (ctx.stopped) return;
 	ctx.stopped = true;
+	// The evaluator is stopped too; the next start records the evaluation as interrupted (engine/seal.ts).
+	ctx.seal.abort?.abort();
 	if (state.interval !== undefined) clearInterval(state.interval);
 	state.interval = undefined;
 	await Promise.allSettled([...ctx.active.values()].flatMap((active) => abandonRun(ctx, active)));
@@ -547,6 +590,8 @@ export function createEngine(options: EngineOptions): Engine {
 		reconciling: new Set<number>(),
 		freezes: 0,
 		lastFreezeReason: undefined,
+		evaluator: options.evaluator ?? NO_EVALUATOR,
+		seal: { working: false, abort: undefined, retryAt: 0, verified: undefined },
 		track: (kind, taskId, work) => track(ctx, state, kind, taskId, work),
 		kick,
 	};
@@ -588,6 +633,7 @@ export function createEngine(options: EngineOptions): Engine {
 		idle: () => idle(ctx, state),
 		activeRuns: () => [...ctx.active.keys()],
 		unfreeze: () => ownerUnfreeze(ctx, state, options.unfreezeQuietMs ?? UNFREEZE_QUIET_MS),
+		seal: (request) => requestSeal(ctx, request),
 	};
 }
 

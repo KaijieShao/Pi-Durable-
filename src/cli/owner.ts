@@ -43,7 +43,7 @@ export type OwnerOptions = {
 /** How long the CLI waits for the answer: an unfreeze runs the recovery checks (each step is bounded). */
 export function answerTimeoutMs(request: OwnerRequest): number {
 	if (request.command === "unfreeze") return 10 * 60_000;
-	if (request.command === "inspect") return 2 * 60_000;
+	if (request.command === "inspect" || request.command === "seal") return 2 * 60_000;
 	return 60_000;
 }
 
@@ -63,6 +63,13 @@ export function ownerRequestOf(invocation: OwnerInvocation, groupChatId: number)
 				: { command: "conversations", task: invocation.task };
 		case "inspect":
 			return { command: "inspect", conversation: invocation.conversation };
+		case "seal":
+			return {
+				command: "seal",
+				group: invocation.group ?? groupChatId,
+				...(invocation.trial === undefined ? {} : { trial: invocation.trial }),
+				...(invocation.tasks === undefined ? {} : { tasks: invocation.tasks }),
+			};
 	}
 }
 
@@ -107,7 +114,9 @@ async function report(result: ClientResult, invocation: OwnerInvocation, config:
 			const needs =
 				invocation.action === "unfreeze"
 					? " An unfreeze needs the running Coordinator: it repeats the recovery checks before the group may dispatch again."
-					: "";
+					: invocation.action === "seal"
+						? " Sealing needs the running Coordinator: it holds dispatch and starts the evaluator."
+						: "";
 			io.stderr(`The Coordinator is not running (${result.detail}).${needs} Start it (pi-durable-telegram run).\n`);
 			if (invocation.action === "status") await fallbackStatus(config, io);
 			return OWNER_EXIT.notRunning;

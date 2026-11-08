@@ -256,6 +256,14 @@ function createWorld() {
 				0,
 			);
 		},
+		async treeId(rev) {
+			return createHash("sha1")
+				.update([...files(rev).entries()].map(([path, text]) => `${path}\0${text}`).join("\n"))
+				.digest("hex");
+		},
+		async exportTree(rev, dest) {
+			await writeTree(dest, files(rev));
+		},
 	};
 
 	const view = (pull: Pull): PullRequest => ({

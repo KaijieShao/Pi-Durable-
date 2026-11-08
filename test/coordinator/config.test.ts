@@ -89,6 +89,7 @@ test("a full valid environment parses, with the documented defaults", () => {
 	assert.equal(config.docker.agentImage, "pi-durable-agent:demo");
 	assert.equal(config.docker.checkImage, "pi-durable-check:demo");
 	assert.equal(config.docker.user, "1000:1000");
+	assert.deepEqual(config.evaluation, { hiddenTestsDir: undefined, image: "pi-durable-evaluator:demo" });
 	assert.equal(config.relay.port, 0);
 	assert.equal(config.setupScript, ".pi/setup.sh");
 	assert.equal(config.logLevel, "info");
@@ -367,6 +368,27 @@ test("systemd isolation refuses the Coordinator's own user as the Pi user", () =
 	assert.equal(summary.runner_isolation, "systemd");
 	assert.equal(summary.runner_user, "pi-runner");
 	assert.equal(summary.runner_slice, "pi-durable-runs.slice");
+});
+
+test("the evaluator: hidden tests outside PI_DATA_DIR and PI_TASK_DIR (the agents' containers mount from there); the image", () => {
+	const config = parse({
+		PI_EVAL_HIDDEN_TESTS_DIR: "/srv/hidden",
+		EVALUATOR_IMAGE: "evaluator:x",
+		PI_TASK_DIR: "/mnt/t",
+	});
+	assert.deepEqual(config.evaluation, { hiddenTestsDir: "/srv/hidden", image: "evaluator:x" });
+	assert.equal(parse({ PI_EVAL_HIDDEN_TESTS_DIR: "hidden" }).evaluation.hiddenTestsDir, "/srv/work/hidden");
+	const hidden = (env: Env) =>
+		problems({ ...VALID, ...env }).filter((problem) => problem.variable === "PI_EVAL_HIDDEN_TESTS_DIR").length;
+	// Inside the task directory, the task directory itself, a parent of it, inside the data directory: refused.
+	for (const dir of ["/mnt/t/hidden", "/mnt/t", "/mnt", "/data/hidden", "/data"])
+		assert.equal(hidden({ PI_TASK_DIR: "/mnt/t", PI_DATA_DIR: "/data", PI_EVAL_HIDDEN_TESTS_DIR: dir }), 1, dir);
+	assert.equal(hidden({ PI_TASK_DIR: "/mnt/t", PI_EVAL_HIDDEN_TESTS_DIR: "/mnt/tests,ro" }), 1, "not mountable");
+	// A sibling whose name only starts like the task directory is outside it.
+	assert.equal(
+		parse({ PI_TASK_DIR: "/mnt/t", PI_EVAL_HIDDEN_TESTS_DIR: "/mnt/tt" }).evaluation.hiddenTestsDir,
+		"/mnt/tt",
+	);
 });
 
 test("disk limits: unset by default (DEMO_LIMITS apply, no task disk budget); sizes in bytes or K/M/G/T", () => {

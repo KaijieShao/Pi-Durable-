@@ -8,11 +8,13 @@ import type { FromRunner } from "../../runner/protocol.ts";
 import type { Logger } from "../../runtime/log.ts";
 import type { CoordinatorConfig } from "../config.ts";
 import type { DiskProbe, DiskSettings } from "../disk.ts";
+import { deploymentHeld } from "../evaluation.ts";
 import type { Git } from "../git.ts";
 import type { Limits } from "../limits.ts";
 import { taskRef } from "../messages.ts";
 import {
 	type AgentSandbox,
+	type Evaluator,
 	type GitHubApi,
 	GitHubError,
 	type RunLauncher,
@@ -201,6 +203,26 @@ export type EngineOptions = {
 	 * refuses (engine/unfreeze.ts; default UNFREEZE_QUIET_MS). Tests shorten it.
 	 */
 	readonly unfreezeQuietMs?: number;
+	/**
+	 * The isolated evaluator (engine/seal.ts): the Docker evaluator in production (coordinator.ts), a local test
+	 * evaluator in tests. Without one, sealing is refused.
+	 */
+	readonly evaluator?: Evaluator;
+};
+
+/** In-memory state of the seal machine (engine/seal.ts); everything durable is in the evaluations table. */
+export type SealRuntime = {
+	/** A phase of the evaluation in progress is running (tracked work). */
+	working: boolean;
+	/** Stops the evaluator container of this process, while it runs. */
+	abort: AbortController | undefined;
+	/** A failed step (fetching main) is tried again after this time. */
+	retryAt: number;
+	/**
+	 * The evaluation whose execution this process verified stopped (the sealing phase's stop step). An evaluation found
+	 * in its snapshot phase without it (a restart: recovery's jobs may have run checks since) is verified again first.
+	 */
+	verified: number | undefined;
 };
 
 export type WatchdogOptions = { readonly link: WatchdogLink } & WatchdogTimings;
@@ -270,6 +292,9 @@ export type Ctx = {
 	 */
 	freezes: number;
 	lastFreezeReason: string | undefined;
+	/** The isolated evaluator (EngineOptions.evaluator). */
+	readonly evaluator: Evaluator;
+	readonly seal: SealRuntime;
 	/** Run queued work in the background, tracked for idle(); marks `taskId` busy while it runs. */
 	track(kind: string, taskId: number | undefined, work: () => Promise<void>): void;
 	kick(): void;
@@ -412,29 +437,36 @@ export function conversationPath(ctx: Ctx, id: string): string {
  */
 export function freezeGroup(ctx: Ctx, reason: string): void {
 	if (ctx.stopped) return;
-	ctx.freezes += 1;
-	ctx.lastFreezeReason = reason;
 	try {
-		tx(ctx, () => {
-			if (ctx.store.freeze(ctx.chatId, reason)) {
-				ctx.store.enqueue({
-					chatId: ctx.chatId,
-					priority: "required",
-					kind: "group_frozen",
-					text: `Group frozen: ${reason}. Only the owner CLI can unfreeze it.`,
-				});
-			}
-		});
-		ctx.log.warn("group_frozen", { chat: ctx.chatId, reason });
+		tx(ctx, () => freezeInTx(ctx, reason));
 	} catch (error) {
 		ctx.log.error("group_freeze_failed", { chat: ctx.chatId, error: describeError(error) });
 	}
 	ctx.kick();
 }
 
+/**
+ * freezeGroup's work inside the caller's transaction (with the state change that freezes, e.g. a recorded evaluation
+ * whose cleanup could not be verified). Posts the notice once. The caller kicks the engine.
+ */
+export function freezeInTx(ctx: Ctx, reason: string): void {
+	ctx.freezes += 1;
+	ctx.lastFreezeReason = reason;
+	if (ctx.store.freeze(ctx.chatId, reason)) {
+		ctx.store.enqueue({
+			chatId: ctx.chatId,
+			priority: "required",
+			kind: "group_frozen",
+			text: `Group frozen: ${reason}. Only the owner CLI can unfreeze it.`,
+		});
+	}
+	ctx.log.warn("group_frozen", { chat: ctx.chatId, reason });
+}
+
+/** No dispatch, merge or follow-up delivery: the group is not normal, or sealing holds the whole deployment. */
 export function groupHeld(ctx: Ctx): boolean {
 	const group = ctx.store.groupState(ctx.chatId);
-	return group.state !== "normal" || group.recheck;
+	return group.state !== "normal" || group.recheck || deploymentHeld(ctx.store);
 }
 
 export function releaseSlot(ctx: Ctx, slotId: number): void {

@@ -186,6 +186,77 @@ export interface Sandbox {
 	killAll(filter?: ContainerFilter): Promise<void>;
 	/** Names of managed containers that still exist (empty = verified gone). */
 	live(filter?: ContainerFilter): Promise<string[]>;
+	/** The pinned image ids once available() succeeded (recorded with each trial's evaluation); none in tests. */
+	images?(): { readonly agent: string; readonly check: string } | undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The isolated evaluator (Architecture § Isolated evaluator; Agent Execution § Containers, Evaluator column; Capacity
+// § Evaluator). A separate trusted container, started only by the Coordinator after sealing, that grades the sealed
+// snapshot: the snapshot and the hidden tests read-only, a scratch space, no network, no credentials, 2 vCPU / 2 GiB;
+// its suites run one after another from the fixed suite list of its image. Production: src/coordinator/sandbox/
+// evaluator.ts (Docker); tests: createLocalEvaluator (src/coordinator/sandbox/local.ts, never reachable from config).
+
+/** One graded suite's outcome. Only "passed" counts as a pass; "not_run" never ran (an earlier stop, the deadline). */
+export type EvaluatorSuiteOutcome = "passed" | "failed" | "timeout" | "error" | "not_run";
+
+export type EvaluatorSuite = {
+	readonly name: string;
+	readonly outcome: EvaluatorSuiteOutcome;
+	readonly exitCode: number | undefined;
+	readonly durationMs: number;
+};
+
+export type EvaluatorRun =
+	/**
+	 * The evaluator container ran. `suites`: its planned suites in order, each with its outcome (a planned suite without
+	 * a result is not_run). `end`: exited (the launcher ran every suite), timeout (the deadline stopped it), aborted (the
+	 * caller's signal stopped it), error (the launcher failed, or reported no plan, or the container hit a limit).
+	 */
+	| {
+			readonly kind: "ran";
+			readonly suites: readonly EvaluatorSuite[];
+			readonly end: "exited" | "timeout" | "aborted" | "error";
+			readonly durationMs: number;
+	  }
+	/** The container did not start (image missing, Docker failure): nothing was graded. */
+	| { readonly kind: "not_started"; readonly reason: string };
+
+/** What the evaluator's availability check found: the pinned image and the hash of its fixed suite list. */
+export type EvaluatorFacts = {
+	readonly image: string;
+	readonly imageId: string;
+	readonly repoDigest: string | undefined;
+	/** sha256 of the image's suite list (the grading rules): "sha256:<hex>". */
+	readonly suitesHash: string;
+};
+
+export type EvaluatorSpec = {
+	readonly trial: string;
+	/** The sealed snapshot (read-only directory); mounted read-only. */
+	readonly snapshot: string;
+	/** The hidden tests (PI_EVAL_HIDDEN_TESTS_DIR); mounted read-only, only in the evaluator. */
+	readonly hiddenTests: string;
+	/** A fresh scratch directory (createScratch), the container's only writable place; wiped after. */
+	readonly scratch: string;
+	readonly deadlineMs: number;
+	readonly signal?: AbortSignal;
+};
+
+export interface Evaluator {
+	/** Fails closed: the evaluator image (and its suite list) or the container runtime is unavailable → no sealing. */
+	available(): Promise<Availability>;
+	/** What the last successful available() found; undefined before. */
+	facts(): EvaluatorFacts | undefined;
+	run(spec: EvaluatorSpec): Promise<EvaluatorRun>;
+	/** Evaluator containers that still exist (empty = verified gone). Throws if they cannot be listed. */
+	live(): Promise<string[]>;
+	/** Kill and remove every evaluator container. */
+	killAll(): Promise<void>;
+	/** A fresh scratch directory under `root` that the evaluator's user can write. */
+	createScratch(root: string): Promise<string>;
+	/** Delete a scratch directory completely; true once it is verified gone. */
+	wipeScratch(path: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

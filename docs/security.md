@@ -2,7 +2,8 @@
 
 The design is in [spec/architecture.md](../spec/architecture.md#trust-boundaries) and
 [spec/deployment.md](../spec/deployment.md). Trusted: the Coordinator, Pi, the relay, the tool hooks, the expected
-test outputs, the watchdog and the GitHub repository settings. Untrusted: model output, tool arguments and generated code.
+test outputs, the watchdog, the evaluator and the GitHub repository settings. Untrusted: model output, tool arguments
+and generated code.
 
 - **One group, explicit roles.** Only the configured group (and topic) is served; every other chat is ignored and
   nothing from it is stored or sent to the model. Only a task's creator and the configured owner can follow up on,
@@ -43,6 +44,10 @@ test outputs, the watchdog and the GitHub repository settings. Untrusted: model 
   interrupted run's changes are never committed or pushed at recovery. A push GitHub refuses because a task branch
   was changed outside the Coordinator is a known outcome (nothing was pushed): the Coordinator never force-pushes, and
   only that task waits, with its worktree kept, until the branch is restored.
+- **The isolated evaluator** ([the evaluator](#the-isolated-evaluator)) grades a read-only snapshot of main with the
+  hidden tests in its own trusted container (no network, no credentials, 2 vCPU / 2 GiB), started only by the
+  Coordinator after the owner seals the group, while dispatch is held deployment-wide. The hidden tests are never
+  mounted in an agent or check container: their directory must be outside the data and task directories.
 - **The owner CLI talks only to the running Coordinator, over an owner-only Unix socket** ([the owner
   socket](#the-owner-socket)): it never writes the database; the transcript of a quarantined conversation goes to the
   owner's terminal only, read without writing anything.
@@ -113,12 +118,36 @@ Coordinator's side), `src/cli/owner.ts` and `src/cli/owner-client.ts` (the CLI).
 | Who may connect | Node exposes no peer credentials of a Unix socket (no SO_PEERCRED or getpeereid), so the peer's uid is not read. What is enforced instead: the client must search the 0700 directory and connect to the 0600 socket (Linux checks write permission on the socket), and every request must carry the token it read from the 0600 file (compared in constant time): only the Coordinator's user and root can do all three. On the VM the owner runs the CLI as that user: `sudo -u pi-coordinator node /opt/pi-durable/src/cli/main.ts owner status --env-file /etc/pi-durable/coordinator.env`. The CLI first checks the directory is its own and not reachable by others; otherwise it sends nothing (no token goes to a socket someone else could have placed) |
 | Stale socket | A socket file a crashed Coordinator left behind is removed at the next start, but only if it is a socket and nothing answers on it (the data directory's lock is held already, so no other Coordinator of this deployment runs); a live listener or a file that is not a socket refuses the start |
 | Protocol | One connection, one request, one response, each a single line of JSON (`{"v":1,"token":…,"command":…}` → `{"ok":…,"text":…}`). A request is at most 64 KiB and must arrive within 5 s, else it is refused (`too_large`, `timeout`) and the connection closed; anything after the first line is not read; at most 8 connections at a time. Bad requests get their reason (`bad_request`); a missing or wrong token is `unauthorized` and never reaches a command |
-| Commands | `status`; `unfreeze [<group>]` (this Coordinator's group only); `resolve <change>...`; `failed-events`; `conversations [<task>]`; `inspect <conversation>` |
+| Commands | `status`; `unfreeze [<group>]` (this Coordinator's group only); `resolve <change>...`; `failed-events`; `conversations [<task>]`; `inspect <conversation>`; `seal [<group>] [--trial <id>] [--tasks <id,...>]` ([the evaluator](#the-isolated-evaluator)) |
 | Unfreeze | The group stays frozen while the Coordinator repeats the recovery checks, in order: nothing of the group still stopping, every run key closed, its own kills of leftover Pi processes and containers verified, the watchdog's sweep (reason `recheck`) answered and verified, every saved merge intent checked against GitHub, every pending file change reconciled and none unresolved without the owner's `resolve`, the relay running, and no new freeze meanwhile (none by the Coordinator, e.g. a `/cancel`'s archive that could not reach GitHub, and no stop the watchdog could not verify). A task a `/cancel` archives while the checks run gets no recovery job: that archive finishes on its own. Only if all pass does the group turn normal (in one transaction with the recovery jobs found); otherwise it stays frozen and the CLI prints which check failed (exit 1). Nothing interrupted resumes; tasks the freeze cancelled stay cancelled. The CLI never writes the database: without a running Coordinator there is no unfreeze |
 | Read-only inspection | Only a quarantined conversation of the group, stored in `<PI_DATA_DIR>/conversations/`, never through a symlink. Without a `-wal` file (or an empty one) the file is opened with SQLite's `mode=ro&immutable=1`: no lock, no `-wal` or `-shm` created. With a `-wal` that holds entries (its Pi process was killed), the file and its WAL are copied (read) into a private scratch directory under `owner/`, the copy is read and deleted at once (and at the next start if a crash left one). Pi Durable's own storage is not opened (its open migrates in a write transaction and its close checkpoints). The transcript goes back over the socket to the owner's terminal only; control characters and bidirectional overrides are escaped, known secret shapes masked |
 | Logs | The command, its outcome and duration (`owner_request`), a refused token (`owner_request_refused`), an inspection's conversation id, entry count and source (`owner_inspect`), a resolution's change and task (`owner_effect_resolved`); never the token, a transcript or any text |
 | Secrets | None in the CLI (Deployment § Secrets: "held only in the Coordinator's memory"): it reads only `PI_DATA_DIR`, `PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes, and from an env file (the Coordinator's, on the VM) only those lines; the bot token, the model key and the GitHub token are dropped before parsing |
 | Without a Coordinator | The CLI says it is not running and exits 3. `owner status` then also prints the status from a read-only, query-only connection to the database (no migration, refused unless the schema is the current one), labelled `READ-ONLY STATUS FROM THE DATABASE` |
+
+## The isolated evaluator
+
+[spec/architecture.md](../spec/architecture.md) § Sealing ("Dispatch is held deployment-wide ... Evaluation and
+execution never overlap. Dispatch stays held from sealing until the evaluator has exited and its cleanup is verified")
+and § Isolated evaluator ("a separate trusted container, launched only by the Coordinator after sealing, with the
+sealed snapshot and hidden tests read-only plus scratch space, and no network or credentials. Agents can't reach it");
+[spec/agent-execution.md](../spec/agent-execution.md) § Containers, Evaluator column. Code:
+`src/coordinator/engine/seal.ts` (sealing), `src/coordinator/engine/snapshot.ts` (the snapshot),
+`src/coordinator/sandbox/evaluator.ts` (the container), `deploy/docker/run-eval.mjs` and `suites.json` (the image's
+launcher and fixed suite list).
+
+| | |
+|---|---|
+| Trigger | Only the owner CLI (`owner seal`), the trial harness: "Evaluation runs only in the trial harness". Nothing in Telegram starts it |
+| Before | Refused unless the group is normal, nothing else is being evaluated, the trial id is new (a trial is evaluated once), the hidden tests are configured and outside `PI_DATA_DIR` and `PI_TASK_DIR` (checked on the resolved paths), the evaluator image answers, and every trial task is merged |
+| Hold | From the seal: no dispatch, no merge, no follow-up delivered into a running task, deployment-wide (any group sealing, or any evaluation not finished, holds every group). New `/task` requests and replies are saved and queued |
+| Exclusive | The evaluator starts only once no run, merge, execution slot, recovery job, cancel or reconciliation is in flight and the recovery stop step (own kills verified, the watchdog's sweep verified) found nothing left; no agent or check container may be listed then. After a restart before the evaluator ran, restart recovery's jobs finish first and the stop step is verified again; no recovery job starts while the evaluator runs or its cleanup is due |
+| Snapshot | The fetched main commit, checked to contain every trial task's merged head, exported without git data under `<PI_TASK_DIR>/snapshots/<trial>-<commit>` (directories 0555, files 0444) with a read-only manifest (commit, tree, content hash); the hash is checked before the evaluator starts and after it ran |
+| Container | `--network none`, read-only root, `--cap-drop ALL`, `no-new-privileges`, `--cpus 2`, `--memory 2048m` (no swap), 512 processes, `CONTAINER_USER`, labels `pi-durable.managed=1`, `pi-durable.kind=evaluator`, `pi-durable.trial=<id>` (no task label: a run's scoped sweep never touches it; restart recovery and the watchdog remove it). Mounts: the snapshot and the hidden tests read-only, a fresh scratch directory under `<PI_TASK_DIR>/eval-scratch/`. Environment: `HOME`, `TMPDIR` and the deadline, nothing else |
+| Grading | The image's suites, one after another: each module's hidden tests, the integration test, the baseline suite, each in a fresh writable copy of the snapshot with its hidden tests copied in (to `hidden-tests/`, which the evaluator owns: whatever the snapshot has there is removed first, so graded code cannot add tests to a suite). "passed" only if every planned suite passed; a suite with no test file is an error, never a pass; the 30-minute deadline removes the container |
+| After | The evaluator container verified gone, the scratch directory wiped and verified gone, the snapshot verified unchanged, the watchdog's sweep verified; then the result (per-suite outcomes, the snapshot, versions, image digests, tool policy version, container limits, the hidden tests' hash) is recorded, posted to the group, and dispatch reopens. An evaluator that cannot start, or a cleanup that cannot be verified, freezes the group instead. A restart during the evaluation records it as interrupted (not graded) |
+| Trust | The evaluator, its launcher and its suite list are trusted; the graded code is not, and it runs inside the evaluator next to the hidden tests (read-only). The evaluator guarantees the isolation of the grading (no network, no credentials, nothing of the deployment reachable, nothing kept after it), not that hostile code cannot fake its own test results (for example by exiting early); the trial's pull requests and merge history remain the supporting evidence |
+| Logs | Trial id, phase, counts, outcomes and hashes; never test output (the launcher discards it) |
 
 Report vulnerabilities privately, see [SECURITY.md](../SECURITY.md).
 
