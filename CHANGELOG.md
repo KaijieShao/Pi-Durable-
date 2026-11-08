@@ -2,13 +2,30 @@
 
 ## Unreleased
 
-- Opt in to one Telegram group/topic with independent sender authorization, addressed commands, `/task` requests
-  and topic-preserving text, typing and file delivery. Private-only behavior remains the default.
+- **Breaking: the private-chat gateway is replaced by a multi-user group Coordinator.** One configured Telegram group
+  (and optional topic) submits `/task <agent> <text>` to configured agent ids; replies to the bot's task messages are
+  follow-ups (steered while a run is busy, another run while the task is in review); `/status`, `/cancel` and
+  `/approve` complete the set. Each task gets one branch, one worktree and one GitHub pull request and merges only
+  after its creator or the owner approves the posted head commit and the tests pass on the result combined with the
+  latest main. Private chats and every other chat are ignored. Bounded queues and fixed demo limits apply to every
+  run. See [README.md](README.md), [RUN-LOCAL.md](RUN-LOCAL.md) and the design docs in [spec/](spec/).
+- New CLI: `run [--env-file p]` and `owner status|unfreeze|failed-events [--env-file p]`; `login` is removed. New
+  configuration (`TELEGRAM_GROUP_CHAT_ID`, `TELEGRAM_OWNER_ID`, `PI_AGENTS`, `GITHUB_*`, `PROJECT_TOKEN_CEILING`,
+  container images...), see [docs/configuration.md](docs/configuration.md); `TELEGRAM_ALLOWED_USER_IDS`,
+  `PI_WORKDIR`, `PI_PLUGINS`, `PI_AUTH_FILE`, `TELEGRAM_RICH`, `DEEPGRAM_API_KEY` and the other private-chat settings
+  are gone. `PI_PROVIDER` must be `openai`: Pi reaches the model only through the Coordinator's relay.
+- Removed with the old gateway: the `bash` tool (the model now has `read`, `edit`, `write` and `run_check` in
+  containers without network), plugins and MCP, voice and file intake, rich drafts and buttons, OAuth login and the
+  credential store, automatic resume of interrupted runs (an interrupted run is now failed and never resumed), and
+  the `postinstall` patch of Pi Durable's 401 retry (Pi Durable 1.5.0 is used unmodified; upstream 400/401 responses
+  end the run instead of being retried). Existing private-chat SQLite data is not migrated.
 
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
+  The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 
 - Add macOS Conductor setup, automatic bot startup, configuration checks, provider login and graceful archive.
   Keep bot credentials in the main checkout's ignored local env file and preserve per-workspace SQLite history.
+  (These Conductor actions run the earlier private-chat bot; start the Coordinator as described in RUN-LOCAL.md.)
 
 ## 0.1.10 (2026-11-03)
 

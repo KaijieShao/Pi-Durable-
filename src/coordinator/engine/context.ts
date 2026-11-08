@@ -1,0 +1,337 @@
+/**
+ * Shared state and helpers of the execution engine (src/coordinator/engine.ts). Every SQLite write goes through
+ * `store.tx()` (synchronous callback, no awaits inside); every user-facing message is enqueued in the same
+ * transaction as the state change it reports.
+ */
+import { join } from "node:path";
+import type { FromRunner } from "../../runner/protocol.ts";
+import type { Logger } from "../../runtime/log.ts";
+import type { CoordinatorConfig } from "../config.ts";
+import type { Git } from "../git.ts";
+import type { Limits } from "../limits.ts";
+import { taskRef } from "../messages.ts";
+import {
+	type AgentSandbox,
+	type GitHubApi,
+	GitHubError,
+	type RunLauncher,
+	type RunnerHandle,
+	type Sandbox,
+} from "../ports.ts";
+import type { OutboxMessage, Store } from "../store.ts";
+
+export type TaskState = "queued" | "running" | "review" | "merging" | "merged" | "failed" | "cancelled";
+export type RunState = "queued" | "starting" | "running" | "finalizing" | "finished" | "failed" | "cancelled";
+
+export type TaskRow = {
+	id: number;
+	chat_id: number;
+	creator_id: number;
+	agent_id: string;
+	text: string;
+	update_id: number;
+	state: TaskState;
+	reason: string | null;
+	generation: number;
+	branch: string | null;
+	worktree_path: string | null;
+	archived: number;
+	base_commit: string | null;
+	head_commit: string | null;
+	posted_head: string | null;
+	tests_passed_head: string | null;
+	pr_number: number | null;
+	pr_url: string | null;
+	followup_count: number;
+	cancel_requested: number;
+	cancel_requested_by: number | null;
+	review_since: number | null;
+	review_reminded: number;
+	created_at: number;
+	updated_at: number;
+};
+
+export type RunRow = {
+	id: number;
+	task_id: number;
+	kind: "initial" | "followup" | "conflict";
+	state: RunState;
+	reason: string | null;
+	requested_by: number;
+	request_id: string;
+	input_text: string;
+	followup_id: number | null;
+	conversation_id: string | null;
+	generation: number | null;
+	model_requests: number;
+	pid: number | null;
+	container: string | null;
+	answer: string | null;
+	checkpoint_commit: string | null;
+	review_done: number;
+	queued_at: number;
+	started_at: number | null;
+	ended_at: number | null;
+};
+
+export type FollowupRow = {
+	id: number;
+	task_id: number;
+	update_id: number;
+	user_id: number;
+	message_id: number;
+	text: string;
+	mode: "steer" | "run";
+	run_id: number | null;
+	state: "pending" | "submitted" | "delivered" | "started" | "expired";
+	reason: string | null;
+	created_at: number;
+	settled_at: number | null;
+};
+
+export type ConversationRow = {
+	id: string;
+	task_id: number;
+	parent_id: string | null;
+	path: string;
+	quarantined: number;
+	reusable: number;
+	created_at: number;
+};
+
+export type FinishedMessage = Extract<FromRunner, { type: "finished" }>;
+
+/** How a run ends. The first decision wins; an abnormal one revokes the run before anything else happens. */
+export type Decision =
+	| { readonly kind: "normal"; readonly finished: FinishedMessage }
+	| {
+			readonly kind: "cancelled" | "failed";
+			/** Shown to the user ("Task 12 failed: <reason>"). */
+			readonly reason: string;
+			/** followupExpired() cause: "cancelled" | "limit" | free text. */
+			readonly cause: string;
+	  };
+
+/** In-memory state of a dispatched run, from slot reservation until its slot is released. */
+export type ActiveRun = {
+	readonly runId: number;
+	readonly taskId: number;
+	readonly chatId: number;
+	readonly agentId: string;
+	readonly generation: number;
+	readonly runNo: number;
+	readonly slotId: number;
+	worktree: string | undefined;
+	branch: string | undefined;
+	handle: RunnerHandle | undefined;
+	agentBox: AgentSandbox | undefined;
+	decision: Decision | undefined;
+	readonly decided: Promise<Decision>;
+	resolveDecision: (decision: Decision) => void;
+	/** In-flight tool executions; finalize waits for them to settle. */
+	readonly tools: Set<Promise<void>>;
+	/** Follow-up ids already sent to the Pi process as steers. */
+	readonly sentSteers: Set<number>;
+	deadline: NodeJS.Timeout | undefined;
+	exited: boolean;
+	finished: FinishedMessage | undefined;
+};
+
+export type EngineOptions = {
+	readonly store: Store;
+	readonly config: CoordinatorConfig;
+	readonly limits: Limits;
+	readonly git: Git;
+	readonly github: GitHubApi;
+	readonly sandbox: Sandbox;
+	readonly launcher: RunLauncher;
+	readonly log: Logger;
+	readonly now?: () => number;
+	/** Called after a transaction that enqueued Telegram messages (the Coordinator kicks its outbox). */
+	readonly onOutbox?: () => void;
+	/** Base delay between attempts of a GitHub change or a push (doubles per attempt). Tests shorten it. */
+	readonly retryDelayMs?: number;
+	/** Free bytes of the task disk; defaults to statfs. */
+	readonly freeBytes?: (path: string) => Promise<number>;
+};
+
+export type Ctx = {
+	readonly store: Store;
+	readonly config: CoordinatorConfig;
+	readonly limits: Limits;
+	readonly git: Git;
+	readonly github: GitHubApi;
+	readonly sandbox: Sandbox;
+	readonly launcher: RunLauncher;
+	readonly log: Logger;
+	readonly now: () => number;
+	readonly chatId: number;
+	readonly retryDelayMs: number;
+	readonly freeBytes: (path: string) => Promise<number>;
+	readonly onOutbox: () => void;
+	stopped: boolean;
+	relayUrl: string | undefined;
+	/** Dispatched runs by run id. */
+	readonly active: Map<number, ActiveRun>;
+	/** Tasks with engine work in flight (run, review, archive, merge, cancel), by task id → what. */
+	readonly busy: Map<number, string>;
+	/** Sandbox enforcement as last checked. */
+	enforcement: { ok: boolean; reason: string | undefined; checkedAt: number } | undefined;
+	/** Recovery jobs (review / archive redo) not yet completed; dispatch and merges wait for them. */
+	recoveryPending: number;
+	/** Queued runs that may not be dispatched before a time (run id → epoch ms), e.g. while the task disk is low. */
+	readonly deferred: Map<number, number>;
+	/** Run queued work in the background, tracked for idle(); marks `taskId` busy while it runs. */
+	track(kind: string, taskId: number | undefined, work: () => Promise<void>): void;
+	kick(): void;
+};
+
+/** Thrown when an effect (GitHub change, push, stop) cannot be confirmed: the group freezes. */
+export class UnknownEffect extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "UnknownEffect";
+	}
+}
+
+export const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set(["merged", "failed", "cancelled"]);
+
+export function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function loadTask(ctx: Ctx, taskId: number): TaskRow {
+	const task = ctx.store.get<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId);
+	if (task === undefined) throw new Error(`task ${taskId} not found`);
+	return task;
+}
+
+export function loadRun(ctx: Ctx, runId: number): RunRow {
+	const run = ctx.store.get<RunRow>("SELECT * FROM runs WHERE id = ?", runId);
+	if (run === undefined) throw new Error(`run ${runId} not found`);
+	return run;
+}
+
+/** 1-based number of a run within its task ("run 2"). */
+export function runNumber(ctx: Ctx, run: { id: number; task_id: number }): number {
+	return (
+		ctx.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM runs WHERE task_id = ? AND id <= ?", run.task_id, run.id)
+			?.n ?? 1
+	);
+}
+
+/** The Telegram message id of the task's /task command (task messages reply to it). */
+export function taskReplyTo(ctx: Ctx, task: { update_id: number }): number | undefined {
+	return (
+		ctx.store.get<{ message_id: number | null }>("SELECT message_id FROM commands WHERE update_id = ?", task.update_id)
+			?.message_id ?? undefined
+	);
+}
+
+/** Enqueue a message about a task, replying to its /task message. Call inside `store.tx()`. */
+export function enqueueTask(
+	ctx: Ctx,
+	task: { id: number; chat_id: number; update_id: number },
+	kind: string,
+	text: string,
+	priority: OutboxMessage["priority"] = "required",
+): void {
+	ctx.store.enqueue({ chatId: task.chat_id, taskId: task.id, priority, kind, text, replyTo: taskReplyTo(ctx, task) });
+}
+
+/** Run a write transaction and kick the outbox afterwards. */
+export function tx<T>(ctx: Ctx, fn: () => T): T {
+	const result = ctx.store.tx(fn);
+	ctx.onOutbox();
+	return result;
+}
+
+export function worktreePath(ctx: Ctx, taskId: number): string {
+	return join(ctx.config.paths.taskDir, "worktrees", `task-${taskId}`);
+}
+
+export function branchName(ctx: Ctx, taskId: number): string {
+	return `${ctx.config.git.branchPrefix}${taskId}`;
+}
+
+export function conversationPath(ctx: Ctx, id: string): string {
+	return join(ctx.config.paths.dataDir, "conversations", `${id}.sqlite`);
+}
+
+/**
+ * Freeze the group (Architecture § Frozen group; Fails closed). Posts the notice once; the next tick cancels the
+ * group's running tasks with "group frozen". Never throws.
+ */
+export function freezeGroup(ctx: Ctx, reason: string): void {
+	if (ctx.stopped) return;
+	try {
+		tx(ctx, () => {
+			if (ctx.store.freeze(ctx.chatId, reason)) {
+				ctx.store.enqueue({
+					chatId: ctx.chatId,
+					priority: "required",
+					kind: "group_frozen",
+					text: `Group frozen: ${reason}. Only the owner CLI can unfreeze it.`,
+				});
+			}
+		});
+		ctx.log.warn("group_frozen", { chat: ctx.chatId, reason });
+	} catch (error) {
+		ctx.log.error("group_freeze_failed", { chat: ctx.chatId, error: describeError(error) });
+	}
+	ctx.kick();
+}
+
+export function groupHeld(ctx: Ctx): boolean {
+	const group = ctx.store.groupState(ctx.chatId);
+	return group.state !== "normal" || group.recheck;
+}
+
+export function releaseSlot(ctx: Ctx, slotId: number): void {
+	tx(ctx, () => ctx.store.run("DELETE FROM slots WHERE id = ?", slotId));
+}
+
+/** Slots in use deployment-wide (runs and checks). */
+export function slotsInUse(ctx: Ctx): number {
+	return ctx.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM slots")?.n ?? 0;
+}
+
+/** Reserve a 'check' slot atomically if one is free (Capacity § Concurrent execution: merge tests reserve one too). */
+export function reserveCheckSlot(ctx: Ctx, taskId: number): number | undefined {
+	return tx(ctx, () => {
+		if (slotsInUse(ctx) >= ctx.limits.maxConcurrentRuns) return undefined;
+		return ctx.store.run(
+			"INSERT INTO slots(kind, task_id, run_id, agent_id, acquired_at) VALUES ('check', ?, NULL, NULL, ?)",
+			taskId,
+			ctx.now(),
+		).lastInsertRowid;
+	});
+}
+
+/** Metadata-only error description for logs: class, code and status; never the message (it may carry paths). */
+export function describeError(error: unknown): string {
+	if (error instanceof GitHubError) return `GitHubError:${error.status ?? "network"}`;
+	if (error instanceof Error) {
+		const code = (error as { code?: unknown }).code;
+		return typeof code === "string" ? `${error.name}:${code}` : error.name;
+	}
+	return typeof error;
+}
+
+/** Text clipped to `max` characters, with a marker. */
+export function clipText(text: string, max: number): string {
+	return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** UTF-8 safe byte cap with a "[truncated]" marker (Agent Execution § Output and Context). */
+export function capBytes(text: string, maxBytes: number): { text: string; truncated: boolean } {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.length <= maxBytes) return { text, truncated: false };
+	const marker = "\n[truncated]";
+	let end = Math.max(0, maxBytes - Buffer.byteLength(marker));
+	// Do not cut inside a multi-byte sequence.
+	while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
+	return { text: `${bytes.subarray(0, end).toString("utf8")}${marker}`, truncated: true };
+}
+
+export { taskRef };

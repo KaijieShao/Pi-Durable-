@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { acquireDataDirLock, LockHeld, type LockProbe } from "../../src/runtime/lock.ts";
-import { tempDir } from "../helpers/agent.ts";
+
+async function tempDir(): Promise<{ dir: string; cleanup(): Promise<void> }> {
+	const dir = await mkdtemp(join(tmpdir(), "pdt-lock-"));
+	return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}
 
 function probe(over: Partial<LockProbe> = {}): LockProbe {
 	return { pid: 100, host: "h1", signal: () => undefined, startTime: () => "s100", now: Date.now, ...over };

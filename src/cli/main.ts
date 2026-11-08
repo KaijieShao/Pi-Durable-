@@ -1,13 +1,8 @@
 #!/usr/bin/env node
-import { createAuthContext } from "../agent/models.ts";
-import { loadConfig } from "../config/load.ts";
-import { ConfigError } from "../config/schema.ts";
-import { scrubSecrets } from "../config/scrub.ts";
-import { createLogger } from "../runtime/log.ts";
+import { errorSummary } from "../runtime/log.ts";
 import { packageVersion } from "../runtime/version.ts";
 import { parseArgs, USAGE } from "./args.ts";
-import { runLogin } from "./login.ts";
-import { runDaemon } from "./run.ts";
+import { runCoordinatorCli, type StartCoordinator } from "./run.ts";
 
 async function main(argv: readonly string[]): Promise<number | undefined> {
 	const args = parseArgs(argv);
@@ -21,37 +16,17 @@ async function main(argv: readonly string[]): Promise<number | undefined> {
 		case "invalid":
 			process.stderr.write(`${args.message}\n\n${USAGE}\n`);
 			return 2;
-		case "login":
-			if (args.envFile !== undefined && !loadEnvFile(args.envFile)) return 2;
-			return runLogin(args.provider);
-		default:
-			return run(args.envFile);
-	}
-}
-
-async function run(envFile: string | undefined): Promise<number | undefined> {
-	let config: Awaited<ReturnType<typeof loadConfig>>;
-	try {
-		config = await loadConfig(envFile === undefined ? {} : { envFile });
-	} catch (error) {
-		if (!(error instanceof ConfigError)) throw error;
-		process.stderr.write(`Configuration error:\n${error.message}\n`);
-		return 2;
-	}
-	const pluginEnv = { ...process.env };
-	const secrets = scrubSecrets(process.env);
-	const log = createLogger({ level: config.logLevel });
-	await runDaemon(config, { log, authContext: createAuthContext(secrets), pluginEnv });
-	return undefined;
-}
-
-function loadEnvFile(path: string): boolean {
-	try {
-		process.loadEnvFile(path);
-		return true;
-	} catch {
-		process.stderr.write(`--env-file: cannot read ${path}\n`);
-		return false;
+		case "owner": {
+			const { runOwnerCommand } = await import("./owner.ts");
+			return runOwnerCommand(args.action, { envFile: args.envFile });
+		}
+		default: {
+			// Loaded on demand, after the configuration parsed: --help and the owner CLI never load the runtime.
+			const start: StartCoordinator = async (config, deps) =>
+				(await import("../coordinator/coordinator.ts")).startCoordinator(config, deps);
+			const result = await runCoordinatorCli({ envFile: args.envFile, start });
+			return typeof result === "number" ? result : undefined;
+		}
 	}
 }
 
@@ -60,7 +35,8 @@ main(process.argv.slice(2)).then(
 		if (code !== undefined) process.exitCode = code;
 	},
 	(error: unknown) => {
-		process.stderr.write(`Fatal: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}\n`);
+		// The first line of the message, redacted; never a stack (it may carry URLs or values).
+		process.stderr.write(`Fatal: ${errorSummary(error)}\n`);
 		process.exitCode = 1;
 	},
 );
