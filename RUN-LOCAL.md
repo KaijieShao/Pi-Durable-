@@ -8,6 +8,9 @@ Docker containers with no network for file operations and checks, and the **watc
 independent stop path (it kills leftover Pi processes and containers and verifies they are gone, and enforces each
 run's deadline). What does not exist yet is listed in [README.md](README.md#not-built-yet).
 
+The local `process` mode is for Mac. On Linux both the Coordinator and watchdog reject it with a configuration error
+(exit 2); use `systemd` and complete the [Linux host setup](docs/isolation.md#one-time-host-setup-linux).
+
 **Before you start:** stop every other process that polls with the same bot token, in particular the old bot started
 by Conductor's **Bot** run action (see [Conductor](#conductor)). Telegram allows one `getUpdates` poller per token.
 

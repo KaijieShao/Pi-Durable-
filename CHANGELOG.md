@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Linux isolation fails closed:** the Coordinator and watchdog reject `PI_RUNNER_ISOLATION=process` with a clear
+  configuration error. Linux requires the Pi systemd slice; Mac local process behavior is unchanged. Production
+  startup factories also reject weak prebuilt configurations before any network or state setup.
+
 - **One PR per task after branch deletion:** published active branches cannot be recreated by a racing push;
   original PR identity survives lost responses, closure and restart. Idle reviews detect deletion/closure without
   an execution slot, hold only that task, and require restoring the same PR. Final preservation/archive of ended

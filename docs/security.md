@@ -14,8 +14,9 @@ and generated code.
   isolation the run key is the first frame on the Pi process's stdin, never in its argv, environment or unit
   properties. Only the Coordinator runs git (with the repository's hooks and local configuration disabled) and calls
   GitHub; the token travels in an environment header, never in a command line, URL or log.
-- **Pi processes are isolated** ([isolation.md](isolation.md)). On Linux (`PI_RUNNER_ISOLATION=systemd`, the
-  default there) each run is a transient unit in the dedicated slice `pi-durable-runs.slice`, as its own unprivileged
+- **Pi processes are isolated** ([isolation.md](isolation.md)). Linux requires `PI_RUNNER_ISOLATION=systemd`;
+  the Coordinator and watchdog reject `process` before starting (configuration error, exit 2). Each run is a
+  transient unit in the dedicated slice `pi-durable-runs.slice`, as its own unprivileged
   user `pi-runner`: read-only system, no home directories, private /tmp and devices, no new privileges, no
   capabilities, loopback-only network (the relay), memory, task and runtime limits. A host nftables rule drops the
   Pi user's traffic to every metadata address and everything off loopback. Its conversation files are readable by

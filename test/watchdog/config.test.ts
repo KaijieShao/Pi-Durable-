@@ -5,11 +5,12 @@
  * launcher does, takes only its own variables from an env file, and removes any secret from its environment.
  */
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { runWatchdogCli } from "../../src/cli/watchdog.ts";
+import { productionReapers, runWatchdogCli } from "../../src/cli/watchdog.ts";
 import { ConfigError } from "../../src/config/shared.ts";
 import { parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { deploymentId } from "../../src/runner/argv.ts";
@@ -63,6 +64,46 @@ test("it ignores every other variable, whatever its value (a broken bot token, a
 	);
 	assert.equal(config.groupChatId, -42);
 	assert.ok(!JSON.stringify(config).includes("not a token"));
+});
+
+test("Linux watchdog parsing and the production reaper factory both refuse process isolation", () => {
+	const env = { TELEGRAM_GROUP_CHAT_ID: "-42", PI_RUNNER_ISOLATION: " process " };
+	const defaults = { cwd: "/", home: "/h", platform: "linux" as const };
+	const rejected = (error: unknown) =>
+		error instanceof ConfigError &&
+		error.problems.length === 1 &&
+		error.problems[0]?.variable === "PI_RUNNER_ISOLATION" &&
+		/Linux requires systemd isolation in the Pi slice; process isolation is refused/.test(error.message);
+	assert.throws(() => parseWatchdogConfig(env, defaults), rejected);
+	assert.throws(() => loadWatchdogConfig({ env, platform: "linux" }), rejected);
+	const mac = parseWatchdogConfig(env, { ...defaults, platform: "darwin" });
+	assert.equal(mac.isolation, "process");
+	assert.throws(() => productionReapers(mac, "linux"), rejected, "prebuilt configs cannot bypass the factory guard");
+	assert.equal(productionReapers(mac, "darwin").processes.length, 1);
+	const systemd = parseWatchdogConfig({ TELEGRAM_GROUP_CHAT_ID: "-42" }, defaults);
+	assert.equal(productionReapers(systemd, "linux").processes.length, 2, "the slice reaper and marker fallback remain");
+	if (process.platform === "linux") assert.throws(() => productionReapers(mac), rejected);
+});
+
+test("the watchdog CLI rejects Linux process mode before logging, starting a loop or creating state", async (t) => {
+	const dir = await tempDir(t),
+		dataDir = join(dir, "must-not-exist");
+	const errors: string[] = [];
+	let logs = 0;
+	const result = await runWatchdogCli({
+		platform: "linux",
+		env: { PI_DATA_DIR: dataDir, TELEGRAM_GROUP_CHAT_ID: "-42", PI_RUNNER_ISOLATION: "process" },
+		processHandlers: false,
+		stderr: (text) => errors.push(text),
+		createLog() {
+			logs++;
+			throw new Error("must reject before logging or starting");
+		},
+	});
+	assert.equal(result, 2);
+	assert.equal(logs, 0);
+	assert.match(errors.join(""), /PI_RUNNER_ISOLATION: Linux requires systemd/);
+	assert.equal(existsSync(dataDir), false);
 });
 
 test("the deployment marker is the launcher's: the data directory resolved exactly as the Coordinator resolves it", () => {
@@ -142,7 +183,8 @@ test("the CLI starts with no secret in its environment, and removes any it finds
 		DOCKER_BIN: join(dir, "no-docker"),
 		...SECRETS,
 	};
-	const started = await runWatchdogCli({ env, processHandlers: false, createLog: () => log });
+	// This no-secret/process-mode test explicitly exercises the Mac policy even on Linux CI.
+	const started = await runWatchdogCli({ env, platform: "darwin", processHandlers: false, createLog: () => log });
 	assert.ok(typeof started !== "number");
 	t.after(() => started.stop());
 	for (const name of Object.keys(SECRETS)) assert.equal(env[name], undefined, `${name} removed`);

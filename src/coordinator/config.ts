@@ -9,8 +9,8 @@ import {
 	type ConfigProblem,
 	dataDirFrom,
 	type Env,
-	ISOLATIONS,
 	isolationFrom,
+	isolationProblem,
 	nonEmpty,
 	readEnvFileOnly,
 	SLICE_NAME,
@@ -378,7 +378,8 @@ function taskDirFrom(env: Env, dataDir: string, cwd: string): string {
 function parseRunner(env: Env, out: Collector, defaults: Defaults): CoordinatorConfig["runner"] {
 	const platform = defaults.platform ?? process.platform;
 	const isolation = isolationFrom(env.PI_RUNNER_ISOLATION, platform) as "systemd" | "process";
-	if (!(ISOLATIONS as readonly string[]).includes(isolation)) out.add("PI_RUNNER_ISOLATION", "systemd or process");
+	const problem = isolationProblem(isolation, platform);
+	if (problem !== undefined) out.add(problem.variable, problem.message);
 	const user = parseAccount(env, "PI_RUNNER_USER", "pi-runner", out);
 	if (isolation === "systemd" && user === defaults.username)
 		out.add("PI_RUNNER_USER", "must not be the Coordinator's own user");

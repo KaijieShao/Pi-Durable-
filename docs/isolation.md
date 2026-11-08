@@ -8,8 +8,13 @@ users".
 
 Each run gets one Pi process (src/runner/main.ts). `PI_RUNNER_ISOLATION` chooses how it is started:
 
-- **`systemd`**, the default on Linux and the deployment mode. src/coordinator/runner-systemd.ts.
+- **`systemd`**, required on Linux and the deployment mode. src/coordinator/runner-systemd.ts.
 - **`process`**, the default elsewhere (macOS). It is the weaker local mode. src/coordinator/runner-launcher.ts.
+
+On Linux both the Coordinator and watchdog refuse `PI_RUNNER_ISOLATION=process` with a configuration error
+(CLI exit 2). The Coordinator also checks programmatically supplied configs and launchers before creating state or
+calling Telegram `getMe`; the watchdog's production reaper factory applies the same policy. Set `systemd` and
+complete the host setup below. There is no environment or CLI override for this requirement.
 
 ## What differs
 
@@ -175,8 +180,8 @@ itself (GCP) is not covered here.
   filter. The firewall rule (metadata addresses, loopback only) still applies to the Pi user.
 - Each polkit check sees the unit name and verb only (see step 4).
 - The slice name's dashes are its hierarchy: `pi-durable-runs.slice` sits under `pi-durable.slice` and `pi.slice`.
-- The `process` mode can be chosen on Linux too (`PI_RUNNER_ISOLATION=process`). It logs `runner_isolation_weak` and
-  gives up all of the separation above; it is meant for development only.
+- Portable tests inject their platform in code and use process/systemd stand-ins. Those policy and lifecycle checks
+  do not verify real Linux users, slices, cgroups, polkit or firewall enforcement; run the deployment checks above.
 
 ---
 

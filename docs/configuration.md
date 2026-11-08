@@ -116,7 +116,7 @@ How each run's Pi process is isolated; see [isolation.md](isolation.md) for both
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | `systemd`: one transient unit per run as the Pi user in the Pi slice, sandboxed, loopback-only network; without the host setup no task runs (fails closed). `process`: a child process as the Coordinator's own user, the weaker local mode |
+| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | Linux requires `systemd`: one transient unit per run as the Pi user in the Pi slice, sandboxed, loopback-only network; without the host setup no task runs (fails closed). Linux refuses `process` at startup (exit 2). On Mac, `process` is a child as the Coordinator's own user, the weaker local mode |
 | `PI_RUNNER_USER` | no | `pi-runner` | The Pi user (systemd only); never `root` or the Coordinator's own user |
 | `PI_RUNNER_GROUP` | no | `pi-durable` | Group shared by the Pi user and the Coordinator user for `<PI_DATA_DIR>/conversations` |
 | `PI_RUNNER_SLICE` | no | `pi-durable-runs.slice` | The slice of the Pi units ([deploy/systemd](../deploy/systemd/pi-durable-runs.slice)); must be installed |
@@ -134,7 +134,7 @@ no secret at all; any secret variable in its environment is removed at start. Pr
 | `PI_DATA_DIR` | no | `~/.local/state/pi-durable-coordinator` | The Coordinator's data directory, resolved exactly as the Coordinator resolves it (so the deployment marker of the Pi processes is the same) |
 | `TELEGRAM_GROUP_CHAT_ID` | yes | | The group it freezes when a stop cannot be verified |
 | `DOCKER_BIN` | no | `docker` | The Docker CLI it lists and removes the labelled containers with |
-| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | Where it looks for Pi processes: the Pi slice's cgroup tree (and marked processes), or marked processes only. Use the Coordinator's value |
+| `PI_RUNNER_ISOLATION` | no | `systemd` on Linux, `process` elsewhere | Where it looks for Pi processes: the Pi slice's cgroup tree (and marked processes), or marked processes only. Use the Coordinator's value; Linux refuses `process` (exit 2), requiring the slice |
 | `PI_RUNNER_SLICE`, `SYSTEMCTL_BIN` | no | `pi-durable-runs.slice`, `systemctl` | The Pi slice, and the systemctl that shows its control group |
 | `LOG_LEVEL` | no | `info` | As for the Coordinator |
 

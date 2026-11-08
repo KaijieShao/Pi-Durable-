@@ -559,6 +559,8 @@ function spawnCoordinator(stack: Stack, docker: boolean): { child: ChildProcess;
 		const [coordinator, launcher, local, harness, log] = await Promise.all(modules.map((m) => import(m)));
 		const checks = { test: harness.nodeTestCheck };
 		await coordinator.startCoordinator(config, {
+			// TEST ONLY: this fake process stack exercises the Mac policy, including on Linux CI.
+			platform: "darwin",
 			remoteUrl,
 			...(docker ? {} : { sandbox: local.createLocalSandbox({ taskDir: config.paths.taskDir, checks }) }),
 			launcher: launcher.createRunLauncher({

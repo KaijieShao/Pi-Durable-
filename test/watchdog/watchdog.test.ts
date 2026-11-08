@@ -324,11 +324,12 @@ test("a pass that fails writes no heartbeat until passes work again", { timeout:
 	await waitFor(() => s.store.getMeta(HEARTBEAT_KEY) !== last, { what: "the heartbeat back" });
 });
 
-const MAIN = fileURLToPath(new URL("../../src/cli/main.ts", import.meta.url));
+// Code-only Mac policy fixture: the real parser/CLI/reapers, without a Linux cgroup/systemd requirement.
+const MAIN = fileURLToPath(new URL("../fixtures/watchdog-process-cli.mjs", import.meta.url));
 
 type CliWatchdog = { readonly pid: number; readonly lines: string[]; kill(): Promise<void> };
 
-/** The watchdog as its own process (the CLI), on the scene's database, with the docker stand-in. */
+/** Real CLI implementation in its own process, injected Mac policy, scene database and Docker stand-in. */
 async function cliWatchdog(t: TestContext, s: Scene): Promise<CliWatchdog> {
 	const child: ChildProcess = spawn(process.execPath, [MAIN, "watchdog"], {
 		env: {

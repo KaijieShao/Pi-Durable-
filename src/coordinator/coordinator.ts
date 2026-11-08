@@ -21,6 +21,7 @@
 import { closeSync, openSync } from "node:fs";
 import { chmod, mkdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { requireRunnerIsolation } from "../config/shared.ts";
 import { acquireDataDirLock, type DataDirLock } from "../runtime/lock.ts";
 import { createLogger, errorSummary, type Logger } from "../runtime/log.ts";
 import { ensurePrivateDir, makePrivate } from "../runtime/private-dir.ts";
@@ -53,6 +54,8 @@ import {
 } from "./watchdog-link.ts";
 
 export type CoordinatorDeps = {
+	/** TEST ONLY: platform policy under test. No environment or CLI setting changes the production platform. */
+	readonly platform?: NodeJS.Platform;
 	readonly telegram?: TelegramApi;
 	readonly github?: GitHubApi;
 	readonly git?: Git;
@@ -169,7 +172,6 @@ async function prepareDirs(config: CoordinatorConfig, isolation: RunLauncher["is
 function createLauncher(config: CoordinatorConfig, log: Logger): RunLauncher {
 	const { runner } = config;
 	if (runner.isolation === "process") {
-		if (process.platform === "linux") log.warn("runner_isolation_weak", { isolation: "process" });
 		return createRunLauncher({ dataDir: config.paths.dataDir, log });
 	}
 	return createSystemdRunLauncher({
@@ -403,10 +405,14 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 }
 
 export async function startCoordinator(config: CoordinatorConfig, deps: CoordinatorDeps = {}): Promise<Coordinator> {
+	// Also reject programmatically supplied/previously parsed configs before filesystem, locking or getMe/network I/O.
+	const platform = deps.platform ?? process.platform;
+	requireRunnerIsolation(config.runner.isolation, platform);
 	const log = deps.log ?? createLogger({ level: config.logLevel });
 	const setup: Setup = { config, deps, log, limits: deps.limits ?? DEMO_LIMITS };
 	const now = deps.now ?? Date.now;
 	const launcher = deps.launcher ?? createLauncher(config, log);
+	requireRunnerIsolation(launcher.isolation, platform);
 	await prepareDirs(config, launcher.isolation);
 	const lock: DataDirLock = acquireDataDirLock(config.paths.dataDir);
 	const parts: Parts = {};

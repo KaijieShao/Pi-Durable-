@@ -34,7 +34,8 @@ import { sleep, waitFor } from "../helpers/env.ts";
 import { markedProcess } from "../helpers/marked-process.ts";
 import { GROUP, type Stack, scriptedAgent, startStack, USER1 } from "./harness.ts";
 
-const MAIN = fileURLToPath(new URL("../../src/cli/main.ts", import.meta.url));
+// Explicit code-only Mac policy injection for portable process cleanup; not real Linux isolation verification.
+const MAIN = fileURLToPath(new URL("../fixtures/watchdog-process-cli.mjs", import.meta.url));
 const PAUSED = /^Task execution is paused: the watchdog \(the independent stop path\) is not answering/;
 
 type RunRow = {
@@ -71,7 +72,7 @@ const sweeps = (stack: Stack): SweepRow[] => readRows<SweepRow>(stack, "SELECT *
 
 type CliWatchdog = { readonly child: ChildProcess; readonly lines: string[]; kill(): Promise<void> };
 
-/** The watchdog as its own process, through the CLI, with an env file of its own variables only (no secret at all). */
+/** Real CLI implementation in its own process, Mac-policy fixture and an env file of watchdog variables only. */
 async function spawnWatchdog(t: TestContext, stack: Stack, docker: DockerShim): Promise<CliWatchdog> {
 	const envFile = join(stack.dir, "watchdog.env");
 	await writeFile(
@@ -123,6 +124,8 @@ function spawnCoordinator(stack: Stack): { child: ChildProcess; ready: Promise<v
 		const { modules, config, remoteUrl } = JSON.parse(readFileSync(0, "utf8"));
 		const [coordinator, launcher, local, harness, log] = await Promise.all(modules.map((m) => import(m)));
 		await coordinator.startCoordinator(config, {
+			// TEST ONLY: this fake process stack exercises the Mac policy, including on Linux CI.
+			platform: "darwin",
 			remoteUrl,
 			sandbox: local.createLocalSandbox({ taskDir: config.paths.taskDir, checks: { test: harness.nodeTestCheck } }),
 			launcher: launcher.createRunLauncher({

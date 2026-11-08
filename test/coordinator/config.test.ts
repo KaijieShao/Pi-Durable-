@@ -313,7 +313,7 @@ test("Pi process isolation: systemd by default on Linux, the local process mode 
 	assert.equal(parse({}, { ...DEFAULTS, platform: "darwin" }).runner.isolation, "process");
 	const explicit = parse(
 		{
-			PI_RUNNER_ISOLATION: "process",
+			PI_RUNNER_ISOLATION: "systemd",
 			PI_RUNNER_USER: "pi_run-2",
 			PI_RUNNER_GROUP: "pi-shared",
 			PI_RUNNER_SLICE: "pi-runs.slice",
@@ -323,7 +323,7 @@ test("Pi process isolation: systemd by default on Linux, the local process mode 
 		{ ...DEFAULTS, platform: "linux" },
 	);
 	assert.deepEqual(explicit.runner, {
-		isolation: "process",
+		isolation: "systemd",
 		user: "pi_run-2",
 		group: "pi-shared",
 		slice: "pi-runs.slice",
@@ -353,6 +353,24 @@ test("Pi process isolation: systemd by default on Linux, the local process mode 
 	}
 });
 
+test("Linux refuses explicit process isolation instead of silently weakening the Pi boundary", () => {
+	for (const value of ["process", " process "]) {
+		const found = problems({ ...VALID, PI_RUNNER_ISOLATION: value }, { ...DEFAULTS, platform: "linux" });
+		assert.deepEqual(
+			found.map((problem) => problem.variable),
+			["PI_RUNNER_ISOLATION"],
+		);
+		assert.match(
+			found[0]?.message ?? "",
+			/Linux requires systemd isolation in the Pi slice; process isolation is refused/,
+		);
+	}
+	assert.equal(
+		parse({ PI_RUNNER_ISOLATION: "process" }, { ...DEFAULTS, platform: "darwin" }).runner.isolation,
+		"process",
+	);
+});
+
 test("systemd isolation refuses the Coordinator's own user as the Pi user", () => {
 	const own = { ...DEFAULTS, platform: "linux" as const, username: "pi-coordinator" };
 	assert.deepEqual(
@@ -361,7 +379,8 @@ test("systemd isolation refuses the Coordinator's own user as the Pi user", () =
 	);
 	// The local process mode runs as the Coordinator's user by definition.
 	assert.equal(
-		parse({ PI_RUNNER_ISOLATION: "process", PI_RUNNER_USER: "pi-coordinator" }, own).runner.user,
+		parse({ PI_RUNNER_ISOLATION: "process", PI_RUNNER_USER: "pi-coordinator" }, { ...own, platform: "darwin" }).runner
+			.user,
 		"pi-coordinator",
 	);
 	const summary = describeConfig(parse({}, own));

@@ -48,6 +48,21 @@ export function isolationFrom(value: string | undefined, platform: NodeJS.Platfo
 	return nonEmpty(value) ?? (platform === "linux" ? "systemd" : "process");
 }
 
+/** The same fail-closed policy at parse time and at production factories, including prebuilt config objects. */
+export function isolationProblem(value: string, platform: NodeJS.Platform): ConfigProblem | undefined {
+	const message = !(ISOLATIONS as readonly string[]).includes(value)
+		? "systemd or process"
+		: platform === "linux" && value !== "systemd"
+			? "Linux requires systemd isolation in the Pi slice; process isolation is refused. Use PI_RUNNER_ISOLATION=systemd and complete the Linux host setup (docs/isolation.md)"
+			: undefined;
+	return message === undefined ? undefined : { variable: "PI_RUNNER_ISOLATION", message };
+}
+
+export function requireRunnerIsolation(value: string, platform: NodeJS.Platform = process.platform): void {
+	const problem = isolationProblem(value, platform);
+	if (problem !== undefined) throw new ConfigError([problem]);
+}
+
 /**
  * Only the variables `names` of an env file (KEY=value lines; `export KEY=value` too), or undefined when it cannot be
  * read. Lines of other variables are dropped before parsing, so their values never end up in the result.

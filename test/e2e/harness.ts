@@ -218,7 +218,12 @@ export async function scopedDockerBin(dir: string, scope: string): Promise<strin
 	return bin;
 }
 
-function stackConfig(dir: string, urls: { bot: string; github: string; model: string }, env: StackOptions["env"]) {
+function stackConfig(
+	dir: string,
+	urls: { bot: string; github: string; model: string },
+	env: StackOptions["env"],
+	platform: NodeJS.Platform,
+) {
 	return parseCoordinatorConfig(
 		{
 			TELEGRAM_BOT_TOKEN: `123456789:${"e".repeat(35)}`,
@@ -238,11 +243,11 @@ function stackConfig(dir: string, urls: { bot: string; github: string; model: st
 			GITHUB_API_URL: urls.github,
 			PI_DATA_DIR: join(dir, "data"),
 			PI_TASK_DIR: join(dir, "tasks"),
-			// The same Pi process mode on every platform (the default is systemd on Linux); runner: "systemd" overrides it.
+			// This fake stack exercises the Mac process policy on any host; Linux production rejects this mode.
 			PI_RUNNER_ISOLATION: "process",
 			...env,
 		},
-		{ cwd: dir, home: dir, uid: 1000, gid: 1000 },
+		{ cwd: dir, home: dir, uid: 1000, gid: 1000, platform },
 	);
 }
 
@@ -363,6 +368,12 @@ function stackEvaluator(options: StackOptions): Evaluator | undefined {
 	return base === undefined ? undefined : (options.wrap?.evaluator?.(base) ?? base);
 }
 
+/** Portable test policy: production-config cases use the real host, stand-ins choose their policy explicitly. */
+function stackPlatform(runner: StackOptions["runner"]): NodeJS.Platform {
+	if (runner === "config") return process.platform;
+	return runner === "systemd" ? "linux" : "darwin";
+}
+
 export async function startStack(options: StackOptions = {}) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-e2e-"));
 	const bot = new FakeBotApi();
@@ -380,12 +391,19 @@ export async function startStack(options: StackOptions = {}) {
 		shims === undefined
 			? {}
 			: { PI_RUNNER_ISOLATION: "systemd", SYSTEMD_RUN_BIN: shims.systemdRun, SYSTEMCTL_BIN: shims.systemctl };
-	const config: CoordinatorConfig = stackConfig(dir, urls, {
-		...containerUser,
-		...systemdEnv,
-		...hiddenEnv,
-		...options.env,
-	});
+	// Code-only test injection: no env or CLI override can weaken the Linux production policy.
+	const platform = stackPlatform(options.runner);
+	const config: CoordinatorConfig = stackConfig(
+		dir,
+		urls,
+		{
+			...containerUser,
+			...systemdEnv,
+			...hiddenEnv,
+			...options.env,
+		},
+		platform,
+	);
 	if (shims !== undefined) await prepareSystemdLayout(config.paths.dataDir);
 	const log = stackLogger();
 	const limits: Limits = { ...DEMO_LIMITS, ...options.limits };
@@ -416,6 +434,7 @@ export async function startStack(options: StackOptions = {}) {
 					),
 				};
 	const deps = {
+		platform,
 		remoteUrl: origin.bare,
 		...optional("sandbox", localSandbox),
 		...optional("evaluator", evaluator),

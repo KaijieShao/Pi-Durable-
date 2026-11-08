@@ -6,7 +6,7 @@
  *                            Coordinator resolves it, so the deployment marker is the launcher's
  *   TELEGRAM_GROUP_CHAT_ID   the group to freeze when a stop cannot be verified
  *   DOCKER_BIN               the Docker CLI (labelled containers)
- *   PI_RUNNER_ISOLATION      systemd (default on Linux: the Pi slice) or process (elsewhere: marked processes)
+ *   PI_RUNNER_ISOLATION      systemd (required on Linux: the Pi slice) or process (elsewhere: marked processes)
  *   PI_RUNNER_SLICE          the Pi slice; SYSTEMCTL_BIN the systemctl to ask for its control group
  *   LOG_LEVEL
  *
@@ -22,8 +22,8 @@ import {
 	type ConfigProblem,
 	dataDirFrom,
 	type Env,
-	ISOLATIONS,
 	isolationFrom,
+	isolationProblem,
 	LOG_LEVELS,
 	nonEmpty,
 	readEnvFileOnly,
@@ -73,9 +73,9 @@ function chatId(env: Env, problems: ConfigProblem[]): number {
 
 function isolation(env: Env, platform: NodeJS.Platform, problems: ConfigProblem[]): WatchdogConfig["isolation"] {
 	const value = isolationFrom(env.PI_RUNNER_ISOLATION, platform);
-	if ((ISOLATIONS as readonly string[]).includes(value)) return value as WatchdogConfig["isolation"];
-	problems.push({ variable: "PI_RUNNER_ISOLATION", message: "systemd or process" });
-	return "process";
+	const problem = isolationProblem(value, platform);
+	if (problem !== undefined) problems.push(problem);
+	return value as WatchdogConfig["isolation"];
 }
 
 function slice(env: Env, problems: ConfigProblem[]): string {
@@ -117,12 +117,19 @@ export function parseWatchdogConfig(
  * The watchdog's variables from `env` (they win) and the optional env file: only WATCHDOG_VARIABLES are taken from
  * the file; nothing is written to `env`.
  */
-export function loadWatchdogConfig(options: { readonly envFile?: string; readonly env?: Env } = {}): WatchdogConfig {
+export function loadWatchdogConfig(
+	options: {
+		readonly envFile?: string;
+		readonly env?: Env;
+		/** TEST ONLY: platform policy under test; production always uses process.platform. Never read from env/CLI. */
+		readonly platform?: NodeJS.Platform;
+	} = {},
+): WatchdogConfig {
 	const env = options.env ?? process.env;
 	const picked: Record<string, string | undefined> = {};
 	const file = options.envFile === undefined ? {} : readEnvFileOnly(options.envFile, WATCHDOG_VARIABLES);
 	if (file === undefined)
 		throw new ConfigError([{ variable: "--env-file", message: `${options.envFile}: cannot be read` }]);
 	for (const name of WATCHDOG_VARIABLES) picked[name] = env[name] ?? file[name];
-	return parseWatchdogConfig(picked);
+	return parseWatchdogConfig(picked, { cwd: process.cwd(), home: homedir(), platform: options.platform });
 }

@@ -11,7 +11,7 @@
  * Exit codes: 0 stopped by SIGINT/SIGTERM, 2 configuration problem (printed by variable name, never a value).
  */
 import { scrubSecrets } from "../config/scrub.ts";
-import { ConfigError } from "../config/shared.ts";
+import { ConfigError, requireRunnerIsolation } from "../config/shared.ts";
 import { createLogger, errorSummary, type Logger } from "../runtime/log.ts";
 import { createShutdownController } from "../runtime/signals.ts";
 import { packageVersion } from "../runtime/version.ts";
@@ -26,6 +26,8 @@ import {
 import { startWatchdog, type Watchdog } from "../watchdog/watchdog.ts";
 
 export type WatchdogCliOptions = {
+	/** TEST ONLY: platform policy under test; never configurable from the environment or product CLI. */
+	readonly platform?: NodeJS.Platform;
 	readonly envFile?: string | undefined;
 	/** Defaults to `process.env` (only the watchdog's variables are read; secret variables are removed from it). */
 	readonly env?: NodeJS.ProcessEnv;
@@ -36,8 +38,9 @@ export type WatchdogCliOptions = {
 	readonly createLog?: (config: WatchdogConfig) => Logger;
 };
 
-/** The production reapers of a configuration. */
-export function productionReapers(config: WatchdogConfig): Reapers {
+/** Production reapers, guarded even for prebuilt configs. `platform` is a code-only test injection. */
+export function productionReapers(config: WatchdogConfig, platform: NodeJS.Platform = process.platform): Reapers {
+	requireRunnerIsolation(config.isolation, platform);
 	const marked = markerProcessReaper({ deployment: config.deployment });
 	const processes: Reaper[] =
 		config.isolation === "systemd"
@@ -53,7 +56,11 @@ export function productionReapers(config: WatchdogConfig): Reapers {
 function readConfig(options: WatchdogCliOptions, env: NodeJS.ProcessEnv): WatchdogConfig | number {
 	const stderr = options.stderr ?? ((text: string) => void process.stderr.write(text));
 	try {
-		return loadWatchdogConfig({ ...(options.envFile === undefined ? {} : { envFile: options.envFile }), env });
+		return loadWatchdogConfig({
+			...(options.envFile === undefined ? {} : { envFile: options.envFile }),
+			env,
+			platform: options.platform,
+		});
 	} catch (error) {
 		if (!(error instanceof ConfigError)) throw error;
 		stderr(`Configuration error:\n${error.problems.map((p) => `  ${p.variable}: ${p.message}`).join("\n")}\n`);
@@ -92,7 +99,7 @@ export async function runWatchdogCli(options: WatchdogCliOptions = {}): Promise<
 	const watchdog = startWatchdog({
 		dataDir: config.dataDir,
 		chatId: config.groupChatId,
-		reapers: productionReapers(config),
+		reapers: productionReapers(config, options.platform),
 		log,
 	});
 	const controller = createShutdownController({

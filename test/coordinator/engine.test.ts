@@ -508,7 +508,8 @@ function testConfig(dir: string): CoordinatorConfig {
 			PI_DATA_DIR: join(dir, "data"),
 			PI_TASK_DIR: join(dir, "tasks"),
 		},
-		{ cwd: dir, home: dir, uid: 1000, gid: 1000 },
+		// This scripted launcher exercises the local Mac policy, even when CI itself is Linux.
+		{ cwd: dir, home: dir, uid: 1000, gid: 1000, platform: "darwin" },
 	);
 }
 
@@ -2925,6 +2926,7 @@ test("startCoordinator wires recovery, relay, poller, engine and outbox; /task f
 	const limits: Limits = { ...DEMO_LIMITS, stopGraceMs: 300, checkDeadlineMs: 3000, minFreeDiskBytes: 0 };
 	const sandbox = createLocalSandbox({ taskDir: config.paths.taskDir });
 	const deps = {
+		platform: "darwin" as const,
 		telegram: telegram.api,
 		github: world.github,
 		git: world.git,
@@ -2982,6 +2984,7 @@ test("startCoordinator refuses a bot whose username does not match and releases 
 	const config = testConfig(dir);
 	const world = createWorld();
 	const deps = {
+		platform: "darwin" as const,
 		telegram: fakeTelegram("someone_else_bot").api,
 		github: world.github,
 		git: world.git,
@@ -2991,6 +2994,40 @@ test("startCoordinator refuses a bot whose username does not match and releases 
 	};
 	await assert.rejects(startCoordinator(config, deps), (error: unknown) => error instanceof ConfigError);
 	await assert.rejects(startCoordinator(config, deps), (error: unknown) => error instanceof ConfigError);
+});
+
+test("Linux startup refuses a weak prebuilt config or injected launcher before dirs, locks, database or getMe", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "coordinator-policy-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const config = testConfig(dir);
+	let touched = 0;
+	const telegram = {
+		...fakeTelegram().api,
+		async getMe() {
+			touched++;
+			throw new Error("must not contact the bot");
+		},
+	};
+	const check = (error: unknown) =>
+		error instanceof ConfigError &&
+		error.problems.length === 1 &&
+		error.problems[0]?.variable === "PI_RUNNER_ISOLATION" &&
+		/Linux requires systemd/.test(error.message);
+	// A caller can construct or parse a Mac config then hand it to a Linux startup; the runtime still rejects it.
+	await assert.rejects(startCoordinator(config, { platform: "linux", telegram }), check);
+	// Even a systemd config must not mask a weaker launcher supplied programmatically.
+	const systemd = { ...config, runner: { ...config.runner, isolation: "systemd" as const } };
+	await assert.rejects(
+		startCoordinator(systemd, {
+			platform: "linux",
+			telegram,
+			launcher: createFakeLauncher(() => {}).launcher,
+		}),
+		check,
+	);
+	assert.equal(touched, 0);
+	assert.equal(existsSync(config.paths.dataDir), false);
+	assert.equal(existsSync(config.paths.taskDir), false);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
