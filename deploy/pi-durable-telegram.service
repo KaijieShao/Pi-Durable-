@@ -1,0 +1,33 @@
+# systemd user unit for pi-durable-telegram.
+#
+#   mkdir -p ~/.config/systemd/user ~/.config/pi-durable-telegram
+#   cp deploy/pi-durable-telegram.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/pi-durable-telegram/env      # TELEGRAM_BOT_TOKEN=..., TELEGRAM_ALLOWED_USER_IDS=..., PI_WORKDIR=...
+#   chmod 600 ~/.config/pi-durable-telegram/env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pi-durable-telegram
+#   loginctl enable-linger "$USER"                 # keep running after logout
+#   journalctl --user -u pi-durable-telegram -f
+#
+# No sandboxing options on purpose: the agent's bash tool is meant to have the service user's full access.
+
+[Unit]
+Description=pi-durable-telegram (durable coding agent in Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/env pi-durable-telegram run --env-file %h/.config/pi-durable-telegram/env
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=3
+# Exit codes 2 (bad config), 3 (data dir in use) and 4 (not logged in) need a person, not a restart loop.
+RestartPreventExitStatus=2 3 4
+TimeoutStopSec=30
+KillMode=mixed
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

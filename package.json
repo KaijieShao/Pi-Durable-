@@ -1,0 +1,91 @@
+{
+  "name": "pi-durable-telegram",
+  "version": "0.1.10",
+  "description": "Always-on durable pi agent on your server that you talk to in Telegram: a pi-durable Telegram gateway that survives crashes and restarts",
+  "license": "MIT",
+  "author": "smixs",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smixs/pi-durable-telegram.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-durable",
+    "pi-agent",
+    "telegram",
+    "telegram-bot",
+    "ai-agent",
+    "coding-agent",
+    "durable",
+    "self-hosted",
+    "claude",
+    "grammy"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "pi-durable-telegram": "dist/cli/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "deploy",
+    "skills",
+    "docs",
+    "scripts/patch-pi-durable.mjs"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "prepack": "npm run build",
+    "postinstall": "node scripts/patch-pi-durable.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/pi-mcp": "1.5.0",
+    "@earendil-works/pi-schema": "1.5.0",
+    "grammy": "1.46.0",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "24.19.2",
+    "@types/proper-lockfile": "4.1.4",
+    "fast-check": "4.10.2",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/chord": "1.5.0"
+  },
+  "homepage": "https://github.com/smixs/pi-durable-telegram#readme",
+  "bugs": {
+    "url": "https://github.com/smixs/pi-durable-telegram/issues"
+  },
+  "pi": {
+    "skills": [
+      "./skills"
+    ],
+    "image": "https://raw.githubusercontent.com/smixs/pi-durable-telegram/main/assets/pi-gallery.webp"
+  }
+}

@@ -1,0 +1,31 @@
+name: Bug report
+description: Something does not work as described
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `pi-durable-telegram --version`
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Node.js version, model provider and model
+      placeholder: "Ubuntu 24.04, Node 24.15, anthropic/claude-opus-5-5"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Journal output
+      description: "`journalctl --user -u pi-durable-telegram -n 50 -o cat`. Logs contain no message text or tokens, but check before pasting."
+      render: text
