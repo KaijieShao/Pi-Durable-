@@ -1,24 +1,8 @@
 {
-  "version": 1,
+  "version": 3,
   "suites": [
-    {
-      "name": "module:{name}",
-      "each": "modules",
-      "hidden": "modules/{name}",
-      "argv": ["node", "--test", "{tests}"],
-      "timeoutMs": 600000
-    },
-    {
-      "name": "integration",
-      "hidden": "integration",
-      "argv": ["node", "--test", "{tests}"],
-      "timeoutMs": 600000
-    },
-    {
-      "name": "baseline",
-      "hidden": "baseline",
-      "argv": ["node", "--test", "{tests}"],
-      "timeoutMs": 600000
-    }
+    { "name": "module:{name}", "each": "modules", "hidden": "modules/{name}", "timeoutMs": 600000 },
+    { "name": "integration", "hidden": "integration", "timeoutMs": 600000 },
+    { "name": "baseline", "hidden": "baseline", "timeoutMs": 600000 }
   ]
 }

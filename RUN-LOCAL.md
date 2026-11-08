@@ -363,17 +363,67 @@ Telegram starts it.
 
    ```
    hidden-tests/
-     modules/signup/*.test.js     one suite per folder of modules/ (each module's hidden tests)
-     integration/*.test.js        the signup-flow integration test across agents A and B
-     baseline/*.test.js           behaviour that existed before the trial
+     modules/signup/signup.test.js
+     modules/signup/expected.json
+     integration/flow.test.mjs
+     integration/expected.json
+     baseline/version.test.cjs
+     baseline/expected.json
    ```
 
-   Each suite runs in a fresh copy of the snapshot with its folder copied to `hidden-tests/<folder>/` (a
-   `hidden-tests/` folder of the project itself is removed from the copy first), with `node --test` from the copy's
-   root, so a hidden test requires the project as `require("../../signup.js")`. A suite whose
-   folder is missing or holds no `*.test.js` (`.mjs`, `.cjs`) file counts as an error, never as a pass. The suite list
-   itself is fixed in the evaluator image (`deploy/docker/suites.json`, built into `/opt/pi-eval/suites.json`):
-   change the commands there and rebuild the image (`scripts/build-images.sh`) to change how suites run.
+   Hidden tests remain **native Node tests** (`node:test`, `.test.js`, `.test.mjs`, `.test.cjs`), with full Node
+   filesystem, asynchronous and child-process APIs. Each suite also needs an independent versioned manifest:
+
+   ```json
+   {"version":3,"tests":[{"id":"accepts-email","file":"signup.test.js","name":"accepts an email"}]}
+   ```
+
+   Names are the actual Node test names; IDs must be unique and every test file must be declared. Optional `line`
+   disambiguates identical names in one file. Every expected test must execute and pass; skips, todos, missing tests
+   (including an accidental `only` selection), duplicate/unplanned results and missing/truncated reports fail closed.
+
+   **Test the application externally; never import its generated source into the trusted test process.** The trusted
+   grader physically has no snapshot mount. Its native tests use the provided client instead:
+
+   ```js
+   const { test } = require("node:test");
+   const assert = require("node:assert/strict");
+   const { app } = require(process.env.PI_EVAL_CLIENT_PATH);
+   test("accepts an email", async () => {
+     assert.equal(await app.call("signup.js", "signup", ["ana@example.com"]), true);
+   });
+   ```
+
+   `app.evaluate(body, input)` runs unrestricted asynchronous Node code in the **app container**, with `require`,
+   `importModule`, `cwd` and `input`; assertions and expected values stay in the trusted hidden test. `app.exec(argv,
+   options)` runs a child process there and returns its exit status and Buffer stdout/stderr. Values use native V8
+   serialization (including Buffer, Map, BigInt and Date), not a JSON-only DSL. Complex callbacks, constructors and
+   stream behavior can be exercised in the application and their observations asserted outside it. This is an
+   explicit external-test migration, not transparent compatibility with unknown in-process import tests.
+
+   For filesystem side effects, use `await app.readFile(relativePath)`: the trusted host reads actual app-scratch
+   bytes with Python3 `openat` directory FDs and `O_NOFOLLOW`, refusing symlinks, special files and escaping paths.
+   An app-reported successful write followed by an app-reported read is not evidence. Likewise, application-owned
+   test reports, `exit(0)` or assertions inside `app.evaluate` are not an independent pass decision; keep the actual
+   hidden assertions and their expected values in the trusted test process. Python3 on the host PATH,
+   with `dir_fd` and `O_NOFOLLOW`, is an explicit requirement; evaluator availability fails closed without it.
+
+   The Coordinator runs **one trusted grader and one separate full-Node application container**. Only the grader
+   receives the read-only hidden mount; only the app receives the read-only snapshot; their writable scratch mounts
+   are disjoint. Both have no network, credentials, Docker socket or shared PID namespace. Each gets 1 vCPU, 1 GiB
+   and 256 PIDs: the total remains 2 vCPU, 2 GiB and 512 PIDs. An app-local Unix socket and a host-started `docker exec`
+   proxy carry untrusted business observations; no host-to-Docker-VM Unix socket sharing is assumed. Native stdout,
+   stderr and stream callbacks/drain are unchanged; logs cannot enter the trusted grading report.
+
+   Each suite gets a fresh app container and writable snapshot copy only after the prior subject is stopped and
+   verified gone. Unexpected app exit, malformed transport or V8 decoding failures latch independently of test
+   assertions, so `assert.rejects` cannot swallow an infrastructure failure into a passing trial. Ordinary application
+   exceptions and genuinely missing/unsafe file observations remain available for explicit negative tests.
+
+   The fixed **version 3** suite list lives in `deploy/docker/suites.json`; `scripts/build-images.sh` builds it offline
+   from the already-local Node image. No QuickJS runtime or restricted-case grading path is included. Migrate every
+   prior assertion, rebuild, and freeze a **new separately reported evaluation series** (spec § Frozen Before Trial 1).
+   Never pool results from the old in-process runner or the rejected restricted prototype with this build.
 2. **Restart the Coordinator** with the new variable, and let the trial's tasks run, get approved and merge.
 3. **Seal**, in a second terminal:
 
@@ -394,9 +444,9 @@ Telegram starts it.
    finish`.
 5. Then the Coordinator verifies nothing executes any more (its own kills and the watchdog's sweep), fetches `main`,
    checks it contains every trial task's merge, exports it read-only to `<PI_TASK_DIR>/snapshots/trial-1-<commit>`
-   (with `trial-1-<commit>.manifest.json`: commit, git tree, content hash) and starts the evaluator container
-   (`pi-durable-evaluator:demo`, no network, 2 vCPU / 2 GiB, the snapshot and hidden tests read-only, a scratch
-   directory under `<PI_TASK_DIR>/eval-scratch/`). The suites run one after another (30-minute deadline).
+   (with `trial-1-<commit>.manifest.json`: commit, git tree, content hash) and starts the trusted evaluator plus its isolated application
+   (`pi-durable-evaluator:demo`, no network, aggregate 2 vCPU / 2 GiB, disjoint read-only sources and private scratch
+   directories under `<PI_TASK_DIR>/eval-scratch/`). The suites run one after another (30-minute deadline).
 6. **The result** is posted to the group, for example `Evaluation of trial trial-1: PASSED. Snapshot of main at
    1a2b3c4. Trial tasks: Task 3, Task 4. Suites (3 of 3 passed): module:signup passed, integration passed, baseline
    passed. Dispatch has reopened.`, and recorded: `owner status` shows `Last evaluation: …` with the per-suite
@@ -410,16 +460,18 @@ recorded): check `docker ps -a --filter label=pi-durable.kind=evaluator` and the
 unfreeze`. A restart during the evaluation records it as interrupted (not graded) and reopens dispatch once the
 cleanup is verified; seal again with a new trial id. A freeze while sealing ends the sealing without grading.
 
-To look at a failing suite, run the launcher on the snapshot yourself (the same suites, without the container):
+The controller must run through the host broker; running it alone or importing candidate code into it bypasses the
+external test contract and is unsupported. To exercise the packaged path without Telegram or credentials, run:
 
 ```sh
-mkdir -p /tmp/eval-scratch
-node deploy/docker/run-eval.mjs --snapshot "$PI_TASK_DIR/snapshots/trial-1-<commit>" \
-  --hidden /path/to/hidden-tests --scratch /tmp/eval-scratch --suites "$PWD/deploy/docker/suites.json"
+node --test test/coordinator/evaluator-docker.test.ts
 ```
 
-It prints one JSON line per suite; the test output itself is discarded (also in the container), so rerun a suite's
-`node --test` by hand in a copy of the snapshot to see it.
+It uses synthetic snapshots and native hidden tests. The trusted plan binds expected IDs; each suite records actual
+executed/passed IDs before `done`. Application output is never parsed as a grading report. This separation and its
+failure cases are regression-tested, not a proof against kernel/container/Node vulnerabilities, compromised trusted
+images or hidden-test authors, or side channels. External tests establish observable behavior; they do not attest
+an internal function's identity or rule out hard-coded behavior outside the tested inputs.
 
 ## Where the data lives
 

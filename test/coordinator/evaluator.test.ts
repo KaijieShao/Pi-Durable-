@@ -31,11 +31,12 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { exportSnapshot, removeTree, snapshotPaths, treeHash } from "../../src/coordinator/engine/snapshot.ts";
 import { createGit, GitError } from "../../src/coordinator/git.ts";
+
 import { evaluationPassed, evaluatorRunOf } from "../../src/coordinator/sandbox/evaluator-output.ts";
 import { createLocalEvaluator } from "../../src/coordinator/sandbox/local.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
 import { waitFor } from "../helpers/env.ts";
-import { makeWritable, runLauncher } from "../helpers/evaluator.ts";
+import { fullNodeProgram, makeWritable, nodeSuite, runLauncher } from "../helpers/evaluator.ts";
 import { commitOnOrigin, createOriginRepo } from "../helpers/fake-github.ts";
 
 const roots: string[] = [];
@@ -124,9 +125,19 @@ test("exportSnapshot: the commit's files only, read-only, with its manifest; a l
 // The launcher's output
 
 const line = (event: object): string => JSON.stringify(event);
-const plan = (...suites: string[]) => line({ type: "plan", suites });
+const plan = (...suites: string[]) =>
+	line({ type: "plan", version: 3, suites, expectedTests: Object.fromEntries(suites.map((name) => [name, ["test"]])) });
 const suite = (name: string, outcome: string, exitCode?: number) =>
-	line({ type: "suite", name, outcome, exitCode, durationMs: 5 });
+	line({
+		type: "suite",
+		name,
+		outcome,
+		exitCode,
+		durationMs: 5,
+		expectedTests: ["test"],
+		executedTests: ["test"],
+		passedTests: outcome === "passed" ? ["test"] : [],
+	});
 const clean = { exitCode: 0, timedOut: false, aborted: false, failed: false, durationMs: 10 };
 
 test("the launcher's output: only planned suites count, a missing one is not_run (timeout at the deadline); passed only if all passed and it finished", () => {
@@ -141,7 +152,12 @@ test("the launcher's output: only planned suites count, a missing one is not_run
 		],
 	);
 	assert.equal(evaluationPassed(ok), true);
-	// Forged or repeated lines change nothing: a suite outside the plan, a second result, junk.
+	assert.equal(
+		evaluationPassed({ ...ok, suites: ok.suites.map((result) => ({ ...result, exitCode: 1 })) }),
+		false,
+		"the final decision itself rejects a nonzero exit, including trusted adapter results",
+	);
+	// Forged or repeated lines fail closed: a suite outside the plan, a second result, junk.
 	const forged = [plan("module:a"), suite("module:a", "failed", 1), suite("module:a", "passed", 0)];
 	forged.push(
 		suite("integration", "passed", 0),
@@ -186,9 +202,6 @@ test("the launcher's output: only planned suites count, a missing one is not_run
 // ---------------------------------------------------------------------------------------------------------------
 // The launcher on the host
 
-const TEST = (body: string) =>
-	`const { test } = require("node:test");\nconst assert = require("node:assert/strict");\n${body}\n`;
-
 function evalDirs(hidden: Record<string, string>) {
 	const root = tempDir("pd-eval-");
 	const snapshot = join(root, "snapshot");
@@ -208,17 +221,43 @@ function events(stdout: string): Record<string, unknown>[] {
 		.map((text) => JSON.parse(text) as Record<string, unknown>);
 }
 
-test("run-eval.mjs: the fixed suites one after another (one per module), in a fresh copy with the hidden tests; failing and empty suites; the snapshot untouched, scratch left empty", async () => {
+function normalHidden() {
+	return {
+		...nodeSuite("modules/greet", "greet.test.js", [
+			{ id: "greets", name: "greets", body: 'assert.equal(await app.call("lib/greet.js", "greet", ["a"]), "hi a");' },
+		]),
+		...nodeSuite("integration", "flow.test.mjs", [
+			{
+				id: "flow",
+				name: "flow",
+				body: 'assert.equal(await app.evaluate(\'const m = await importModule("lib/greet.js"); const b = await importModule("index.js"); return m.greet("b") && b.version;\'), 1);',
+			},
+		]),
+		...nodeSuite("baseline", "version.test.cjs", [
+			{
+				id: "version",
+				name: "version",
+				body: 'require("node:fs").writeFileSync("written-by-a-test.txt", "x"); assert.equal(await app.call("index.js", "version"), 1);',
+			},
+		]),
+	};
+}
+
+function runOf(result: Awaited<ReturnType<typeof runLauncher>>) {
+	return evaluatorRunOf(result.stdout, {
+		...clean,
+		exitCode: result.exitCode,
+		failed: result.failed || result.subjectFailed,
+	});
+}
+
+test("run-eval.mjs: native Node suites sequentially in fresh application processes; failing and empty suites; immutable snapshot and empty scratch", async () => {
 	const dirs = evalDirs({
-		"modules/greet/greet.test.js": TEST(
-			'test("greets", () => assert.equal(require("../../lib/greet.js").greet("a"), "hi a"));',
-		),
-		"modules/broken/broken.test.js": TEST('test("fails", () => assert.equal(1, 2));'),
-		"modules/empty/README.md": "no tests here\n",
-		"integration/flow.test.mjs": 'import { test } from "node:test";\ntest("flow", () => {});\n',
-		"baseline/version.test.js": TEST(
-			'require("node:fs").writeFileSync("written-by-a-test.txt", "x");\ntest("version", () => assert.equal(require("../../index.js").version, 1));',
-		),
+		...normalHidden(),
+		...nodeSuite("modules/broken", "broken.test.js", [
+			{ id: "fails", name: "fails", body: 'assert.equal(await app.call("index.js", "version"), 2);' },
+		]),
+		"modules/empty/README.md": "no hidden tests here\n",
 	});
 	chmodTree(dirs.snapshot);
 	const before = await treeHash(dirs.snapshot);
@@ -227,7 +266,15 @@ test("run-eval.mjs: the fixed suites one after another (one per module), in a fr
 	const out = events(result.stdout);
 	assert.deepEqual(out[0], {
 		type: "plan",
+		version: 3,
 		suites: ["module:broken", "module:empty", "module:greet", "integration", "baseline"],
+		expectedTests: {
+			"module:broken": ["fails"],
+			"module:empty": [],
+			"module:greet": ["greets"],
+			integration: ["flow"],
+			baseline: ["version"],
+		},
 	});
 	assert.deepEqual(
 		out.slice(1, -1).map((event) => [event.type, event.name, event.outcome, event.exitCode]),
@@ -240,87 +287,148 @@ test("run-eval.mjs: the fixed suites one after another (one per module), in a fr
 		],
 	);
 	assert.deepEqual(out.at(-1), { type: "done" });
-	assert.equal((await treeHash(dirs.snapshot)).hash, before.hash, "the snapshot is never written");
-	assert.deepEqual(readdirSync(dirs.scratch), [], "each suite's copy is removed");
-	const run = evaluatorRunOf(result.stdout, { ...clean, exitCode: result.exitCode });
-	assert.equal(evaluationPassed(run), false);
+	assert.equal((await treeHash(dirs.snapshot)).hash, before.hash);
+	assert.deepEqual(readdirSync(dirs.scratch), []);
+	assert.equal(evaluationPassed(runOf(result)), false);
 });
 
-test("run-eval.mjs: no module folder, a missing suite folder, a hanging suite (its bound), the overall deadline, bad arguments", async () => {
-	const dirs = evalDirs({
-		"integration/hang.test.js": TEST('test("hangs", () => new Promise(() => setInterval(() => {}, 1000)));'),
-	});
+test("run-eval.mjs: missing modules/suites, hanging native async test, overall deadline, bad arguments and unsafe argv", async () => {
+	const dirs = evalDirs(
+		nodeSuite("integration", "hang.test.js", [
+			{ id: "hangs", name: "hangs", body: "await new Promise(() => setInterval(() => {}, 1000));" },
+		]),
+	);
 	const suites = join(dirs.root, "suites.json");
 	writeFileSync(
 		suites,
 		JSON.stringify({
-			version: 1,
+			version: 3,
 			suites: [
-				{ name: "module:{name}", each: "modules", hidden: "modules/{name}", argv: ["node", "--test", "{tests}"] },
-				{ name: "integration", hidden: "integration", argv: ["node", "--test", "{tests}"], timeoutMs: 1500 },
-				{ name: "baseline", hidden: "baseline", argv: ["node", "--test", "{tests}"] },
+				{ name: "module:{name}", each: "modules", hidden: "modules/{name}" },
+				{ name: "integration", hidden: "integration", timeoutMs: 1500 },
+				{ name: "baseline", hidden: "baseline" },
 			],
 		}),
 	);
-	const started = Date.now();
-	const result = await runLauncher({ ...dirs, suites });
-	assert.equal(result.exitCode, 0, result.stderr);
-	assert.ok(Date.now() - started < 20_000, "the hanging suite was stopped at its bound");
+	const started = Date.now(),
+		result = await runLauncher({ ...dirs, suites });
+	assert.equal(result.exitCode, 0);
+	assert.ok(Date.now() - started < 20_000);
 	assert.deepEqual(
 		events(result.stdout)
-			.slice(0, -1)
-			.map((event) => (event.type === "plan" ? event.suites : [event.name, event.outcome])),
+			.slice(1, -1)
+			.map((event) => [event.name, event.outcome]),
 		[
-			["module", "integration", "baseline"],
 			["module", "error"],
 			["integration", "timeout"],
 			["baseline", "error"],
 		],
 	);
-	// The overall deadline: exit 124 once it passed, the suite in progress timed out.
 	const deadline = await runLauncher({ ...dirs, suites }, { deadlineMs: 800 });
 	assert.equal(deadline.exitCode, 124);
-	const cut = evaluatorRunOf(deadline.stdout, { ...clean, exitCode: deadline.exitCode });
-	assert.equal(cut.end, "timeout");
+	assert.equal(runOf(deadline).end, "timeout");
 	assert.deepEqual(
-		cut.suites.map((s) => s.outcome),
+		runOf(deadline).suites.map((suite) => suite.outcome),
 		["error", "timeout", "not_run"],
 	);
-	// Bad arguments and a bad suite list never run anything.
-	const bad = await runLauncher({ ...dirs, snapshot: "relative/path" });
+	assert.equal((await runLauncher({ ...dirs, snapshot: "relative/path" })).exitCode, 70);
+	writeFileSync(suites, JSON.stringify({ version: 3, suites: [{ name: "x", hidden: "../etc", argv: ["true"] }] }));
+	const bad = await runLauncher({ ...dirs, suites });
 	assert.equal(bad.exitCode, 70);
-	writeFileSync(suites, JSON.stringify({ version: 1, suites: [{ name: "x", hidden: "../etc", argv: ["true"] }] }));
-	const evil = await runLauncher({ ...dirs, suites });
-	assert.equal(evil.exitCode, 70);
-	assert.match(evil.stderr, /invalid suite definition/);
-	assert.equal(evil.stdout, "");
+	assert.match(bad.stderr, /invalid.*trusted grading configuration/);
+	assert.equal(bad.stdout, "");
 });
 
-test("run-eval.mjs: hidden-tests/ is the evaluator's: test files or a symlink the graded snapshot put there are removed, never run", async () => {
-	const dirs = evalDirs({
-		"modules/empty/README.md": "no tests here\n",
-		"integration/flow.test.js": TEST('test("flow", () => assert.equal(require("../../index.js").version, 1));'),
-		"baseline/version.test.js": TEST('test("version", () => {});'),
-	});
-	// The graded code plants a passing "hidden" test for the empty module and redirects another suite's folder.
-	writeTree(dirs.snapshot, { "hidden-tests/empty/planted.test.js": TEST('test("planted", () => {});') });
+test("run-eval.mjs: candidate-planted hidden files/symlinks never become trusted test definitions", async () => {
+	const dirs = evalDirs({ ...normalHidden(), "modules/empty/README.md": "none\n" });
+	writeTree(dirs.snapshot, { "hidden-tests/empty/planted.test.js": "process.exit(0);" });
 	symlinkSync("../lib", join(dirs.snapshot, "hidden-tests", "integration"));
 	chmodTree(dirs.snapshot);
 	const result = await runLauncher(dirs);
-	assert.equal(result.exitCode, 0, result.stderr);
 	assert.deepEqual(
-		events(result.stdout)
-			.filter((event) => event.type === "suite")
-			.map((event) => [event.name, event.outcome]),
+		runOf(result).suites.map((suite) => [suite.name, suite.outcome]),
 		[
 			["module:empty", "error"],
+			["module:greet", "passed"],
 			["integration", "passed"],
 			["baseline", "passed"],
 		],
-		"the planted test does not count: a module without hidden tests is an error",
 	);
-	assert.deepEqual(readdirSync(join(dirs.snapshot, "lib")), ["greet.js"], "nothing was written through the link");
+	assert.deepEqual(readdirSync(join(dirs.snapshot, "lib")), ["greet.js"]);
 	assert.deepEqual(readdirSync(dirs.scratch), []);
+});
+
+test("trusted report protocol: missing, truncated, fabricated, duplicate, extra, skipped, todo and fewer-than-expected results fail closed", () => {
+	const valid = [plan("baseline"), suite("baseline", "passed", 0), line({ type: "done" })];
+	const fewer = line({
+		type: "suite",
+		name: "baseline",
+		outcome: "passed",
+		exitCode: 0,
+		expectedTests: ["test"],
+		executedTests: [],
+		passedTests: [],
+	});
+	const invalid = [
+		"",
+		valid.slice(0, -1).join("\n"),
+		valid.join("\n").slice(0, -3),
+		[valid[0], fewer, valid[2]].join("\n"),
+		[valid[0], valid[1], valid[1], valid[2]].join("\n"),
+		[...valid, suite("extra", "passed", 0)].join("\n"),
+		[valid[0], suite("baseline", "skipped", 0), valid[2]].join("\n"),
+		[valid[0], suite("baseline", "todo", 0), valid[2]].join("\n"),
+		line({ type: "done", outcome: "passed" }),
+	];
+	for (const stdout of invalid) assert.equal(evaluationPassed(evaluatorRunOf(stdout, clean)), false);
+	assert.equal(evaluationPassed(evaluatorRunOf(valid.join("\n"), clean)), true);
+});
+
+test("transport failure cannot be converted to a pass by a hidden negative assertion", () => {
+	const run = evaluatorRunOf(
+		[plan("baseline"), suite("baseline", "passed", 0), line({ type: "done" })].join("\n"),
+		clean,
+	);
+	assert.equal(evaluationPassed(run), true);
+	assert.equal(evaluationPassed({ ...run, subjectFailed: true }), false);
+});
+
+test("hidden native tests: skip, todo, fewer definitions, missing/truncated manifests and unmanifested files fail closed", async () => {
+	for (const options of ["{skip:true}", "{todo:true}"]) {
+		const dirs = evalDirs({
+			...normalHidden(),
+			...nodeSuite("modules/greet", "greet.test.js", [
+				{ id: "greets", name: "greets", body: "assert.equal(1, 1);", options },
+			]),
+		});
+		assert.equal(evaluationPassed(runOf(await runLauncher(dirs))), false, options);
+	}
+	for (const manifest of [
+		"",
+		"{",
+		JSON.stringify({
+			version: 3,
+			tests: [
+				{ id: "greets", file: "greet.test.js", name: "greets" },
+				{ id: "missing", file: "greet.test.js", name: "never ran" },
+			],
+		}),
+	]) {
+		const dirs = evalDirs({ ...normalHidden(), "modules/greet/expected.json": manifest });
+		assert.equal(evaluationPassed(runOf(await runLauncher(dirs))), false);
+	}
+});
+
+test("full Node values and async/file/child-process APIs remain available; file effects are inspected independently", async () => {
+	const body = `const value=await app.evaluate(${JSON.stringify(fullNodeProgram)});
+	assert.deepEqual(value.data,Buffer.from("abc"));assert.deepEqual(value.map,new Map([["key",1]]));assert.equal(value.big,123n);assert.equal(value.child,"child");assert.equal(value.streamCallback,true);assert.equal(value.streamDrain,true);
+	assert.equal((await app.readFile("proof.txt")).toString(),"real file");`;
+	const dirs = evalDirs({
+		...normalHidden(),
+		...nodeSuite("modules/greet", "greet.test.js", [{ id: "node-apis", name: "full Node APIs", body }]),
+	});
+	const result = await runLauncher(dirs);
+	assert.equal(evaluationPassed(runOf(result)), true, result.stdout);
 });
 
 /** Read-only like a sealed snapshot: directories 0555, files 0444; symlinks untouched (never followed). */
@@ -364,4 +472,68 @@ test("the local test evaluator: its deadline and the caller's abort stop the run
 	const unavailable = createLocalEvaluator({ run: hanging.run as never, unavailable: "no image" });
 	assert.deepEqual(await unavailable.available(), { ok: false, reason: "no image" });
 	assert.equal(unavailable.facts(), undefined);
+});
+
+test("fresh full Node subject per suite: require cache, globals and pending timers cannot leak into the next suite", async () => {
+	const dirs = evalDirs({
+		...nodeSuite("modules/state", "state.test.js", [
+			{
+				id: "writes",
+				name: "writes",
+				body: 'await app.evaluate(\'globalThis.leak = true; require("node:fs").writeFileSync("index.js", "exports.version=99"); setInterval(()=>{},1000); return true;\');',
+			},
+		]),
+		...nodeSuite("integration", "fresh.test.js", [
+			{
+				id: "fresh",
+				name: "fresh",
+				body: 'assert.equal(await app.evaluate(\'return globalThis.leak ?? null;\'), null); assert.equal(await app.call("index.js","version"),1);',
+			},
+		]),
+		...nodeSuite("baseline", "version.test.js", [
+			{ id: "version", name: "version", body: 'assert.equal(await app.call("index.js","version"),1);' },
+		]),
+	});
+	assert.equal(evaluationPassed(runOf(await runLauncher(dirs))), true);
+});
+
+test("full native ESM, including .js package type module and top-level await, is supported", async () => {
+	const dirs = evalDirs({
+		...normalHidden(),
+		...nodeSuite("modules/greet", "greet.test.js", [
+			{ id: "esm", name: "esm", body: 'assert.equal(await app.call("esm/value.js", "version"),1);' },
+		]),
+	});
+	writeTree(dirs.snapshot, {
+		"esm/package.json": '{"type":"module"}',
+		"esm/value.js": "await new Promise(r=>setTimeout(r,5)); export const version=1;",
+	});
+	assert.equal(evaluationPassed(runOf(await runLauncher(dirs))), true);
+});
+
+test("published package includes the full Node controller/client/application and trusted file observer", () => {
+	const manifest = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+		files: string[];
+		dependencies: Record<string, string>;
+	};
+	assert.ok(manifest.files.includes("deploy"));
+	assert.equal(manifest.dependencies["quickjs-emscripten"], undefined);
+	for (const name of ["run-eval.mjs", "eval-tests.mjs", "app-client.mjs", "eval-app.mjs", "inspect-eval-file.py"])
+		assert.ok(readFileSync(new URL(`../../deploy/docker/${name}`, import.meta.url)).length > 0);
+});
+
+test("hidden module definitions never silently omit unsupported directories or symbolic aliases", async () => {
+	const invalid = evalDirs(normalHidden());
+	mkdirSync(join(invalid.hidden, "modules", "bad name"));
+	const bad = await runLauncher(invalid);
+	assert.equal(bad.exitCode, 70);
+	assert.equal(evaluationPassed(runOf(bad)), false);
+	const linked = evalDirs(normalHidden());
+	symlinkSync("greet", join(linked.hidden, "modules", "alias"));
+	const alias = await runLauncher(linked);
+	assert.equal(alias.exitCode, 70);
+	assert.equal(evaluationPassed(runOf(alias)), false);
+	const valid = evalDirs(normalHidden());
+	writeFileSync(join(valid.hidden, "modules", "README.md"), "module documentation");
+	assert.equal(evaluationPassed(runOf(await runLauncher(valid))), true);
 });

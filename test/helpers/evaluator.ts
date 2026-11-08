@@ -1,60 +1,101 @@
-/**
- * TEST ONLY: the isolated evaluator in tests. `hostLauncher` is a LocalEvaluatorRunner (src/coordinator/sandbox/
- * local.ts) that runs the evaluator image's own launcher (deploy/docker/run-eval.mjs) and suite list
- * (deploy/docker/suites.json) on the host, against the paths the Coordinator hands the evaluator: the same grading
- * as in the container, without its isolation. `makeWritable` lets a test's temp dir with a read-only snapshot be removed.
- */
+/** TEST ONLY benign local fixtures. Same-uid host subprocesses are NOT an adversarial isolation boundary. */
 import { spawn } from "node:child_process";
-import { chmod, lstat, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { chmod, lstat, mkdir, readdir, rm } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type EvaluationProcess, runEvaluationPair } from "../../src/coordinator/sandbox/evaluator-broker.ts";
 import type { LocalEvaluatorRunner } from "../../src/coordinator/sandbox/local.ts";
 
 export const RUN_EVAL = fileURLToPath(new URL("../../deploy/docker/run-eval.mjs", import.meta.url));
 export const SUITES = fileURLToPath(new URL("../../deploy/docker/suites.json", import.meta.url));
+const PROXY = fileURLToPath(new URL("../../deploy/docker/eval-proxy.mjs", import.meta.url));
+const APP = fileURLToPath(new URL("../../deploy/docker/eval-app.mjs", import.meta.url));
 
-/** Run the launcher on the host; its stdout and exit code. Killed (with its process group) on the signal. */
-export function runLauncher(
+async function stopLocalChild(child: ReturnType<typeof spawn> | undefined): Promise<void> {
+	if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+	const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+	try {
+		if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+	} catch {
+		child.kill("SIGKILL");
+	}
+	await closed;
+}
+async function stopLocalRole(
+	child: ReturnType<typeof spawn>,
+	transport: ReturnType<typeof spawn> | undefined,
+	scratch: string,
+	socket: string,
+): Promise<boolean> {
+	await Promise.all([stopLocalChild(child), stopLocalChild(transport)]);
+	await rm(scratch, { recursive: true, force: true });
+	await rm(socket, { force: true });
+	return (await lstat(scratch).catch(() => undefined)) === undefined;
+}
+export async function runLauncher(
 	paths: { snapshot: string; hidden: string; scratch: string; suites?: string },
 	options: { signal?: AbortSignal; deadlineMs?: number } = {},
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const args = [RUN_EVAL, "--snapshot", paths.snapshot, "--hidden", paths.hidden, "--scratch", paths.scratch];
-	args.push("--suites", paths.suites ?? SUITES);
-	return new Promise((resolve) => {
+): Promise<{ exitCode: number; stdout: string; stderr: string; subjectFailed: boolean; failed: boolean }> {
+	if (![paths.snapshot, paths.hidden, paths.scratch].every(isAbsolute))
+		return { exitCode: 70, stdout: "", stderr: "invalid absolute path", subjectFailed: false, failed: true };
+	let stderr = "";
+	let sequence = 0;
+	const localPath = process.env.PATH ?? "/usr/bin:/bin";
+	const deadline = String(options.deadlineMs ?? 60_000);
+	const suites = paths.suites ?? SUITES;
+	const launch = async (role: "grader" | "app"): Promise<EvaluationProcess> => {
+		const scratch = join(paths.scratch, `${role}-${++sequence}`);
+		await mkdir(scratch, { mode: 0o700 });
+		const socket = `/tmp/pi-eval-${randomBytes(8).toString("hex")}.sock`;
+		const args =
+			role === "grader"
+				? [RUN_EVAL, "--hidden", paths.hidden, "--scratch", scratch, "--suites", suites]
+				: [APP, paths.snapshot, scratch, socket];
 		const child = spawn(process.execPath, args, {
-			cwd: paths.scratch,
+			cwd: scratch,
 			env: {
-				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				PATH: localPath,
 				NODE_NO_WARNINGS: "1",
-				...(options.deadlineMs === undefined ? {} : { PI_EVAL_DEADLINE_MS: String(options.deadlineMs) }),
+				PI_EVAL_DEADLINE_MS: deadline,
 			},
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 			detached: true,
 		});
-		let stdout = "";
-		let stderr = "";
-		child.stdout.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		child.stderr.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString("utf8");
-		});
-		const kill = (): void => {
-			try {
-				if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
-			} catch {
-				// gone
-			}
+		const transport =
+			role === "app"
+				? spawn(process.execPath, [PROXY, socket], {
+						env: { PATH: localPath },
+						stdio: ["pipe", "pipe", "pipe"],
+						detached: true,
+					})
+				: undefined;
+		if (role === "grader")
+			child.stderr.on("data", (chunk) => {
+				stderr = (stderr + chunk.toString("utf8")).slice(0, 16384);
+			});
+		let stopped: Promise<boolean> | undefined;
+		const stop = (): Promise<boolean> => {
+			stopped ??= stopLocalRole(child, transport, scratch, socket);
+			return stopped;
 		};
-		options.signal?.addEventListener("abort", kill, { once: true });
-		child.on("close", (code) => {
-			options.signal?.removeEventListener("abort", kill);
-			resolve({ exitCode: code ?? 1, stdout, stderr });
-		});
+		return { child, scratch, stop, transport };
+	};
+	const result = await runEvaluationPair({
+		grader: await launch("grader"),
+		launchSubject: () => launch("app"),
+		deadlineMs: options.deadlineMs ?? 60_000,
+		...(options.signal === undefined ? {} : { signal: options.signal }),
 	});
+	return {
+		exitCode: result.timedOut ? 124 : (result.exitCode ?? 1),
+		stdout: result.stdout,
+		stderr,
+		subjectFailed: result.subjectFailed,
+		failed: result.failed,
+	};
 }
 
-/** The local evaluator's runner: the real launcher on the host, stopped on the Coordinator's signal. */
 export const hostLauncher: LocalEvaluatorRunner = async (spec) =>
 	runLauncher(
 		{ snapshot: spec.snapshot, hidden: spec.hiddenTests, scratch: spec.scratch },
@@ -68,3 +109,37 @@ export async function makeWritable(path: string): Promise<void> {
 	await chmod(path, 0o700);
 	for (const name of await readdir(path)) await makeWritable(join(path, name));
 }
+
+export type NodeHiddenTest = { id: string; name: string; body: string; options?: string };
+
+/** Independent manifest plus native Node tests. Bodies keep trusted assertions outside the observed application. */
+export function nodeSuite(folder: string, file: string, tests: readonly NodeHiddenTest[]): Record<string, string> {
+	const prefix = file.endsWith(".mjs")
+		? 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);\n'
+		: "";
+	const source =
+		prefix +
+		'const { test } = require("node:test");\nconst assert = require("node:assert/strict");\nconst { app } = require(process.env.PI_EVAL_CLIENT_PATH);\n' +
+		tests
+			.map((test) => `test(${JSON.stringify(test.name)}, ${test.options ?? "{}"}, async () => { ${test.body} });`)
+			.join("\n") +
+		"\n";
+	return {
+		[`${folder}/${file}`]: source,
+		[`${folder}/expected.json`]: JSON.stringify({
+			version: 3,
+			tests: tests.map(({ id, name }) => ({ id, file, name })),
+		}),
+	};
+}
+
+/** A full native Node positive fixture, shared by host smoke tests and the real isolated Docker boundary test. */
+export const fullNodeProgram = `
+const fs=require("node:fs/promises");await fs.writeFile("proof.txt","real file");
+console.log("normal console output");require("node:fs").writeSync(1,"raw stdout without newline");
+await new Promise((resolve,reject)=>process.stdout.write("native callback",error=>error?reject(error):resolve()));
+if(!process.stdout.write("x".repeat(128*1024)))await require("node:events").once(process.stdout,"drain");
+await new Promise(resolve=>setTimeout(resolve,5));
+const {execFileSync}=require("node:child_process");
+const child=execFileSync(process.execPath,["-e",${JSON.stringify('process.stdout.write("child")')}]).toString();
+return {data:Buffer.from("abc"),map:new Map([["key",1]]),big:123n,child,streamCallback:true,streamDrain:true};`;

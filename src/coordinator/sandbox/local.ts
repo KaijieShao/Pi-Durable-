@@ -238,9 +238,12 @@ export function createLocalSandbox(options: LocalSandboxOptions): Sandbox {
 // and killAll() behave like the Docker evaluator's label queries.
 
 /** The runner gets the spec (snapshot, hidden tests, scratch, deadline, a signal) and returns the launcher's output. */
-export type LocalEvaluatorRunner = (
-	spec: EvaluatorSpec & { readonly signal: AbortSignal },
-) => Promise<{ readonly exitCode: number; readonly stdout: string }>;
+export type LocalEvaluatorRunner = (spec: EvaluatorSpec & { readonly signal: AbortSignal }) => Promise<{
+	readonly exitCode: number;
+	readonly stdout: string;
+	readonly subjectFailed?: boolean;
+	readonly failed?: boolean;
+}>;
 
 export type LocalEvaluatorOptions = {
 	readonly run: LocalEvaluatorRunner;
@@ -250,7 +253,13 @@ export type LocalEvaluatorOptions = {
 };
 
 type RunnerEnd =
-	| { readonly kind: "done"; readonly exitCode: number; readonly stdout: string }
+	| {
+			readonly kind: "done";
+			readonly exitCode: number;
+			readonly stdout: string;
+			readonly subjectFailed?: boolean;
+			readonly failed?: boolean;
+	  }
 	| { readonly kind: "timeout" | "aborted" | "error" };
 
 async function isDirectory(path: string): Promise<boolean> {
@@ -275,7 +284,14 @@ function raceRunner(options: LocalEvaluatorOptions, spec: EvaluatorSpec): Promis
 		spec.signal?.addEventListener("abort", onAbort, { once: true });
 		if (spec.signal?.aborted === true) onAbort();
 		options.run({ ...spec, signal: controller.signal }).then(
-			(result) => finish({ kind: "done", exitCode: result.exitCode, stdout: String(result.stdout ?? "") }),
+			(result) =>
+				finish({
+					kind: "done",
+					exitCode: result.exitCode,
+					stdout: String(result.stdout ?? ""),
+					subjectFailed: result.subjectFailed,
+					failed: result.failed,
+				}),
 			() => finish({ kind: "error" }),
 		);
 	});
@@ -302,7 +318,7 @@ export function createLocalEvaluator(options: LocalEvaluatorOptions): Evaluator 
 			exitCode: end.kind === "done" ? end.exitCode : undefined,
 			timedOut: end.kind === "timeout",
 			aborted: end.kind === "aborted",
-			failed: end.kind === "error",
+			failed: end.kind === "error" || (end.kind === "done" && (end.subjectFailed === true || end.failed === true)),
 			durationMs: Date.now() - startedAt,
 		});
 	};

@@ -1,282 +1,278 @@
 #!/usr/bin/env node
-/**
- * The isolated evaluator's launcher, in the trusted evaluator image (Architecture § Isolated evaluator; Capacity
- * § Evaluator: "grades the suites sequentially"; Evaluation § What's Graded: each module's hidden tests, the signup-flow
- * integration test, a baseline suite).
- *
- * Inside the evaluator container (the Coordinator starts it: src/coordinator/sandbox/evaluator.ts):
- *   node /opt/pi-eval/run-eval.mjs
- *     /eval/snapshot   the sealed snapshot of main, read-only
- *     /eval/hidden     the hidden tests, read-only
- *     /scratch         scratch space, the only writable place (the Coordinator wipes it afterwards)
- *     suites.json      next to this file: the image's fixed suite list (the grading rules)
- * Host runs (tests, RUN-LOCAL) pass --snapshot, --hidden, --scratch and --suites; the Coordinator never does.
- *
- * Suite list: {"version": 1, "suites": [{"name", "hidden", "argv", "timeoutMs"?, "each"?}, ...]}. `hidden` is a folder
- * of the hidden tests; `each` (with {name} in `name` and `hidden`) makes one suite per subfolder of that folder, in
- * name order. For each suite, one after another:
- *   - a fresh, writable copy of the snapshot at /scratch/run/project, the suite's hidden tests copied into it at
- *     hidden-tests/<last segment of hidden> (a hidden-tests/ the snapshot brought is removed first: that folder is the
- *     evaluator's); no *.test.js / .mjs / .cjs file there → the suite is "error" (a suite with nothing to run never
- *     passes);
- *   - its argv, with the "{tests}" element replaced by those test files, runs in the copy without a shell, with a fixed
- *     environment (HOME and TMPDIR in scratch, CI=1, nothing else), in its own process group, its output discarded;
- *   - bounded by its timeoutMs and by what is left of PI_EVAL_DEADLINE_MS; passed only on exit 0;
- *   - /scratch/run is removed before the next suite.
- * stdout: one JSON line per event (src/coordinator/sandbox/evaluator-output.ts): the plan, one per suite, done.
- * Exit codes: 0 every suite ran; 70 the launcher could not run (EX_SOFTWARE); 124 the overall deadline passed.
- * Refuses to run as root. Plain JavaScript, no dependencies, Node 18+.
- */
-import { spawn } from "node:child_process";
-import {
-	lstatSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	readlinkSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { constants as osConstants } from "node:os";
-import { dirname, join, relative } from "node:path";
+/** Trusted full-Node controller. No snapshot mount, candidate import or app output enters this process. */
+import { fork } from "node:child_process";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { serialize } from "node:v8";
 
-const EXIT_LAUNCHER = 70;
-const EXIT_DEADLINE = 124;
-const DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEFAULT_TIMEOUT_MS = 10 * 60_000;
-const MAX_TIMEOUT_MS = 24 * 60 * 60_000;
+const HERE = dirname(fileURLToPath(import.meta.url));
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SUITE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
-const TEST_FILE = /\.test\.(c|m)?js$/;
+const TEST = /\.test\.(?:[cm]?js)$/;
+const pending = new Map();
+let nextId = 0;
+const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+const fail = () => {
+	process.stderr.write("pi-eval: invalid or unavailable trusted grading configuration\n");
+	process.exit(70);
+};
 
-function fail(message) {
-	process.stderr.write(`pi-eval: ${message}\n`);
-	process.exit(EXIT_LAUNCHER);
-}
+createInterface({ input: process.stdin }).on("line", (line) => {
+	try {
+		const message = JSON.parse(line);
+		const reply = pending.get(message.id);
+		if (reply === undefined || message.type !== "rpc_result") return;
+		pending.delete(message.id);
+		reply(message);
+	} catch {
+		fail();
+	}
+});
 
-function emit(event) {
-	process.stdout.write(`${JSON.stringify(event)}\n`);
+function request(op, payload) {
+	return new Promise((resolve) => {
+		const id = ++nextId;
+		pending.set(id, resolve);
+		emit({ type: "rpc", id, op, payload });
+	});
 }
 
 function options(argv) {
-	const here = dirname(fileURLToPath(import.meta.url));
-	const paths = {
-		snapshot: "/eval/snapshot",
-		hidden: "/eval/hidden",
-		scratch: "/scratch",
-		suites: join(here, "suites.json"),
-	};
+	const paths = { hidden: "/eval/hidden", scratch: "/scratch", suites: join(HERE, "suites.json") };
 	for (let index = 0; index < argv.length; index += 2) {
-		const key = argv[index]?.replace(/^--/, "");
-		const value = argv[index + 1];
-		if (key === undefined || !Object.hasOwn(paths, key) || value === undefined || !value.startsWith("/"))
-			fail("usage: run-eval.mjs [--snapshot P --hidden P --scratch P --suites P] (absolute paths)");
+		const key = argv[index]?.replace(/^--/, ""),
+			value = argv[index + 1];
+		if (!Object.hasOwn(paths, key) || typeof value !== "string" || !value.startsWith("/")) fail();
 		paths[key] = value;
 	}
 	return paths;
 }
 
-/** A relative folder of the hidden tests: no absolute path, no "..", no empty segment. */
-function relativeFolder(value) {
+function relativePath(value) {
 	return (
 		typeof value === "string" &&
-		value !== "" &&
-		!value.startsWith("/") &&
+		value.length > 0 &&
 		!value.includes("\0") &&
-		value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")
+		value.split("/").every((part) => part !== "" && part !== "." && part !== "..")
 	);
 }
 
-function validEntry(entry) {
-	if (typeof entry !== "object" || entry === null) return false;
-	const { name, hidden, argv, timeoutMs, each } = entry;
-	const timeout =
-		timeoutMs === undefined || (Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_TIMEOUT_MS);
-	const args = Array.isArray(argv) && argv.length > 0 && argv.every((part) => typeof part === "string" && part !== "");
-	const named = typeof name === "string" && SUITE.test(name.replace("{name}", "x"));
-	const folder = typeof hidden === "string" && relativeFolder(hidden.replace("{name}", "x"));
-	return named && folder && args && timeout && (each === undefined || relativeFolder(each));
+function validSuite(entry) {
+	if (!SUITE.test(entry.name?.replace("{name}", "x")) || !relativePath(entry.hidden?.replace("{name}", "x")))
+		return false;
+	if (Object.hasOwn(entry, "argv") || (entry.each !== undefined && !relativePath(entry.each))) return false;
+	return entry.timeoutMs === undefined || (Number.isSafeInteger(entry.timeoutMs) && entry.timeoutMs > 0);
 }
-
 function loadSuites(path) {
-	let parsed;
-	try {
-		parsed = JSON.parse(readFileSync(path, "utf8"));
-	} catch {
-		return fail("cannot read the suite list");
-	}
-	if (parsed?.version !== 1 || !Array.isArray(parsed.suites) || parsed.suites.length === 0) fail("invalid suite list");
-	if (!parsed.suites.every(validEntry)) fail("invalid suite definition");
-	return parsed.suites;
+	const config = JSON.parse(readFileSync(path, "utf8"));
+	if (config.version !== 3 || !Array.isArray(config.suites) || config.suites.length === 0) fail();
+	if (!config.suites.every(validSuite)) fail();
+	return config.suites;
 }
 
 function subfolders(dir) {
+	let entries;
 	try {
-		return readdirSync(dir, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory() && NAME.test(entry.name))
-			.map((entry) => entry.name)
-			.sort();
-	} catch {
-		return [];
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch (error) {
+		if (error.code === "ENOENT") return [];
+		throw error;
 	}
-}
-
-/** The suites in order; an "each" with no subfolder is one suite that cannot run ("error"). */
-function expand(entries, hiddenRoot) {
-	const suites = [];
+	const names = [];
 	for (const entry of entries) {
-		const timeoutMs = entry.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-		if (entry.each === undefined) {
-			suites.push({ name: entry.name, hidden: entry.hidden, argv: entry.argv, timeoutMs });
-			continue;
-		}
-		const names = subfolders(join(hiddenRoot, entry.each));
-		if (names.length === 0) suites.push({ name: entry.name.replace(/:?\{name\}/, ""), error: true });
-		for (const name of names)
-			suites.push({
-				name: entry.name.replace("{name}", name),
-				hidden: entry.hidden.replace("{name}", name),
-				argv: entry.argv,
-				timeoutMs,
-			});
+		if (entry.isFile() && ["README.md", ".DS_Store"].includes(entry.name)) continue;
+		if (!entry.isDirectory() || !NAME.test(entry.name)) throw new Error("unsupported module definition");
+		names.push(entry.name);
 	}
-	return suites;
+	return names.sort();
 }
 
-/**
- * Copy a tree into a new, writable one (the snapshot's own files are read-only): directories 0755, files 0644 or 0755
- * (the executable bit kept), symlinks as they are (never followed). Contents are copied, not modes, so no chmod is
- * needed (some bind-mount file systems refuse it).
- */
-function copyTree(source, target) {
-	const stat = lstatSync(source);
-	if (stat.isSymbolicLink()) return symlinkSync(readlinkSync(source), target);
-	if (stat.isFile()) return writeFileSync(target, readFileSync(source), { mode: stat.mode & 0o111 ? 0o755 : 0o644 });
-	if (!stat.isDirectory()) return undefined;
-	mkdirSync(target, { recursive: true, mode: 0o755 });
-	for (const name of readdirSync(source)) copyTree(join(source, name), join(target, name));
-	return undefined;
+function expand(entries, hidden) {
+	return entries.flatMap((entry) => {
+		if (entry.each === undefined) return [entry];
+		const names = subfolders(join(hidden, entry.each));
+		if (names.length === 0) return [{ name: entry.name.replace(/:?\{name\}/, ""), error: true }];
+		return names.map((name) => ({
+			...entry,
+			name: entry.name.replace("{name}", name),
+			hidden: entry.hidden.replace("{name}", name),
+		}));
+	});
 }
 
-function testFiles(root, dir) {
+function testFiles(root) {
 	const found = [];
-	const walk = (current) => {
-		for (const entry of readdirSync(current, { withFileTypes: true })) {
-			const full = join(current, entry.name);
-			if (entry.isDirectory()) walk(full);
-			else if (entry.isFile() && TEST_FILE.test(entry.name)) found.push(relative(root, full));
-		}
+	const entryAt = (entry, dir, prefix) => {
+		if (entry.isSymbolicLink()) throw new Error("hidden symlink");
+		const path = prefix + entry.name;
+		if (entry.isDirectory()) return walk(join(dir, entry.name), `${path}/`);
+		if (entry.isFile() && TEST.test(path)) found.push(path);
+		return undefined;
 	};
-	walk(dir);
+	const walk = (dir, prefix) => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) entryAt(entry, dir, prefix);
+	};
+	walk(root, "");
 	return found.sort();
 }
-
-/** The suite's working copy: the snapshot, then its hidden tests; the test files to run (none → it cannot run). */
-function prepare(paths, suite) {
-	const run = join(paths.scratch, "run");
-	rmSync(run, { recursive: true, force: true });
-	const project = join(run, "project");
-	for (const dir of [join(run, "home"), join(run, "tmp")]) mkdirSync(dir, { recursive: true, mode: 0o700 });
-	copyTree(paths.snapshot, project);
-	// hidden-tests/ is the evaluator's: whatever the graded snapshot put there (files, a symlink) is removed first, so
-	// only the hidden tests are found and run there (a planted file must not turn an empty suite into a pass).
-	const reserved = join(project, "hidden-tests");
-	rmSync(reserved, { recursive: true, force: true });
-	const source = join(paths.hidden, suite.hidden);
-	if (!lstatSync(source, { throwIfNoEntry: false })?.isDirectory()) return { run, project, tests: [] };
-	const target = join(reserved, suite.hidden.split("/").at(-1));
-	mkdirSync(reserved, { mode: 0o755 });
-	copyTree(source, target);
-	return { run, project, tests: testFiles(project, target) };
+function validExpected(test) {
+	return (
+		NAME.test(test.id) &&
+		relativePath(test.file) &&
+		TEST.test(test.file) &&
+		typeof test.name === "string" &&
+		test.name.length > 0 &&
+		!Object.hasOwn(test, "skip") &&
+		!Object.hasOwn(test, "todo")
+	);
+}
+function manifestTests(manifest) {
+	if (
+		manifest.version !== 3 ||
+		!Array.isArray(manifest.tests) ||
+		manifest.tests.length === 0 ||
+		manifest.tests.length > 4096
+	)
+		throw new Error("invalid manifest");
+	const tests = manifest.tests;
+	if (!tests.every(validExpected) || new Set(tests.map((test) => test.id)).size !== tests.length)
+		throw new Error("invalid expected test");
+	return tests;
+}
+function planned(paths, suite) {
+	try {
+		if (suite.error) throw new Error("missing modules");
+		const root = join(paths.hidden, suite.hidden);
+		if (!lstatSync(root).isDirectory()) throw new Error("hidden directory missing");
+		const manifest = join(root, "expected.json");
+		if (!lstatSync(manifest).isFile()) throw new Error("manifest is not a regular file");
+		const tests = manifestTests(JSON.parse(readFileSync(manifest, "utf8")));
+		const files = testFiles(root),
+			declared = [...new Set(tests.map((test) => test.file))].sort();
+		if (JSON.stringify(files) !== JSON.stringify(declared)) throw new Error("unplanned or missing test file");
+		return { ...suite, root, tests, files: files.map((file) => join(root, file)) };
+	} catch {
+		return { ...suite, error: true, tests: [] };
+	}
 }
 
-function killGroup(child) {
+function kill(child) {
 	try {
 		process.kill(-child.pid, "SIGKILL");
 	} catch {
-		// already gone
+		/* already gone */
 	}
 }
 
-/** A suite's outcome from how its command ended: passed only on exit 0 (no signal) within its bound. */
-function ended(code, signal, timedOut) {
-	const exitCode = signal === null ? code : 128 + (osConstants.signals[signal] ?? 0);
-	if (timedOut) return { outcome: "timeout", exitCode };
-	return { outcome: code === 0 && signal === null ? "passed" : "failed", exitCode };
+function outcomeOf(code, signal, timedOut, infrastructureFailed, report) {
+	if (timedOut) return "timeout";
+	return code === 0 && signal === null && report?.complete === true && !infrastructureFailed ? "passed" : "failed";
 }
-
-/** Run one prepared suite; resolves with its outcome and exit code. */
-function execute(suite, work, timeoutMs) {
-	const argv = suite.argv.flatMap((part) => (part === "{tests}" ? work.tests : [part]));
-	const env = {
-		PATH: process.env.PATH || DEFAULT_PATH,
-		HOME: join(work.run, "home"),
-		TMPDIR: join(work.run, "tmp"),
-		CI: "1",
-		NO_COLOR: "1",
-		PI_EVAL_SUITE: suite.name,
+function executionResult(code, signal, timedOut, infrastructureFailed, report) {
+	return {
+		outcome: outcomeOf(code, signal, timedOut, infrastructureFailed, report),
+		exitCode: code ?? undefined,
+		executedTests: report?.executedTests ?? [],
+		passedTests: report?.passedTests ?? [],
 	};
+}
+function relay(child, message) {
+	void request(message.op, message.payload).then((reply) => {
+		if (child.connected) child.send({ ...reply, kind: "rpc_result", id: message.id });
+	});
+}
+function execute(paths, suite, timeoutMs) {
 	return new Promise((resolve) => {
-		const child = spawn(argv[0], argv.slice(1), {
-			cwd: work.project,
-			env,
-			stdio: "ignore",
-			shell: false,
-			detached: true,
-		});
-		let timedOut = false;
+		const work = join(paths.scratch, "run");
+		rmSync(work, { recursive: true, force: true });
+		mkdirSync(work, { recursive: true });
+		const child = fork(
+			join(HERE, "eval-tests.mjs"),
+			[JSON.stringify({ root: suite.root, tests: suite.tests, files: suite.files })],
+			{
+				cwd: work,
+				detached: true,
+				stdio: ["ignore", "ignore", "ignore", "ipc"],
+				env: {
+					PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+					HOME: work,
+					TMPDIR: work,
+					CI: "1",
+					NODE_NO_WARNINGS: "1",
+					PI_EVAL_CLIENT_PATH: join(HERE, "app-client.mjs"),
+				},
+			},
+		);
+		let report,
+			timedOut = false,
+			infrastructureFailed = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
-			killGroup(child);
+			kill(child);
 		}, timeoutMs);
-		child.on("error", () => {
-			clearTimeout(timer);
-			resolve({ outcome: "error", exitCode: undefined });
+		child.on("message", (message) => {
+			switch (message?.kind) {
+				case "infrastructure_failure":
+					infrastructureFailed = true;
+					void request("subject_failure", serialize(null).toString("base64"));
+					return;
+				case "test_result":
+					report = report === undefined ? message : { complete: false };
+					return;
+				case "rpc":
+					relay(child, message);
+					return;
+				default:
+					infrastructureFailed = true;
+			}
 		});
+		child.on("error", () => resolve({ outcome: "error", executedTests: [], passedTests: [] }));
 		child.on("exit", (code, signal) => {
 			clearTimeout(timer);
-			killGroup(child);
-			resolve(ended(code, signal, timedOut));
+			kill(child);
+			resolve(executionResult(code, signal, timedOut, infrastructureFailed, report));
 		});
 	});
 }
 
 async function grade(paths, suite, deadline) {
-	const startedAt = Date.now();
-	const report = (outcome, exitCode) =>
-		emit({ type: "suite", name: suite.name, outcome, exitCode, durationMs: Date.now() - startedAt });
-	if (suite.error === true) return report("error");
-	let work;
-	try {
-		work = prepare(paths, suite);
-	} catch {
-		return report("error");
+	const started = Date.now();
+	let result = { outcome: "error", executedTests: [], passedTests: [] };
+	if (!suite.error) {
+		const reset = await request("reset", serialize(null).toString("base64"));
+		if (reset.ok === true)
+			result = await execute(paths, suite, Math.max(1, Math.min(suite.timeoutMs ?? 600000, deadline - Date.now())));
 	}
-	try {
-		if (work.tests.length === 0) return report("error");
-		const left = deadline - Date.now();
-		const result = await execute(suite, work, Math.max(1, Math.min(suite.timeoutMs, left)));
-		report(result.outcome, result.exitCode);
-	} finally {
-		rmSync(work.run, { recursive: true, force: true });
-	}
+	rmSync(join(paths.scratch, "run"), { recursive: true, force: true });
+	emit({
+		type: "suite",
+		name: suite.name,
+		...result,
+		expectedTests: suite.tests.map((test) => test.id),
+		durationMs: Date.now() - started,
+	});
 }
 
 async function main() {
-	if (typeof process.getuid === "function" && process.getuid() === 0) fail("refusing to run as root");
+	if (process.getuid?.() === 0) fail();
 	const paths = options(process.argv.slice(2));
-	const suites = expand(loadSuites(paths.suites), paths.hidden);
-	const limit = Number(process.env.PI_EVAL_DEADLINE_MS);
-	const deadline = Date.now() + (Number.isSafeInteger(limit) && limit > 0 ? limit : MAX_TIMEOUT_MS);
-	emit({ type: "plan", suites: suites.map((suite) => suite.name) });
+	const suites = expand(loadSuites(paths.suites), paths.hidden).map((suite) => planned(paths, suite));
+	if (suites.length > 256 || new Set(suites.map((suite) => suite.name)).size !== suites.length) fail();
+	const limit = Number(process.env.PI_EVAL_DEADLINE_MS),
+		deadline = Date.now() + (limit > 0 ? limit : 30 * 60_000);
+	emit({
+		type: "plan",
+		version: 3,
+		suites: suites.map((suite) => suite.name),
+		expectedTests: Object.fromEntries(suites.map((suite) => [suite.name, suite.tests.map((test) => test.id)])),
+	});
 	for (const suite of suites) {
-		if (Date.now() >= deadline) process.exit(EXIT_DEADLINE);
+		if (Date.now() >= deadline) process.exit(124);
 		await grade(paths, suite, deadline);
 	}
 	emit({ type: "done" });
-	process.exit(Date.now() >= deadline ? EXIT_DEADLINE : 0);
+	process.exit(Date.now() >= deadline ? 124 : 0);
 }
-
-main().catch(() => fail("unexpected failure"));
+main().catch(fail);

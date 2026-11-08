@@ -37,8 +37,8 @@ afterEach(async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-function openStore(): Store {
-	const store = new Store(join(dir, "coordinator.sqlite"));
+function openStore(now?: () => number): Store {
+	const store = new Store(join(dir, "coordinator.sqlite"), now);
 	stores.push(store);
 	return store;
 }
@@ -166,9 +166,9 @@ describe("outbox: failures", () => {
 	});
 
 	it("keeps a 429 hold across a restart: the saved retry_after is honoured by the next sender", async () => {
-		const store = openStore();
 		let clock = Date.now();
 		const now = () => clock;
+		const store = openStore(now);
 		fake.failNext("sendMessage", { status: 429, retryAfter: 30 });
 		const a = enqueue(store, { text: "held" });
 		const first = start(store, { now });

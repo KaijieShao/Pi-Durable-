@@ -1,124 +1,177 @@
 /**
- * What the evaluator's launcher (deploy/docker/run-eval.mjs) prints on its stdout, one JSON object per line, and how
- * the Coordinator reads it (shared by the Docker evaluator and the local test evaluator):
- *
- *   {"type":"plan","suites":["module:signup","integration","baseline"]}      the suites it will grade, in order
- *   {"type":"suite","name":"module:signup","outcome":"passed","exitCode":0,"durationMs":812}   one per suite
- *   {"type":"done"}                                                          every planned suite has a result
- *
- * Suite outcomes: passed (exit 0), failed (another exit code), timeout (its own bound or the overall deadline),
- * error (it could not run: no hidden tests for it, a launcher failure). Nothing else on stdout counts; a suite the
- * plan does not name is ignored, a planned suite without a result is not_run (or timeout, the one in progress when the
- * deadline stopped the container). No test output reaches the Coordinator: the launcher discards it.
+ * The trusted evaluator's version 3 protocol. The plan binds each suite to immutable hidden-test IDs; each result
+ * names the tests attempted and passed. Missing, duplicate, truncated, unplanned or inconsistent records fail closed.
+ * This parser is defense in depth: generated code executes in a separate app container and cannot emit this stream.
  */
 import type { EvaluatorRun, EvaluatorSuite, EvaluatorSuiteOutcome } from "../ports.ts";
 
 const SUITE_NAME = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
+const TEST_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const REPORTED: ReadonlySet<string> = new Set(["passed", "failed", "timeout", "error"]);
-/** deploy/docker/run-eval.mjs exits with this once its own deadline (PI_EVAL_DEADLINE_MS) has passed. */
 export const LAUNCHER_DEADLINE_EXIT = 124;
-/** At most this many suites are read from one plan. */
 const MAX_SUITES = 256;
+const MAX_TESTS = 4096;
 
 type Parsed = {
-	plan: string[] | undefined;
+	plan: Map<string, string[]> | undefined;
 	readonly results: Map<string, EvaluatorSuite>;
 	done: boolean;
+	invalid: boolean;
 };
 
-function asObject(line: string): Record<string, unknown> | undefined {
-	try {
-		const value = JSON.parse(line) as unknown;
-		return typeof value === "object" && value !== null && !Array.isArray(value)
-			? (value as Record<string, unknown>)
-			: undefined;
-	} catch {
-		return undefined;
+function asObject(line: string): Record<string, unknown> {
+	const value = JSON.parse(line) as unknown;
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid record");
+	return value as Record<string, unknown>;
+}
+
+function testIds(value: unknown): string[] {
+	if (!Array.isArray(value) || value.length > MAX_TESTS) throw new Error("invalid test IDs");
+	const ids = value.filter((id): id is string => typeof id === "string" && TEST_ID.test(id));
+	if (ids.length !== value.length || new Set(ids).size !== ids.length) throw new Error("invalid test IDs");
+	return ids;
+}
+
+function same(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function planOf(fields: Record<string, unknown>): Map<string, string[]> {
+	const { version, suites, expectedTests } = fields;
+	if (version !== 3 || !Array.isArray(suites) || suites.length === 0 || suites.length > MAX_SUITES)
+		throw new Error("invalid suite plan");
+	if (typeof expectedTests !== "object" || expectedTests === null || Array.isArray(expectedTests))
+		throw new Error("missing expected tests");
+	const tests = expectedTests as Record<string, unknown>;
+	const plan = new Map<string, string[]>();
+	for (const name of suites) {
+		if (typeof name !== "string" || !SUITE_NAME.test(name) || plan.has(name)) throw new Error("invalid suite name");
+		plan.set(name, testIds(tests[name]));
 	}
+	if (Object.keys(tests).length !== plan.size) throw new Error("unplanned expected tests");
+	return plan;
 }
 
-function planOf(value: unknown): string[] | undefined {
-	if (!Array.isArray(value) || value.length > MAX_SUITES) return undefined;
-	const names = value.filter((name): name is string => typeof name === "string" && SUITE_NAME.test(name));
-	return names.length === value.length && new Set(names).size === names.length ? names : undefined;
+function validPassing(
+	outcome: string,
+	exitCode: unknown,
+	expected: readonly string[],
+	passed: readonly string[],
+): boolean {
+	return outcome !== "passed" || (exitCode === 0 && expected.length > 0 && same(passed, expected));
 }
 
-function suiteOf(fields: Record<string, unknown>): EvaluatorSuite | undefined {
+function suiteOf(fields: Record<string, unknown>, plan: Map<string, string[]>): EvaluatorSuite {
 	const { name, outcome, exitCode, durationMs } = fields;
-	if (typeof name !== "string" || typeof outcome !== "string" || !REPORTED.has(outcome)) return undefined;
+	if (typeof name !== "string" || typeof outcome !== "string" || !REPORTED.has(outcome))
+		throw new Error("invalid suite result");
+	const expected = plan.get(name);
+	const declared = testIds(fields.expectedTests);
+	const executed = testIds(fields.executedTests);
+	const passed = testIds(fields.passedTests);
+	if (expected === undefined || !same(declared, expected) || !same(executed, expected.slice(0, executed.length)))
+		throw new Error("unexpected or missing test");
+	if (
+		!same(
+			passed,
+			executed.filter((id) => passed.includes(id)),
+		)
+	)
+		throw new Error("test did not execute");
+	if (!validPassing(outcome, exitCode, expected, passed)) throw new Error("incomplete passing suite");
 	return {
 		name,
 		outcome: outcome as EvaluatorSuiteOutcome,
 		exitCode: typeof exitCode === "number" && Number.isSafeInteger(exitCode) ? exitCode : undefined,
 		durationMs: typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0,
+		expectedTests: expected,
+		executedTests: executed,
+		passedTests: passed,
 	};
 }
 
 function readLine(parsed: Parsed, line: string): void {
 	const fields = asObject(line);
-	if (fields === undefined) return;
-	if (fields.type === "plan" && parsed.plan === undefined) {
-		parsed.plan = planOf(fields.suites);
+	if (parsed.done) throw new Error("record after done");
+	if (fields.type === "plan") {
+		if (parsed.plan !== undefined) throw new Error("duplicate plan");
+		parsed.plan = planOf(fields);
 		return;
 	}
+	if (parsed.plan === undefined) throw new Error("no plan");
 	if (fields.type === "done") {
-		parsed.done = parsed.plan !== undefined;
+		if (parsed.results.size !== parsed.plan.size) throw new Error("missing suite");
+		parsed.done = true;
 		return;
 	}
-	if (fields.type !== "suite" || parsed.plan === undefined) return;
-	const suite = suiteOf(fields);
-	if (suite !== undefined && parsed.plan.includes(suite.name) && !parsed.results.has(suite.name))
-		parsed.results.set(suite.name, suite);
+	if (fields.type !== "suite") throw new Error("unrecognized record");
+	const suite = suiteOf(fields, parsed.plan);
+	if (parsed.results.has(suite.name)) throw new Error("duplicate suite");
+	parsed.results.set(suite.name, suite);
 }
 
-/** The planned suites with their results, in plan order; the first missing one is "timeout" after a deadline. */
 function planned(parsed: Parsed, timedOut: boolean): EvaluatorSuite[] {
 	let marked = !timedOut;
-	return (parsed.plan ?? []).map((name) => {
+	return Array.from(parsed.plan ?? []).map(([name, expectedTests]) => {
 		const result = parsed.results.get(name);
-		if (result !== undefined) return result;
+		if (result !== undefined) {
+			if (result.outcome === "timeout") marked = true;
+			return result;
+		}
 		const outcome: EvaluatorSuiteOutcome = marked ? "not_run" : "timeout";
 		marked = true;
-		return { name, outcome, exitCode: undefined, durationMs: 0 };
+		return { name, outcome, exitCode: undefined, durationMs: 0, expectedTests, executedTests: [], passedTests: [] };
 	});
 }
 
 export type LauncherEnd = {
-	/** The launcher's exit code (undefined when the container was stopped). */
 	readonly exitCode: number | undefined;
 	readonly timedOut: boolean;
 	readonly aborted: boolean;
-	/** The container hit a limit (memory, output) or its state could not be read. */
 	readonly failed: boolean;
 	readonly durationMs: number;
 };
 
 type End = Extract<EvaluatorRun, { kind: "ran" }>["end"];
 
-function endOf(parsed: Parsed, end: LauncherEnd, planned: number): End {
-	// The launcher's own deadline (exit 124) is the evaluation's deadline too.
+function endOf(parsed: Parsed, end: LauncherEnd, count: number): End {
 	if (end.timedOut || end.exitCode === LAUNCHER_DEADLINE_EXIT) return "timeout";
 	if (end.aborted) return "aborted";
-	const finished = parsed.done && end.exitCode === 0 && !end.failed && planned > 0;
+	const finished = parsed.done && !parsed.invalid && end.exitCode === 0 && !end.failed && count > 0;
 	return finished ? "exited" : "error";
 }
 
-/** The run as the Coordinator records it, from the launcher's stdout and how its container ended. */
 export function evaluatorRunOf(stdout: string, end: LauncherEnd): Extract<EvaluatorRun, { kind: "ran" }> {
-	const parsed: Parsed = { plan: undefined, results: new Map(), done: false };
-	for (const line of stdout.split("\n")) if (line.trim() !== "") readLine(parsed, line.trim());
-	// Stopped by the Coordinator's deadline, the suite in progress has no line: it timed out. At its own deadline the
-	// launcher reports that suite itself.
-	const suites = planned(parsed, end.timedOut);
+	const parsed: Parsed = { plan: undefined, results: new Map(), done: false, invalid: false };
+	for (const line of stdout.split("\n")) {
+		if (line.trim() === "") continue;
+		try {
+			readLine(parsed, line);
+		} catch {
+			parsed.invalid = true;
+		}
+	}
+	const suites = planned(parsed, end.timedOut || end.exitCode === LAUNCHER_DEADLINE_EXIT);
 	return { kind: "ran", suites, end: endOf(parsed, end, suites.length), durationMs: end.durationMs };
 }
 
-/** "passed" only if the launcher ran every planned suite and each one passed (Evaluation § What's Graded). */
+function allTestsPassed(suite: EvaluatorSuite): boolean {
+	const expected = suite.expectedTests ?? [];
+	return (
+		suite.outcome === "passed" &&
+		suite.exitCode === 0 &&
+		expected.length > 0 &&
+		same(expected, suite.executedTests ?? []) &&
+		same(expected, suite.passedTests ?? [])
+	);
+}
+
 export function evaluationPassed(run: EvaluatorRun): boolean {
 	return (
 		run.kind === "ran" &&
+		run.subjectFailed !== true &&
 		run.end === "exited" &&
 		run.suites.length > 0 &&
-		run.suites.every((suite) => suite.outcome === "passed")
+		run.suites.every(allTestsPassed)
 	);
 }

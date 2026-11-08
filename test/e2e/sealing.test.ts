@@ -35,6 +35,7 @@ import type { Evaluator, EvaluatorSpec, Sandbox } from "../../src/coordinator/po
 import { Store } from "../../src/coordinator/store.ts";
 import type { ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { sleep } from "../helpers/env.ts";
+import { nodeSuite } from "../helpers/evaluator.ts";
 import type { FakeHandler, FakeStep } from "../helpers/fake-model.ts";
 import {
 	agentPosition,
@@ -55,26 +56,28 @@ const LATER_JS = "exports.later = 1;\n";
 
 /** The hidden tests: one module (signup), the integration test, the baseline suite. */
 const HIDDEN: Readonly<Record<string, string>> = {
-	"modules/signup/signup.test.js": [
-		'const { test } = require("node:test");',
-		'const assert = require("node:assert/strict");',
-		'const { signup } = require("../../signup.js");',
-		'test("accepts an email", () => assert.equal(signup("ana@example.com"), true));',
-		'test("refuses junk", () => assert.equal(signup("junk"), false));',
-		"",
-	].join("\n"),
-	"integration/flow.test.js": [
-		'const { test } = require("node:test");',
-		'const assert = require("node:assert/strict");',
-		'test("signup flow", () => assert.equal(require("../../signup.js").signup("b@c.d") && require("../../index.js").version, 1));',
-		"",
-	].join("\n"),
-	"baseline/version.test.js": [
-		'const { test } = require("node:test");',
-		'const assert = require("node:assert/strict");',
-		'test("version", () => assert.equal(require("../../index.js").version, 1));',
-		"",
-	].join("\n"),
+	...nodeSuite("modules/signup", "signup.test.js", [
+		{
+			id: "accepts-email",
+			name: "accepts an email",
+			body: 'assert.equal(await app.call("signup.js", "signup", ["ana@example.com"]), true);',
+		},
+		{
+			id: "rejects-junk",
+			name: "refuses junk",
+			body: 'assert.equal(await app.call("signup.js", "signup", ["junk"]), false);',
+		},
+	]),
+	...nodeSuite("integration", "flow.test.js", [
+		{
+			id: "flow",
+			name: "signup flow",
+			body: 'assert.equal(await app.evaluate(\'const {signup} = await importModule("signup.js"); const {version} = await importModule("index.js"); return signup("b@c.d") && version;\'), 1);',
+		},
+	]),
+	...nodeSuite("baseline", "version.test.js", [
+		{ id: "version", name: "version", body: 'assert.equal(await app.call("index.js", "version"), 1);' },
+	]),
 };
 
 type Gate = { readonly opened: Promise<void>; open(): void };
@@ -374,7 +377,7 @@ test("sealing: refused while a trial task is not merged; then dispatch, merges a
 	assert.deepEqual(facts.limits.agent, { cpus: 0.5, memoryMiB: 512, pids: 128 });
 	assert.match(facts.images.evaluator.imageId, /^sha256:/);
 	assert.match(facts.hiddenTests.hash, /^sha256:[0-9a-f]{64}$/);
-	assert.equal(facts.hiddenTests.files, 3);
+	assert.equal(facts.hiddenTests.files, 6);
 	assert.equal(existsSync(row.scratch_path as string), false, "the scratch directory was wiped");
 	assert.equal(groupState(stack), "normal");
 
@@ -514,6 +517,27 @@ test("an evaluator cleanup that cannot be verified freezes the group (the result
 	assert.equal(ran, false, "no evaluator without its scratch space");
 	const [noSpaceRow] = evaluations(noScratch);
 	assert.deepEqual([noSpaceRow?.outcome, noSpaceRow?.started_ok, noSpaceRow?.scratch_path], ["error", 0, null]);
+
+	// A failed application transport is a failed trial, not an unverified stop. Verified cleanup reopens dispatch.
+	const transportFailure = await stackFor(t, {
+		wrap: {
+			evaluator: (evaluator) => ({
+				...evaluator,
+				run: async () => ({ kind: "ran", end: "error", suites: [], durationMs: 0, subjectFailed: true }),
+			}),
+		},
+	});
+	assert.equal((await transportFailure.owner("seal", "--trial", "c4")).code, 0);
+	const transportResult = await transportFailure.waitForBotMessage(/^Evaluation of trial c4: /, { timeoutMs: 60_000 });
+	assert.match(transportResult.text, /NOT PASSED.*Dispatch has reopened\.$/);
+	assert.equal(groupState(transportFailure), "normal");
+	const [transportRow] = evaluations(transportFailure);
+	assert.deepEqual(
+		[transportRow?.state, transportRow?.outcome, transportRow?.cleanup_verified],
+		["done", "not_passed", 1],
+	);
+	assert.ok(transportRow?.scratch_path);
+	assert.equal(existsSync(transportRow.scratch_path), false);
 });
 
 test("a restart during the evaluation: recorded as interrupted (not graded), its cleanup verified, then dispatch reopens and the queued task runs", {

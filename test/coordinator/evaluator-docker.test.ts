@@ -22,19 +22,19 @@
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DEMO_LIMITS } from "../../src/coordinator/limits.ts";
-import type { Evaluator, EvaluatorRun } from "../../src/coordinator/ports.ts";
+import type { Evaluator } from "../../src/coordinator/ports.ts";
 import { createDockerSandbox, runDocker } from "../../src/coordinator/sandbox/docker.ts";
 import { createDockerEvaluator, LABEL_TRIAL } from "../../src/coordinator/sandbox/evaluator.ts";
 import { evaluationPassed } from "../../src/coordinator/sandbox/evaluator-output.ts";
 import { silentLogger } from "../../src/runtime/log.ts";
 import { waitFor } from "../helpers/env.ts";
-import { makeWritable } from "../helpers/evaluator.ts";
+import { fullNodeProgram, makeWritable, nodeSuite } from "../helpers/evaluator.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const IMAGE = "pi-durable-evaluator:demo";
@@ -61,39 +61,38 @@ function writeTree(root: string, files: Record<string, string>): void {
 	}
 }
 
-const TEST = (body: string) =>
-	`const { test } = require("node:test");\nconst assert = require("node:assert/strict");\n${body}\n`;
+/** This trusted host-invoked probe does not import candidate code. Assertions also inspect Docker's own metadata. */
+const PROBE = `const fs=require("node:fs"), os=require("node:os"), net=require("node:net");
+const code=fn=>{try{fn();return "ok"}catch(e){return e.code}};
+(async()=>{
+ const network=await new Promise(resolve=>{const s=net.connect(80,"192.0.2.1");const done=v=>{s.destroy();resolve(v)};s.on("connect",()=>done("connected"));s.on("error",e=>done(e.code));setTimeout(()=>done("timeout"),1000)});
+ console.log(JSON.stringify({uid:process.getuid(),interfaces:Object.keys(os.networkInterfaces()),network,
+ snapshotSeen:fs.existsSync("/eval/snapshot/index.js"),snapshotContent:fs.existsSync("/eval/snapshot/index.js")?fs.readFileSync("/eval/snapshot/index.js","utf8"):null,hiddenSeen:fs.existsSync("/eval/hidden"),
+ snapshotWrite:code(()=>fs.writeFileSync("/eval/snapshot/evil.txt","x")),hiddenWrite:code(()=>fs.writeFileSync("/eval/hidden/evil.txt","x")),
+ rootWrite:code(()=>fs.writeFileSync("/etc/evil","x")),scratchWrite:code(()=>fs.writeFileSync("/scratch/ok.txt","x")),
+ copied:fs.existsSync("/scratch/project/index.js"),dockerSocket:fs.existsSync("/var/run/docker.sock"),env:Object.keys(process.env)}));
+})().catch(()=>process.exit(1));`;
 
-/**
- * The probe suite, inside the evaluator: what it can reach, written to /scratch/probe.json; then it holds the container
- * until the host writes /scratch/release (the host inspects the running container meanwhile).
- */
-const PROBE = TEST(`const fs = require("fs"), os = require("os"), net = require("net");
-const code = (fn) => { try { fn(); return "ok"; } catch (e) { return e.code; } };
-test("probe", async () => {
-	const network = await new Promise((resolve) => {
-		const socket = net.connect(80, "192.0.2.1");
-		const done = (value) => { socket.destroy(); resolve(value); };
-		socket.on("connect", () => done("connected"));
-		socket.on("error", (e) => done(e.code));
-		setTimeout(() => done("timeout"), 3000);
-	});
-	const facts = {
-		uid: process.getuid(),
-		network,
-		interfaces: Object.keys(os.networkInterfaces()),
-		snapshotWrite: code(() => fs.writeFileSync("/eval/snapshot/evil.txt", "x")),
-		hiddenWrite: code(() => fs.writeFileSync("/eval/hidden/evil.txt", "x")),
-		rootWrite: code(() => fs.writeFileSync("/etc/evil", "x")),
-		scratchWrite: code(() => fs.writeFileSync("/scratch/ok.txt", "x")),
-		snapshotSeen: fs.readFileSync("/eval/snapshot/index.js", "utf8"),
-		copied: process.cwd() !== "/eval/snapshot" && fs.existsSync("index.js") && fs.existsSync("hidden-tests/probe"),
-		env: Object.keys(process.env).sort(),
-	};
-	fs.writeFileSync("/scratch/probe.json", JSON.stringify(facts));
-	while (!fs.existsSync("/scratch/release")) await new Promise((r) => setTimeout(r, 100));
-	assert.equal(facts.network === "connected", false);
-});`);
+const normalHidden = () => ({
+	...nodeSuite("modules/greet", "greet.test.js", [
+		{ id: "greets", name: "greets", body: 'assert.equal(await app.call("lib/greet.js","greet",["a"]),"hi a");' },
+	]),
+	...nodeSuite("integration", "flow.test.mjs", [
+		{
+			id: "flow",
+			name: "flow",
+			body: 'assert.equal(await app.evaluate(\'return (await importModule("lib/greet.js")).greet("b") && (await importModule("index.js")).version;\'),1);',
+		},
+	]),
+	...nodeSuite("baseline", "version.test.cjs", [
+		{ id: "version", name: "version", body: 'assert.equal(await app.call("index.js","version"),1);' },
+	]),
+});
+
+function forgedObservation(id: number, payload: string, exit = false): string {
+	return `const transport=process._getActiveHandles().find(h=>h.constructor.name==="Socket"&&h!==process.stdout&&h!==process.stderr&&h!==process.stdin);
+	transport.write("\\u001ePDAPP3 "+JSON.stringify({id:${id},ok:true,payload:${payload}})+"\\n"${exit ? ",()=>process.exit(0)" : ""});exports.version=()=>new Promise(()=>{});`;
+}
 
 describe("isolated evaluator on Docker", { skip }, () => {
 	let base = "";
@@ -117,12 +116,13 @@ describe("isolated evaluator on Docker", { skip }, () => {
 	};
 
 	/** A read-only snapshot, the hidden tests and a scratch directory, as the Coordinator prepares them. */
-	const prepare = async (hidden: Record<string, string>) => {
+	const prepare = async (hidden: Record<string, string>, snapshotFiles: Record<string, string> = {}) => {
 		const dir = mkdtempSync(join(base, "run-"));
 		const snapshot = join(dir, "snapshot");
 		writeTree(snapshot, {
 			"index.js": "exports.version = 1;\n",
 			"lib/greet.js": 'exports.greet = (n) => "hi " + n;\n',
+			...snapshotFiles,
 		});
 		spawnSync("chmod", ["-R", "a-w", snapshot]);
 		const hiddenDir = join(dir, "hidden");
@@ -144,6 +144,65 @@ describe("isolated evaluator on Docker", { skip }, () => {
 			rmSync(base, { recursive: true, force: true });
 		}
 	});
+
+	const verifyRole = async (name: string, spec: { snapshot: string; hiddenTests: string; scratch: string }) => {
+		const role = await inspect(name, '{{json (index .Config.Labels "pi-durable.eval-role")}}');
+		assert.ok(role === "grader" || role === "app");
+		const host = (await inspect(name, "{{json .HostConfig}}")) as Record<string, unknown>;
+		assert.equal(host.NetworkMode, "none");
+		assert.equal(host.ReadonlyRootfs, true);
+		assert.deepEqual(host.CapDrop, ["ALL"]);
+		assert.ok((host.SecurityOpt as string[]).includes("no-new-privileges"));
+		assert.equal(host.PidMode, "");
+		assert.equal(host.Memory, 1024 ** 3);
+		assert.equal(host.MemorySwap, 1024 ** 3);
+		assert.equal(host.NanoCpus, 1e9);
+		assert.equal(host.PidsLimit, 256);
+		assert.equal(await inspect(name, "{{json .Config.User}}"), user);
+		const labels = (await inspect(name, "{{json .Config.Labels}}")) as Record<string, string>;
+		assert.equal(labels["pi-durable.managed"], "1");
+		assert.equal(labels["pi-durable.kind"], "evaluator");
+		assert.equal(labels[LABEL_TRIAL], trialId);
+		assert.equal(labels["pi-durable.task"], undefined);
+		const mounts = (await inspect(name, "{{json .Mounts}}")) as {
+			Source: string;
+			Destination: string;
+			RW: boolean;
+		}[];
+		assert.equal(mounts.length, 2, "only role-specific read-only source and its private scratch");
+		const source =
+			role === "app"
+				? ["/eval/snapshot", realpathSync(spec.snapshot), false]
+				: ["/eval/hidden", realpathSync(spec.hiddenTests), false];
+		const mount = mounts.find((m) => m.Destination === source[0]);
+		assert.deepEqual(mount && [mount.Destination, mount.Source, mount.RW], source);
+		const scratch = mounts.find((m) => m.Destination === "/scratch");
+		assert.ok(scratch?.RW);
+		assert.ok(scratch.Source.startsWith(`${realpathSync(spec.scratch)}/`));
+		const env = (await inspect(name, "{{json .Config.Env}}")) as string[];
+		assert.ok(!env.some((e) => /^(OPENAI|GITHUB|TELEGRAM|GH|PI_RUN|DOCKER)_/.test(e)));
+		const output = await runDocker("docker", ["exec", name, "node", "-e", PROBE]);
+		assert.equal(output.code, 0);
+		const facts = JSON.parse(output.stdout);
+		assert.notEqual(facts.uid, 0);
+		assert.deepEqual(facts.interfaces, ["lo"]);
+		assert.notEqual(facts.network, "connected");
+		assert.equal(facts.snapshotSeen, role === "app");
+		if (role === "app") assert.equal(facts.snapshotContent, "exports.version = 1;\n");
+		assert.equal(facts.hiddenSeen, role === "grader");
+		assert.equal(facts.copied, role === "app");
+		assert.equal(facts.dockerSocket, false);
+		assert.equal(role === "app" ? facts.snapshotWrite : facts.hiddenWrite, "EROFS");
+		assert.equal(facts.rootWrite, "EROFS");
+		assert.equal(facts.scratchWrite, "ok");
+		assert.ok(!facts.env.some((k: string) => /TOKEN|KEY|SECRET/.test(k)));
+		return {
+			cpus: Number(host.NanoCpus),
+			memory: Number(host.Memory),
+			pids: Number(host.PidsLimit),
+			scratch: scratch.Source,
+		};
+	};
 
 	test("available: the image is pinned by id and its fixed suite list hashed", async () => {
 		assert.deepEqual(await evaluator.available(), { ok: true });
@@ -168,93 +227,247 @@ describe("isolated evaluator on Docker", { skip }, () => {
 		assert.equal((await root.available()).ok, false, "never as root");
 	});
 
-	test("grades the snapshot one suite after another in a container with no network, 2 vCPU / 2 GiB, read-only mounts and scratch; gone afterwards", {
+	test("grades native hidden tests externally; two disjoint containers preserve no network, aggregate 2 CPU/2 GiB/512 pids and read-only mounts; cleanup verified", {
 		timeout: 180_000,
 	}, async () => {
 		const spec = await prepare({
-			"modules/greet/greet.test.js": TEST(
-				'test("greets", () => assert.equal(require("../../lib/greet.js").greet("a"), "hi a"));',
-			),
-			"modules/probe/probe.test.js": PROBE,
-			"modules/zbroken/broken.test.js": TEST('test("fails", () => assert.equal(1, 2));'),
-			"integration/flow.test.js": TEST('test("flow", () => assert.equal(require("../../index.js").version, 1));'),
-			"baseline/version.test.js": TEST('test("version", () => assert.equal(require("../../index.js").version, 1));'),
+			...normalHidden(),
+			...nodeSuite("modules/probe", "probe.test.js", [
+				{
+					id: "probe",
+					name: "probe",
+					body: `
+				assert.equal(await app.call("index.js","version"),1);
+				const fs=require("node:fs"); fs.writeFileSync("/scratch/probe.json","ready");
+				while(!fs.existsSync("/scratch/release")) await new Promise(r=>setTimeout(r,50));
+			`,
+				},
+			]),
+			...nodeSuite("modules/zbroken", "broken.test.js", [
+				{ id: "fails", name: "fails", body: 'assert.equal(await app.call("index.js","version"),2);' },
+			]),
 		});
 		const running = evaluator.run({ trial: trialId, ...spec, deadlineMs: 120_000 });
-		const probeFile = join(spec.scratch, "probe.json");
-		await waitFor(() => existsSync(probeFile), { timeoutMs: 90_000, what: "the probe suite" });
-		const [name] = await ours();
-		assert.ok(name !== undefined, "the evaluator container runs");
-		const host = (await inspect(name, "{{json .HostConfig}}")) as Record<string, unknown>;
-		assert.equal(host.NetworkMode, "none");
-		assert.equal(host.NanoCpus, 2e9);
-		assert.equal(host.Memory, 2 * 1024 ** 3);
-		assert.equal(host.MemorySwap, 2 * 1024 ** 3);
-		assert.equal(host.ReadonlyRootfs, true);
-		assert.deepEqual(host.CapDrop, ["ALL"]);
-		assert.ok((host.SecurityOpt as string[]).includes("no-new-privileges"));
-		assert.equal(await inspect(name, "{{json .Config.User}}"), user);
-		const labels = (await inspect(name, "{{json .Config.Labels}}")) as Record<string, string>;
-		assert.equal(labels["pi-durable.managed"], "1");
-		assert.equal(labels["pi-durable.kind"], "evaluator");
-		assert.equal(labels[LABEL_TRIAL], trialId);
-		assert.equal(labels["pi-durable.task"], undefined, "a run's scoped sweep never matches it");
-		const mounts = (await inspect(name, "{{json .Mounts}}")) as { Source: string; Destination: string; RW: boolean }[];
-		assert.deepEqual(mounts.map((mount) => [mount.Destination, mount.Source, mount.RW]).sort(), [
-			["/eval/hidden", realpathSync(spec.hiddenTests), false],
-			["/eval/snapshot", realpathSync(spec.snapshot), false],
-			["/scratch", realpathSync(spec.scratch), true],
-		]);
-		const env = (await inspect(name, "{{json .Config.Env}}")) as string[];
-		assert.ok(!env.some((entry) => /^(OPENAI|GITHUB|TELEGRAM|GH|PI_RUN|DOCKER)_/.test(entry)), env.join());
-		const facts = JSON.parse(readFileSync(probeFile, "utf8"));
-		assert.notEqual(facts.uid, 0);
-		assert.deepEqual(facts.interfaces, ["lo"]);
-		assert.notEqual(facts.network, "connected");
-		assert.equal(facts.snapshotWrite, "EROFS");
-		assert.equal(facts.hiddenWrite, "EROFS");
-		assert.equal(facts.rootWrite, "EROFS");
-		assert.equal(facts.scratchWrite, "ok");
-		assert.equal(facts.snapshotSeen, "exports.version = 1;\n");
-		assert.equal(facts.copied, true, "suites run in a copy of the snapshot");
-		assert.ok(!facts.env.some((key: string) => /TOKEN|KEY|SECRET/.test(key)), facts.env.join());
-		writeFileSync(join(spec.scratch, "release"), "");
-		const result: EvaluatorRun = await running;
-		assert.equal(result.kind, "ran");
-		assert.equal(result.kind === "ran" && result.end, "exited");
-		assert.deepEqual(result.kind === "ran" ? result.suites.map((suite) => `${suite.name}=${suite.outcome}`) : [], [
+		const graderName = await waitFor(
+			async () => {
+				for (const name of await ours())
+					if ((await inspect(name, '{{json (index .Config.Labels "pi-durable.eval-role")}}')) === "grader") return name;
+				return undefined;
+			},
+			{ timeoutMs: 90_000, what: "trusted grader container" },
+		);
+		const graderMounts = (await inspect(graderName, "{{json .Mounts}}")) as {
+			Source: string;
+			Destination: string;
+			RW: boolean;
+		}[];
+		const graderScratch = graderMounts.find((m) => m.Destination === "/scratch")?.Source;
+		assert.ok(graderScratch);
+		await waitFor(() => existsSync(join(graderScratch, "probe.json")), {
+			timeoutMs: 90_000,
+			what: "trusted hidden probe",
+		});
+		const names = await ours();
+		assert.equal(names.length, 2, "one trusted grader plus one isolated app");
+		let cpus = 0,
+			memory = 0,
+			pids = 0;
+		const scratches: string[] = [];
+		for (const name of names) {
+			const role = await verifyRole(name, spec);
+			cpus += role.cpus;
+			memory += role.memory;
+			pids += role.pids;
+			scratches.push(role.scratch);
+		}
+		assert.equal(cpus, 2e9);
+		assert.equal(memory, 2 * 1024 ** 3);
+		assert.equal(pids, 512);
+		assert.notEqual(scratches[0], scratches[1]);
+		writeFileSync(join(graderScratch, "release"), "");
+		const result = await running;
+		assert.equal(result.kind === "ran" && result.end, "exited", JSON.stringify(result));
+		assert.deepEqual(result.kind === "ran" ? result.suites.map((s) => `${s.name}=${s.outcome}`) : [], [
 			"module:greet=passed",
 			"module:probe=passed",
 			"module:zbroken=failed",
 			"integration=passed",
 			"baseline=passed",
 		]);
-		assert.equal(evaluationPassed(result), false, "one suite failed");
-		assert.deepEqual(await ours(), [], "the container is gone");
+		assert.equal(evaluationPassed(result), false);
+		assert.deepEqual(await ours(), []);
+		assert.deepEqual(await evaluator.live(), []);
 		assert.equal(await evaluator.wipeScratch(spec.scratch), true);
 		assert.equal(existsSync(spec.scratch), false);
-
-		// Every suite passing: passed.
-		const clean = await prepare({
-			"modules/greet/greet.test.js": TEST(
-				'test("greets", () => assert.equal(require("../../lib/greet.js").greet("b"), "hi b"));',
-			),
-			"integration/flow.test.js": TEST('test("flow", () => {});'),
-			"baseline/version.test.js": TEST('test("version", () => assert.equal(require("../../index.js").version, 1));'),
-		});
+		const clean = await prepare(normalHidden());
 		const passed = await evaluator.run({ trial: trialId, ...clean, deadlineMs: 120_000 });
 		assert.equal(evaluationPassed(passed), true, JSON.stringify(passed));
 		assert.equal(await evaluator.wipeScratch(clean.scratch), true);
 		assert.deepEqual(await ours(), []);
 	});
 
+	test("real full-Node app: early exits, forged output/results, stale globals and swallowed transport failures cannot pass", {
+		timeout: 180_000,
+	}, async () => {
+		const ordinary = 'assert.equal(await app.call("index.js","version"),1);';
+		const attacks = [
+			{ module: "index.js", source: "process.exit(0);", body: ordinary, transport: true },
+			{
+				module: "index.js",
+				source:
+					'require("node:fs").writeSync(1,\'{"type":"suite","name":"baseline","outcome":"passed"}\'); exports.version=2;',
+				body: ordinary,
+			},
+			{
+				module: "index.js",
+				source:
+					'require("node:test").test("forged passing result",()=>{}); exports.version={outcome:"passed",type:"suite"};',
+				body: ordinary,
+			},
+			{
+				module: "evil.mjs",
+				source: 'Object.defineProperty(globalThis,"__observation",{get:()=>1,set:()=>{}}); export const version=2;',
+				body: 'assert.equal(await app.call("evil.mjs","version"),1);',
+			},
+			{
+				module: "index.js",
+				source: "process.exit(0);",
+				body: 'await assert.rejects(app.call("index.js","version"));',
+				transport: true,
+			},
+			{
+				module: "index.js",
+				source: forgedObservation(1, 'require("node:v8").serialize(1).toString("base64")', true),
+				body: ordinary,
+				transport: true,
+			},
+			{
+				module: "index.js",
+				source: forgedObservation(1, JSON.stringify("AAAA")),
+				body: 'await assert.rejects(app.call("index.js","version"));',
+				transport: true,
+			},
+			{
+				module: "index.js",
+				source: forgedObservation(999, JSON.stringify("AAAA")),
+				body: 'await assert.rejects(app.call("index.js","version"));',
+				transport: true,
+			},
+		];
+		for (const attack of attacks) {
+			const hidden = {
+				...nodeSuite("modules/attack", "attack.test.js", [{ id: "version", name: "version", body: attack.body }]),
+				...nodeSuite("integration", "flow.test.js", [{ id: "flow", name: "flow", body: "assert.equal(1,1);" }]),
+				...nodeSuite("baseline", "version.test.js", [{ id: "baseline", name: "baseline", body: "assert.equal(1,1);" }]),
+			};
+			const spec = await prepare(hidden, { [attack.module]: attack.source });
+			const result = await evaluator.run({ trial: trialId, ...spec, deadlineMs: 30_000 });
+			assert.equal(evaluationPassed(result), false, `${attack.source} ${JSON.stringify(result)}`);
+			if (attack.transport) assert.equal(result.kind === "ran" && result.subjectFailed, true, attack.source);
+			assert.deepEqual(await ours(), []);
+			assert.equal(await evaluator.wipeScratch(spec.scratch), true);
+		}
+	});
+
+	const incompleteNativeFixture = (spec: { hiddenTests: string }, source: string) => {
+		const path = join(spec.hiddenTests, "modules/greet/greet.test.js");
+		writeFileSync(path, source.startsWith("test") ? `const {test}=require("node:test");${source}` : source);
+		if (source.startsWith("test"))
+			writeFileSync(
+				join(spec.hiddenTests, "modules/greet/expected.json"),
+				JSON.stringify({
+					version: 3,
+					tests: [
+						{ id: "greets", name: "greets", file: "greet.test.js" },
+						{ id: "missing", name: "missing", file: "greet.test.js" },
+					],
+				}),
+			);
+	};
+
+	test("real trusted Node runner: skipped/todo/only-missing tests and missing/truncated reports fail closed", {
+		timeout: 180_000,
+	}, async () => {
+		for (const option of ["{skip:true}", "{todo:true}"]) {
+			const spec = await prepare({
+				...normalHidden(),
+				...nodeSuite("modules/greet", "greet.test.js", [
+					{ id: "greets", name: "greets", body: "assert.equal(1,1);", options: option },
+				]),
+			});
+			assert.equal(
+				evaluationPassed(await evaluator.run({ trial: trialId, ...spec, deadlineMs: 30_000 })),
+				false,
+				option,
+			);
+			assert.equal(await evaluator.wipeScratch(spec.scratch), true);
+		}
+		for (const source of ["process.exit(0);", 'test.only("greets",()=>{});']) {
+			const spec = await prepare(normalHidden());
+			incompleteNativeFixture(spec, source);
+			assert.equal(
+				evaluationPassed(await evaluator.run({ trial: trialId, ...spec, deadlineMs: 30_000 })),
+				false,
+				source,
+			);
+			assert.equal(await evaluator.wipeScratch(spec.scratch), true);
+		}
+		for (const manifest of ["", "{"]) {
+			const spec = await prepare(normalHidden());
+			writeFileSync(join(spec.hiddenTests, "modules/greet/expected.json"), manifest);
+			assert.equal(evaluationPassed(await evaluator.run({ trial: trialId, ...spec, deadlineMs: 30_000 })), false);
+			assert.equal(await evaluator.wipeScratch(spec.scratch), true);
+		}
+	});
+
+	test("real full Node filesystem/async/ESM/child-process/native streams and V8 values remain usable; actual file proof rejects spoofing", {
+		timeout: 180_000,
+	}, async () => {
+		const body = `const value=await app.evaluate(${JSON.stringify(fullNodeProgram)});
+		 assert.deepEqual(value.data,Buffer.from("abc"));assert.deepEqual(value.map,new Map([["key",1]]));assert.equal(value.big,123n);assert.equal(value.child,"child");assert.equal(value.streamCallback,true);assert.equal(value.streamDrain,true);assert.equal((await app.readFile("proof.txt")).toString(),"real file");
+		 assert.equal(await app.call("esm/value.js","version"),1);assert.equal(await app.call("receiver.js","value"),7);
+		 await app.evaluate('require("node:fs").symlinkSync("/etc/passwd","unsafe");return true;');await assert.rejects(app.readFile("unsafe"));await assert.rejects(app.readFile("../outside"));
+		 const result=await app.exec(["node","-e",${JSON.stringify('process.stdout.write("cli");process.stderr.write("err")')}]);assert.equal(result.stdout.toString(),"cli");assert.equal(result.stderr.toString(),"err");assert.equal(result.exitCode,0);
+		`;
+		const hidden = {
+			...normalHidden(),
+			...nodeSuite("modules/greet", "greet.test.js", [{ id: "full-node", name: "full Node", body }]),
+		};
+		const files = {
+			"esm/package.json": '{"type":"module"}',
+			"esm/value.js": "await new Promise(r=>setTimeout(r,5)); export const version=1;",
+			"receiver.js": "exports.n=7;exports.value=function(){return this.n};",
+		};
+		const spec = await prepare(hidden, files);
+		const result = await evaluator.run({ trial: trialId, ...spec, deadlineMs: 60_000 });
+		assert.equal(evaluationPassed(result), true, JSON.stringify(result));
+		assert.equal(await evaluator.wipeScratch(spec.scratch), true);
+		const spoof = await prepare(
+			{
+				...normalHidden(),
+				...nodeSuite("modules/greet", "greet.test.js", [
+					{
+						id: "proof",
+						name: "proof",
+						body: 'await app.call("index.js","version"); await app.evaluate(\'require("node:fs").writeFileSync("proof.txt","never written");return true;\'); assert.equal((await app.readFile("proof.txt")).toString(),"never written");',
+					},
+				]),
+			},
+			{ "index.js": 'require("node:fs").writeFileSync=()=>{};exports.version=1;' },
+		);
+		assert.equal(evaluationPassed(await evaluator.run({ trial: trialId, ...spoof, deadlineMs: 30_000 })), false);
+		assert.equal(await evaluator.wipeScratch(spoof.scratch), true);
+	});
+
 	test("the deadline stops the container: the suite in progress timed out, the rest never ran", {
 		timeout: 120_000,
 	}, async () => {
 		const spec = await prepare({
-			"modules/hang/hang.test.js": TEST('test("hangs", () => new Promise(() => setInterval(() => {}, 1000)));'),
-			"integration/flow.test.js": TEST('test("flow", () => {});'),
-			"baseline/version.test.js": TEST('test("version", () => {});'),
+			...nodeSuite("modules/hang", "hang.test.js", [
+				{ id: "hangs", name: "hangs", body: 'await app.evaluate("while(true){}");' },
+			]),
+			...nodeSuite("integration", "flow.test.js", [{ id: "flow", name: "flow", body: "assert.equal(1,1);" }]),
+			...nodeSuite("baseline", "version.test.js", [{ id: "version", name: "version", body: "assert.equal(1,1);" }]),
 		});
 		// Long enough for the container to start and print its plan on a loaded host; the hanging suite outlasts it.
 		const result = await evaluator.run({ trial: trialId, ...spec, deadlineMs: 10_000 });

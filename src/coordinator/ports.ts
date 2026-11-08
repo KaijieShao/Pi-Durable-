@@ -202,6 +202,10 @@ export type EvaluatorSuiteOutcome = "passed" | "failed" | "timeout" | "error" | 
 
 export type EvaluatorSuite = {
 	readonly name: string;
+	/** Immutable hidden IDs and the trusted controller's observations (legacy results cannot pass). */
+	readonly expectedTests?: readonly string[];
+	readonly executedTests?: readonly string[];
+	readonly passedTests?: readonly string[];
 	readonly outcome: EvaluatorSuiteOutcome;
 	readonly exitCode: number | undefined;
 	readonly durationMs: number;
@@ -215,6 +219,8 @@ export type EvaluatorRun =
 	 */
 	| {
 			readonly kind: "ran";
+			/** A transport/exit failure of the isolated app; independent of any hidden assertion catching it. */
+			readonly subjectFailed?: boolean;
 			readonly suites: readonly EvaluatorSuite[];
 			readonly end: "exited" | "timeout" | "aborted" | "error";
 			readonly durationMs: number;
