@@ -13,9 +13,10 @@ import type { Store } from "./store.ts";
  * Per request: the bearer run key must be open and its run starting or running (same generation). Then, in ONE
  * `BEGIN IMMEDIATE` transaction: the request cap (30 per run, retries included, shared with the successor run), the
  * 48K-token input estimate, the budget reservation against the project ceiling, the `model_requests` increment and
- * the budget row. Only then is the request forwarded. The upstream SSE body is streamed back as it arrives while the
- * terminal `response.*` event's usage reconciles the budget row; without reported usage the row becomes `unknown`
- * and keeps its reservation (Capacity § Token budget reservation).
+ * the budget row. Only then is the request forwarded; admitting the run's last allowed request first reports the cap
+ * reached (`onCapReached`), so the run's pending steers can be withdrawn. The upstream SSE body is streamed back as
+ * it arrives while the terminal `response.*` event's usage reconciles the budget row; without reported usage the row
+ * becomes `unknown` and keeps its reservation (Capacity § Token budget reservation).
  *
  * Error bodies are sanitized and fixed: the 400/401 texts contain none of pi-ai's retryable words, so Pi's durable
  * retry never retries them (Agent Execution § Limits); 429/5xx texts carry the status number, so Pi retries them and
@@ -37,6 +38,11 @@ export type RelayOptions = {
 	 * refusal is sent, outside any transaction; may be called more than once for the same run (be idempotent).
 	 */
 	readonly onRunLimit: (runId: number, reason: RelayLimitReason) => void;
+	/**
+	 * The run's last allowed request (the cap'th) was admitted: the engine tells its Pi process that no steer can reach
+	 * the model any more. Called once per run, after the admission commits and before the request is forwarded.
+	 */
+	readonly onCapReached: (runId: number) => void;
 	readonly log: Logger;
 	readonly fetch?: typeof fetch;
 	/** 127.0.0.1 port; 0 or undefined = ephemeral. */
@@ -183,6 +189,7 @@ class RelayCore {
 		if (body instanceof Answer) return this.#answer(res, body);
 		const admitted = this.#admit(gate.keyHash, gate.run, body);
 		if (admitted instanceof Answer) return this.#answer(res, admitted);
+		if (admitted.requestNumber >= this.#options.limits.modelRequestsPerRun) this.#capReached(gate.run);
 		await this.#forward(req, res, gate.run, body, admitted, started);
 	}
 
@@ -361,6 +368,15 @@ class RelayCore {
 			this.#options.onRunLimit(run.runId, reason);
 		} catch (error) {
 			this.#options.log.error("relay.on_run_limit_failed", { run: run.runId, reason, error: errorSummary(error) });
+		}
+	}
+
+	#capReached(run: RunRef): void {
+		this.#options.log.info("relay.cap_reached", { run: run.runId, task: run.taskId });
+		try {
+			this.#options.onCapReached(run.runId);
+		} catch (error) {
+			this.#options.log.error("relay.on_cap_reached_failed", { run: run.runId, error: errorSummary(error) });
 		}
 	}
 

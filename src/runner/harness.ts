@@ -3,6 +3,8 @@
  * Execution § Finalize and Pending Inputs). Opens the conversation's own SQLite file, submits the run's input with its
  * `requestId`, steers follow-ups into the running work (`whenBusy: "steer"`, `whenIdle: "reject"`, falling back to one
  * successor input when Pi is already idle), and reports `finished` only once Pi is idle and every submission settled.
+ * A steer counts as delivered only once the model answered a request that carried it. When the relay admitted the run's
+ * last allowed request (`cap_reached`), queued steers are withdrawn and new ones refused, so no successor run starts.
  *
  * Pi Durable is used unmodified: `harness.resume()` is never called (an interrupted run is never resumed; a reused
  * conversation with unfinished work is refused), compaction is off, Pi's durable retry is the only retry owner
@@ -13,16 +15,20 @@ import { dirname } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type AuthContext, createModels, type ModelThinkingLevel, type Provider } from "@earendil-works/pi-ai";
 import {
+	AssistantEntry,
 	type Conversation,
 	ConversationIdle,
+	type Cursor,
 	createRegistry,
 	type EntryId,
+	type EntryRecord,
 	Harness,
 	type HarnessSettings,
 	LiveDoc,
 	type Report,
 	type SettledSubmissionRecord,
 	type Submission,
+	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { loadProvider } from "../agent/providers.ts";
@@ -42,8 +48,14 @@ export const MAX_TURNS = 30;
 export const QUIESCE_MS = 250;
 /** How long an aborted tool call still waits for the Coordinator's result (the in-flight round may settle). */
 export const TOOL_ABORT_GRACE_MS = 5_000;
-/** Placement polling for steers (Pi has no push for one submission's status). */
+/** Delivery polling for steers (Pi has no push for one submission's status). */
 const PLACEMENT_POLL_MS = 100;
+/** Entries scanned per page, and pages at most, when looking for the model's response after a placed steer. */
+const SCAN_PAGE = 64;
+const SCAN_PAGES = 32;
+/** Stop reasons of a complete model response (not an error, nor a partial cut by an abort). */
+const RESPONSE_STOPS: ReadonlySet<unknown> = new Set(["stop", "length", "toolUse"]);
+const CAP_REACHED = "the run's request limit is reached";
 /** Bounds on the stop path, so a stuck step can never keep the process from reporting and exiting. */
 const STOP_STEP_MS = 10_000;
 /** Final answer text sent to the Coordinator (it shortens further for Telegram). */
@@ -73,11 +85,20 @@ type Track = {
 	readonly settled: Promise<SettledSubmissionRecord>;
 	/** steer_status delivered sent. */
 	delivered: boolean;
+	/** Withdrawn from Pi's inbox after `cap_reached` (settled unanswered, never placed): not a failure of the run. */
+	withdrawn: boolean;
 };
 
 type Phase = "starting" | "running" | "closing" | "done";
 
-type Admission = { readonly track: Track; readonly status: SteerStatus } | { readonly refusal: string };
+type Admission =
+	| { readonly track: Track; readonly status: SteerStatus }
+	| { readonly refusal: string; readonly status: "rejected" | "withdrawn" };
+
+/** How far one steer got: still on its way, received by the model, or never going to be. */
+type Delivery = "pending" | "seen" | "never";
+
+type Outcomes = { delivered: string[]; unconsumed: string[]; answered: string[] };
 
 /** Harness settings for a run; exported for tests. */
 export function runnerSettings(maxRetries: number, fastRetry: boolean): HarnessSettings {
@@ -116,6 +137,8 @@ export class RunController {
 	#phase: Phase = "starting";
 	#aborting = false;
 	#finished = false;
+	/** `cap_reached` arrived: no steer can reach the model any more. */
+	#capReached = false;
 	#harness: Harness | undefined;
 	#root: Conversation | undefined;
 	/** Resolves when start-up (open and the input's submission) ended, either way. */
@@ -177,12 +200,9 @@ export class RunController {
 			if (typeof requestId === "string") void this.#steerStatus(requestId, "rejected", "invalid follow-up");
 			return;
 		}
-		if (this.#aborting) {
-			void this.#steerStatus(requestId, "rejected", "run stopping");
-			return;
-		}
-		if (this.#finished || this.#phase === "closing" || this.#phase === "done") {
-			void this.#steerStatus(requestId, "rejected", "run finished");
+		const refusal = this.#steerRefusal();
+		if (refusal !== undefined) {
+			void this.#steerStatus(requestId, "rejected", refusal);
 			return;
 		}
 		if (this.#steerIds.has(requestId)) {
@@ -190,11 +210,27 @@ export class RunController {
 			return;
 		}
 		this.#steerIds.add(requestId);
+		if (this.#capReached) {
+			void this.#steerStatus(requestId, "withdrawn", CAP_REACHED);
+			return;
+		}
 		if (this.#phase === "starting") {
 			this.#queuedSteers.push({ requestId, content });
 			return;
 		}
 		void this.#submitSteer(requestId, content);
+	}
+
+	/**
+	 * The relay admitted the run's last allowed model request: a steer could only reach the model in a request the cap
+	 * refuses. Withdraw every steer still queued in Pi's inbox and refuse new ones, so Pi starts no successor run
+	 * (Agent Execution § Finalize and Pending Inputs: "if the cap is already reached, it expires").
+	 */
+	capReached(): void {
+		if (this.#capReached) return;
+		this.#capReached = true;
+		this.#io.note("runner_cap_reached");
+		for (const track of this.#tracked) if (track.kind === "steer") void this.#withdraw(track);
 	}
 
 	/** The Coordinator's answer to one `tool` request. */
@@ -224,10 +260,19 @@ export class RunController {
 			const aborted = await bounded(root.abort(BG), STOP_STEP_MS);
 			if (!aborted.ok) this.#io.note("runner_abort_timeout");
 		}
-		const { delivered, unconsumed } = await this.#steerOutcomes();
-		await this.#reportDelivered(delivered);
+		const records = await this.#currentRecords();
+		const outcomes = await this.#outcomes(records);
+		const answer = root === undefined ? undefined : await this.#answerText(root, records);
+		await this.#reportDelivered(outcomes.delivered);
 		await this.#closeHarness();
-		await this.#finish({ outcome: "aborted", reason: shorten(reason, REASON_CHARS), delivered, unconsumed }, 0);
+		const optional = answer === undefined ? {} : { answer };
+		await this.#finish({ outcome: "aborted", reason: shorten(reason, REASON_CHARS), ...optional, ...outcomes }, 0);
+	}
+
+	#steerRefusal(): string | undefined {
+		if (this.#aborting) return "run stopping";
+		if (this.#finished || this.#phase === "closing" || this.#phase === "done") return "run finished";
+		return undefined;
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
@@ -307,22 +352,25 @@ export class RunController {
 			admission = await this.#admitSteer(root, requestId, content);
 		} catch (error) {
 			this.#io.note("runner_steer_failed", { error: errorName(error) });
-			admission = { refusal: errorText(error) };
+			admission = { refusal: errorText(error), status: "rejected" };
 		} finally {
 			this.#inFlight--;
 			if (this.#inFlight === 0) for (const wake of this.#inFlightWaiters.splice(0)) wake();
 		}
 		if ("refusal" in admission) {
-			await this.#steerStatus(requestId, "rejected", admission.refusal);
+			await this.#steerStatus(requestId, admission.status, admission.refusal);
 			return;
 		}
 		await this.#steerStatus(requestId, admission.status);
-		void this.#watchPlacement(admission.track);
+		// `cap_reached` arrived while Pi admitted it: it can no longer reach the model.
+		if (this.#capReached) await this.#withdraw(admission.track);
+		void this.#watchDelivery(admission.track);
 	}
 
 	/** Steer into the running work; when Pi is idle, fall back to one successor run. */
 	async #admitSteer(root: Conversation, requestId: string, content: string): Promise<Admission> {
-		if (this.#aborting) return { refusal: "run stopping" };
+		if (this.#aborting) return { refusal: "run stopping", status: "rejected" };
+		if (this.#capReached) return { refusal: CAP_REACHED, status: "withdrawn" };
 		try {
 			const draft = { type: "input", content, requestId, whenBusy: "steer", whenIdle: "reject" } as const;
 			const submission = await root.submit(draft, BG);
@@ -339,9 +387,10 @@ export class RunController {
 	 */
 	async #admitSuccessor(root: Conversation, requestId: string, content: string): Promise<Admission> {
 		const records = await bounded(Promise.all(this.#tracked.map((each) => each.settled)), 2000);
-		if (this.#aborting) return { refusal: "run stopping" };
+		if (this.#aborting) return { refusal: "run stopping", status: "rejected" };
+		if (this.#capReached) return { refusal: CAP_REACHED, status: "withdrawn" };
 		if (records.value === undefined || records.value.some((record) => record.status !== "done")) {
-			return { refusal: "run failed" };
+			return { refusal: "run failed", status: "rejected" };
 		}
 		const submission = await root.submit({ type: "input", content, requestId }, BG);
 		return { track: this.#track("steer", requestId, submission), status: "successor" };
@@ -351,22 +400,61 @@ export class RunController {
 		const settled = submission.wait(BG);
 		// Observed here so an early rejection (a failed Harness) is never unhandled; drain sees it too.
 		settled.catch(() => {});
-		const track: Track = { kind, requestId, submission, settled, delivered: false };
+		const track: Track = { kind, requestId, submission, settled, delivered: false, withdrawn: false };
 		this.#tracked.push(track);
 		return track;
 	}
 
-	/** Report `delivered` once the steer is placed into the conversation (by the running run or its successor). */
-	async #watchPlacement(track: Track): Promise<void> {
+	/** Withdraw a steer still queued in Pi's inbox; one Pi already placed stays and is reported as usual. */
+	async #withdraw(track: Track): Promise<void> {
+		if (track.withdrawn || this.#finished) return;
+		const result = await bounded(track.submission.abort(BG), STOP_STEP_MS);
+		if (result.value !== "aborted") return;
+		track.withdrawn = true;
+		this.#io.note("runner_steer_withdrawn");
+		await this.#steerStatus(track.requestId, "withdrawn", CAP_REACHED);
+	}
+
+	/**
+	 * Report `delivered` once the model received the steer: Pi placed it (into the running run or a successor) and a
+	 * model response to a request that carried it was committed. Placement alone is not delivery.
+	 */
+	async #watchDelivery(track: Track): Promise<void> {
 		while (!this.#finished && this.#phase !== "done" && !this.#aborting) {
 			const record = await track.submission.status(BG).catch(() => undefined);
-			if (record === undefined) return;
-			if (record.status !== "queued") {
-				if (record.type === "input" && record.entry !== undefined) await this.#markDelivered(track);
-				return;
-			}
+			const delivery = record === undefined ? "never" : await this.#delivery(record);
+			if (delivery === "seen") await this.#markDelivered(track);
+			if (delivery !== "pending") return;
 			await sleep(PLACEMENT_POLL_MS);
 		}
+	}
+
+	async #delivery(record: SubmissionRecord): Promise<Delivery> {
+		if (record.type !== "input") return "never";
+		if (record.status === "queued") return "pending";
+		if (record.status === "done") return "seen";
+		if (record.entry === undefined) return "never";
+		if (await this.#modelResponded(record.entry)) return "seen";
+		return record.status === "unanswered" ? "never" : "pending";
+	}
+
+	/**
+	 * True once a complete model response was committed after `entry`. Steers are placed at a boundary, before the
+	 * next request is assembled, so every response after the entry answers a request that carried it.
+	 */
+	async #modelResponded(entry: EntryId): Promise<boolean> {
+		const root = this.#root;
+		if (root === undefined) return false;
+		const query = { minEntryId: (entry + 1) as EntryId, order: "ascending" } as const;
+		let cursor: Cursor | undefined;
+		for (let page = 0; page < SCAN_PAGES; page++) {
+			const found = await root.entries(query, SCAN_PAGE, cursor, BG).catch(() => undefined);
+			if (found === undefined) return false;
+			if (found.items.some(isModelResponse)) return true;
+			if (found.next === undefined) return false;
+			cursor = found.next;
+		}
+		return false;
 	}
 
 	async #markDelivered(track: Track): Promise<void> {
@@ -375,7 +463,7 @@ export class RunController {
 		await this.#steerStatus(track.requestId, "delivered");
 	}
 
-	/** steer_status delivered for every placed steer not reported yet, before `finished`. */
+	/** steer_status delivered for every steer the model received and not reported yet, before `finished`. */
 	async #reportDelivered(delivered: readonly string[]): Promise<void> {
 		for (const track of this.#tracked) {
 			if (track.kind === "steer" && delivered.includes(track.requestId)) await this.#markDelivered(track);
@@ -416,8 +504,8 @@ export class RunController {
 		const records = await Promise.all(this.#tracked.map((track) => track.settled));
 		let { outcome, reason } = await this.#outcome(root, records);
 		const answer = await this.#answerText(root, records);
-		const { delivered, unconsumed } = await this.#steerOutcomes(records);
-		await this.#reportDelivered(delivered);
+		const outcomes = await this.#outcomes(records);
+		await this.#reportDelivered(outcomes.delivered);
 		if (!(await this.#closeHarness()) && outcome === "answered") {
 			outcome = "failed";
 			reason = "the conversation store did not close cleanly";
@@ -426,15 +514,18 @@ export class RunController {
 			...(reason === undefined ? {} : { reason: shorten(reason, REASON_CHARS) }),
 			...(answer === undefined ? {} : { answer }),
 		};
-		await this.#finish({ outcome, ...optional, delivered, unconsumed }, 0);
+		await this.#finish({ outcome, ...optional, ...outcomes }, 0);
 	}
 
-	/** Answered when every input settled done; otherwise failed with Pi's run failure (reason and detail). */
+	/**
+	 * Answered when every input settled done (a steer withdrawn at the cap does not count); otherwise failed with Pi's
+	 * run failure (reason and detail).
+	 */
 	async #outcome(
 		root: Conversation,
 		records: readonly SettledSubmissionRecord[],
 	): Promise<{ outcome: RunnerOutcome; reason?: string }> {
-		const unanswered = records.find((record) => record.status !== "done");
+		const unanswered = records.find((record, index) => record.status !== "done" && !this.#tracked[index]?.withdrawn);
 		if (unanswered === undefined) return { outcome: "answered" };
 		const live = await this.#harness?.snapshot(LiveDoc, root.id, BG).catch(() => undefined);
 		const failure = live?.runFailure;
@@ -446,10 +537,13 @@ export class RunController {
 	}
 
 	/** The newest answer of the runs this process drove. */
-	async #answerText(root: Conversation, records: readonly SettledSubmissionRecord[]): Promise<string | undefined> {
+	async #answerText(
+		root: Conversation,
+		records: readonly (SubmissionRecord | undefined)[],
+	): Promise<string | undefined> {
 		let id: EntryId | undefined;
 		for (const record of records) {
-			if (record.type === "input" && record.status === "done" && (id === undefined || record.answer > id)) {
+			if (record?.type === "input" && record.status === "done" && (id === undefined || record.answer > id)) {
 				id = record.answer;
 			}
 		}
@@ -461,21 +555,26 @@ export class RunController {
 		return shorten(text, ANSWER_CHARS);
 	}
 
-	/** Which steers were placed into the conversation, and which never were. */
-	async #steerOutcomes(
-		records?: readonly SettledSubmissionRecord[],
-	): Promise<{ delivered: string[]; unconsumed: string[] }> {
-		const delivered: string[] = [];
-		const unconsumed: string[] = [];
+	/** Each submission's current record (bounded reads; undefined when it could not be read). */
+	async #currentRecords(): Promise<(SubmissionRecord | undefined)[]> {
+		const records: (SubmissionRecord | undefined)[] = [];
+		for (const track of this.#tracked) records.push((await bounded(track.submission.status(BG), 2000)).value);
+		return records;
+	}
+
+	/** Which steers the model received and which it never did, and which submissions Pi settled answered. */
+	async #outcomes(records: readonly (SubmissionRecord | undefined)[]): Promise<Outcomes> {
+		const outcomes: Outcomes = { delivered: [], unconsumed: [], answered: [] };
 		for (const [index, track] of this.#tracked.entries()) {
+			const record = records[index];
+			if (record?.status === "done") outcomes.answered.push(track.requestId);
 			if (track.kind !== "steer") continue;
-			const record = records?.[index] ?? (await bounded(track.submission.status(BG), 2000)).value;
-			const placed = record !== undefined && record.type === "input" && record.entry !== undefined;
-			(placed ? delivered : unconsumed).push(track.requestId);
+			const seen = record !== undefined && (await this.#delivery(record)) === "seen";
+			(seen ? outcomes.delivered : outcomes.unconsumed).push(track.requestId);
 		}
 		// Follow-ups queued before the conversation opened never reached Pi.
-		for (const steer of this.#queuedSteers) unconsumed.push(steer.requestId);
-		return { delivered, unconsumed };
+		for (const steer of this.#queuedSteers) outcomes.unconsumed.push(steer.requestId);
+		return outcomes;
 	}
 
 	async #invokeTool(call: AllowedCall, signal: AbortSignal | undefined): Promise<ToolResult> {
@@ -526,7 +625,7 @@ export class RunController {
 	}
 
 	async #finish(
-		result: { outcome: RunnerOutcome; reason?: string; answer?: string; delivered?: string[]; unconsumed?: string[] },
+		result: { outcome: RunnerOutcome; reason?: string; answer?: string } & Partial<Outcomes>,
 		code: number,
 	): Promise<void> {
 		if (this.#finished) return;
@@ -545,6 +644,7 @@ export class RunController {
 			...(result.answer === undefined ? {} : { answer: result.answer }),
 			delivered: result.delivered ?? [],
 			unconsumed,
+			answered: result.answered ?? [],
 		});
 		this.#io.note("runner_finished", { outcome: result.outcome });
 		this.#resolveDone(code);
@@ -570,6 +670,13 @@ function normalizeToolResult(value: unknown): ToolResult {
 	if (typeof value !== "object" || value === null) return { ok: false, text: "invalid tool result" };
 	const { ok, text } = value as { ok?: unknown; text?: unknown };
 	return { ok: ok === true, text: typeof text === "string" ? text : "" };
+}
+
+/** A committed, complete model response (an assistant entry that is not an error or a partial cut by an abort). */
+function isModelResponse(entry: EntryRecord): boolean {
+	if (!AssistantEntry.is(entry)) return false;
+	const message = entry.model?.[0] as { readonly role?: unknown; readonly stopReason?: unknown } | undefined;
+	return message?.role === "assistant" && RESPONSE_STOPS.has(message.stopReason);
 }
 
 function isConversationIdle(error: unknown): boolean {

@@ -158,6 +158,8 @@ type Fixture = {
 	readonly relay: Relay;
 	readonly run: RunFixture;
 	readonly hits: { runId: number; reason: RelayLimitReason }[];
+	/** onCapReached calls (run ids), in order. */
+	readonly capped: number[];
 	readonly logs: string[];
 	addRun(options?: { runState?: string; keyState?: string; keyGeneration?: number }): RunFixture;
 };
@@ -201,6 +203,7 @@ async function setup(
 	const store = new Store(join(dir, "coordinator.sqlite"));
 	const upstream = await startUpstream();
 	const hits: { runId: number; reason: RelayLimitReason }[] = [];
+	const capped: number[] = [];
 	const logs: string[] = [];
 	const relay = await startRelay({
 		store,
@@ -209,6 +212,7 @@ async function setup(
 		codexGateway: options.codexGateway ?? false,
 		projectTokenCeiling: options.ceiling ?? 50_000_000,
 		onRunLimit: (runId, reason) => hits.push({ runId, reason }),
+		onCapReached: (runId) => capped.push(runId),
 		log: createLogger({ level: "debug", sink: (_level, line) => logs.push(line) }),
 	});
 	const run = addRun(store);
@@ -223,7 +227,7 @@ async function setup(
 			}
 		}
 	});
-	return { store, upstream, relay, run, hits, logs, addRun: (o) => addRun(store, o) };
+	return { store, upstream, relay, run, hits, capped, logs, addRun: (o) => addRun(store, o) };
 }
 
 function requestBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -429,7 +433,10 @@ test("only POST /v1/responses is served", async (t) => {
 
 test("the 31st request is refused: the 30-request cap counts retries (429/5xx answers too)", async (t) => {
 	const f = await setup(t);
+	/** onCapReached calls already made when each request reached upstream. */
+	const cappedAtUpstream: number[] = [];
 	f.upstream.handler = (_call, res) => {
+		cappedAtUpstream.push(f.capped.length);
 		if (f.upstream.calls.length % 3 === 0) errorReply(res, 503, { "retry-after": "1" });
 		else sseReply(res, responseEvents("ok", USAGE));
 	};
@@ -443,6 +450,9 @@ test("the 31st request is refused: the 30-request cap counts retries (429/5xx an
 	assert.equal(statuses.filter((status) => status === 200).length, 20);
 	assert.equal(modelRequests(f.store, f.run.runId), 30);
 	assert.deepEqual(f.hits, []);
+	// The 30th (last allowed) admission reports the cap reached once, before that request is forwarded.
+	assert.deepEqual(f.capped, [f.run.runId]);
+	assert.deepEqual(cappedAtUpstream, [...Array(29).fill(0), 1]);
 
 	const refused = await post(f.relay, f.run.key);
 	assert.equal(refused.status, 400);
@@ -458,9 +468,10 @@ test("the 31st request is refused: the 30-request cap counts retries (429/5xx an
 	});
 	assert.equal(rows.length, 30);
 	assert.equal(rows.filter((row) => row.state === "unknown").length, 10, "a 5xx keeps its reservation");
-	// Still refused afterwards, without reaching upstream.
+	// Still refused afterwards, without reaching upstream; refusals do not report the cap reached again.
 	assert.equal((await post(f.relay, f.run.key)).status, 400);
 	assert.equal(f.upstream.calls.length, 30);
+	assert.deepEqual(f.capped, [f.run.runId]);
 	assert.ok(isRetryableAssistantError(asAssistantError("OpenAI API error (503): upstream error (status 503)")));
 	assert.ok(!isRetryableAssistantError(asAssistantError("400 request limit reached (30 per run)")));
 });

@@ -12,7 +12,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, statfs } from "node:fs/promises";
 import { join } from "node:path";
-import type { FromRunner, RunnerStart } from "../../runner/protocol.ts";
+import type { FromRunner, RunnerStart, ToRunner } from "../../runner/protocol.ts";
 import { clip } from "../messages.ts";
 import type { RunnerHandle } from "../ports.ts";
 import {
@@ -25,6 +25,7 @@ import {
 	type Decision,
 	describeError,
 	enqueueTask,
+	type FinishedMessage,
 	type FollowupRow,
 	loadRun,
 	loadTask,
@@ -94,6 +95,9 @@ export function newActiveRun(ctx: Ctx, reservation: Reservation): ActiveRun {
 		deadline: undefined,
 		exited: false,
 		finished: undefined,
+		capReached: false,
+		capRefused: false,
+		capTimer: undefined,
 	};
 }
 
@@ -495,7 +499,13 @@ function launch(ctx: Ctx, active: ActiveRun, prepared: Prepared): void {
 			const timer = setTimeout(() => {
 				if (active.decision !== undefined || ctx.stopped) return;
 				ctx.log.warn("runner_exited_early", { run: active.runId, code: exit.code, signal: exit.signal });
-				decide(ctx, active, { kind: "failed", reason: "the Pi process exited unexpectedly", cause: "run failed" });
+				decide(
+					ctx,
+					active,
+					active.capRefused
+						? capLimit(ctx)
+						: { kind: "failed", reason: "the Pi process exited unexpectedly", cause: "run failed" },
+				);
 			}, EXIT_MESSAGE_GRACE_MS);
 			timer.unref?.();
 		},
@@ -541,7 +551,8 @@ function onRunnerMessage(ctx: Ctx, active: ActiveRun, message: FromRunner): void
 				ctx.log.debug("runner_ready", { run: active.runId });
 				return;
 			case "progress":
-				if (active.decision !== undefined) return;
+				// A revoked run posts no progress (a refusal over the cap revokes before it decides).
+				if (active.decision !== undefined || active.capRefused) return;
 				tx(ctx, () =>
 					enqueueTask(
 						ctx,
@@ -589,6 +600,9 @@ function onSteerStatus(ctx: Ctx, active: ActiveRun, requestId: string, status: s
 			deliverFollowup(ctx, followup);
 		} else if (status === "rejected") {
 			expireFollowup(ctx, followup, "the running task did not accept it");
+		} else if (status === "withdrawn") {
+			// Withdrawn from Pi's inbox (or refused) because the run's request cap is reached.
+			expireFollowup(ctx, followup, "limit");
 		}
 	});
 	ctx.log.info("steer_status", { run: active.runId, followup: followup.id, status });
@@ -609,8 +623,12 @@ function onTool(ctx: Ctx, active: ActiveRun, message: Extract<FromRunner, { type
 function onFinished(ctx: Ctx, active: ActiveRun, message: Extract<FromRunner, { type: "finished" }>): void {
 	active.finished = message;
 	if (message.delivered.length > 0) tx(ctx, () => applyDelivered(ctx, active, message.delivered));
+	if (active.capRefused) {
+		decide(ctx, active, afterCapRefusal(ctx, active, message));
+		return;
+	}
 	if (message.outcome === "answered") {
-		decide(ctx, active, { kind: "normal", finished: message });
+		decide(ctx, active, { kind: "normal", finished: message, reusable: true });
 		return;
 	}
 	const reason =
@@ -620,12 +638,30 @@ function onFinished(ctx: Ctx, active: ActiveRun, message: Extract<FromRunner, { 
 	decide(ctx, active, { kind: "failed", reason, cause: "run failed" });
 }
 
-function sendSteers(ctx: Ctx, active: ActiveRun, handle: RunnerHandle): void {
+/** The run's pending steers not yet sent to its Pi process. */
+function unsentSteers(ctx: Ctx, active: ActiveRun): FollowupRow[] {
 	const rows = ctx.store.all<FollowupRow>(
 		"SELECT * FROM followups WHERE run_id = ? AND mode = 'steer' AND state = 'pending' ORDER BY id",
 		active.runId,
 	);
-	for (const row of rows.filter((candidate) => !active.sentSteers.has(candidate.id))) {
+	return rows.filter((candidate) => !active.sentSteers.has(candidate.id));
+}
+
+/** Once the cap is reached a steer can never reach the model (Architecture § Follow-up during a run). */
+function expireUnsentSteers(ctx: Ctx, active: ActiveRun): void {
+	const rows = unsentSteers(ctx, active);
+	if (rows.length === 0) return;
+	tx(ctx, () => {
+		for (const row of rows) expireFollowup(ctx, row, "limit");
+	});
+}
+
+function sendSteers(ctx: Ctx, active: ActiveRun, handle: RunnerHandle): void {
+	if (active.capReached) {
+		expireUnsentSteers(ctx, active);
+		return;
+	}
+	for (const row of unsentSteers(ctx, active)) {
 		active.sentSteers.add(row.id);
 		try {
 			handle.send({ type: "steer", requestId: String(row.update_id), content: row.text });
@@ -643,6 +679,73 @@ export function sendPendingSteers(ctx: Ctx): void {
 			sendSteers(ctx, active, active.handle);
 		}
 	}
+}
+
+function sendQuietly(active: ActiveRun, message: ToRunner): void {
+	try {
+		if (!active.exited) active.handle?.send(message);
+	} catch {
+		// The process is gone; its exit is handled on its own.
+	}
+}
+
+/**
+ * Relay callback: the run's last allowed model request was admitted (Agent Execution § Finalize and Pending Inputs:
+ * "if the cap is already reached, it expires"). The Pi process withdraws the steers still queued in its inbox and
+ * refuses new ones, so no successor run starts; steers not yet sent to it expire here. The run itself goes on: if
+ * that request brings the answer, the run completes normally.
+ */
+export function onCapReached(ctx: Ctx, active: ActiveRun): void {
+	if (active.capReached || active.decision !== undefined) return;
+	active.capReached = true;
+	ctx.log.info("run_cap_reached", { run: active.runId, task: active.taskId });
+	sendQuietly(active, { type: "cap_reached" });
+	expireUnsentSteers(ctx, active);
+}
+
+/** The request-cap limit failure (Agent Execution § Limits: "Hitting any limit ... ends the task as failed"). */
+function capLimit(ctx: Ctx): Decision {
+	return { kind: "failed", reason: limitReason("request_cap", ctx.limits), cause: "limit" };
+}
+
+/**
+ * Relay callback: a request over the cap was refused. Revoke at once (close the key, the run leaves 'running' so a
+ * reply is refused as "stopping" instead of being accepted as a steer, abort Pi), but decide only once the runner says
+ * what the cap cut (`afterCapRefusal`); if it does not report within the stop grace, it is a limit failure.
+ */
+export function onCapRefused(ctx: Ctx, active: ActiveRun): void {
+	if (active.capRefused || active.decision !== undefined) return;
+	active.capRefused = true;
+	active.capReached = true;
+	tx(ctx, () => {
+		closeRunKeys(ctx.store, active, ctx.now());
+		ctx.store.run(
+			"UPDATE runs SET state = 'finalizing' WHERE id = ? AND state IN ('starting', 'running')",
+			active.runId,
+		);
+	});
+	expireUnsentSteers(ctx, active);
+	ctx.log.info("run_cap_refused", { run: active.runId, task: active.taskId });
+	sendQuietly(active, { type: "abort", reason: limitReason("request_cap", ctx.limits) });
+	active.capTimer = setTimeout(() => {
+		if (active.decision === undefined) decide(ctx, active, capLimit(ctx));
+	}, ctx.limits.stopGraceMs);
+	active.capTimer.unref?.();
+}
+
+/**
+ * What a refusal over the cap ends (Agent Execution § Finalize and Pending Inputs, § Limits). If the run's own input
+ * had been answered and the refused requests belonged only to a successor whose input never reached the model (Pi
+ * started it before it could withdraw the steer), the cap was already reached at normal completion: the run keeps
+ * its result and that steer expires. Otherwise the cap cut off work the model was doing: a limit failure.
+ */
+function afterCapRefusal(ctx: Ctx, active: ActiveRun, finished: FinishedMessage): Decision {
+	const own = loadRun(ctx, active.runId).request_id;
+	const answered = new Set(Array.isArray(finished.answered) ? finished.answered : []);
+	const cutOff = finished.delivered.some((requestId) => !answered.has(requestId));
+	if (!answered.has(own) || cutOff) return capLimit(ctx);
+	ctx.log.info("run_cap_after_answer", { run: active.runId, task: active.taskId });
+	return { kind: "normal", finished, reusable: false };
 }
 
 /** Relay limit callback reasons → user-facing text (Agent Execution § Limits). */

@@ -27,7 +27,15 @@ import { dispatchOnce } from "./engine/dispatch.ts";
 import { decide } from "./engine/finalize.ts";
 import { mergeTask, nextMergeTask } from "./engine/merge.ts";
 import { type RecoveryJob, reconcile, runRecoveryJob } from "./engine/recovery.ts";
-import { defaultFreeBytes, limitReason, newActiveRun, runLifecycle, sendPendingSteers } from "./engine/runs.ts";
+import {
+	defaultFreeBytes,
+	limitReason,
+	newActiveRun,
+	onCapReached,
+	onCapRefused,
+	runLifecycle,
+	sendPendingSteers,
+} from "./engine/runs.ts";
 import { rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
 import { projectTokensSpent } from "./relay.ts";
 
@@ -36,8 +44,14 @@ export type { EngineOptions } from "./engine/context.ts";
 export type Engine = {
 	/** The relay's base URL (http://127.0.0.1:P/v1); no run is dispatched before it is set. */
 	setRelayUrl(url: string): void;
-	/** Relay callback: a run hit a limit or a fatal upstream answer → it is revoked and finalized as failed. */
+	/**
+	 * Relay callback: a run hit a limit or a fatal upstream answer → it is revoked and finalized as failed. Over the
+	 * request cap it is revoked at once but decided on the runner's report: if the cap only cut a successor whose input
+	 * never reached the model (the run's own input was answered), the run completes; otherwise it fails.
+	 */
 	onRunLimit(runId: number, reason: string): void;
+	/** Relay callback: the run's last allowed model request was admitted → its Pi process takes no more steers. */
+	onCapReached(runId: number): void;
 	/** Look at the store now (after a command was saved). */
 	kick(): void;
 	/** Restart recovery steps 1–3; call before the relay, the poller and start(). */
@@ -358,6 +372,7 @@ function waitAtMost(ms: number): Promise<void> {
 /** Abort a live run's process and stop its container; no database change (recovery marks it interrupted). */
 function abandonRun(ctx: Ctx, active: ActiveRun): Promise<unknown>[] {
 	if (active.deadline !== undefined) clearTimeout(active.deadline);
+	if (active.capTimer !== undefined) clearTimeout(active.capTimer);
 	if (active.decision === undefined) {
 		active.decision = { kind: "cancelled", reason: "coordinator stopping", cause: "interrupted" };
 		active.resolveDecision(active.decision);
@@ -442,7 +457,12 @@ export function createEngine(options: EngineOptions): Engine {
 		onRunLimit(runId: number, reason: string): void {
 			const active = ctx.active.get(runId);
 			if (active === undefined || active.decision !== undefined) return;
-			decide(ctx, active, { kind: "failed", reason: limitReason(reason, ctx.limits), cause: "limit" });
+			if (reason === "request_cap") onCapRefused(ctx, active);
+			else decide(ctx, active, { kind: "failed", reason: limitReason(reason, ctx.limits), cause: "limit" });
+		},
+		onCapReached(runId: number): void {
+			const active = ctx.active.get(runId);
+			if (active !== undefined) onCapReached(ctx, active);
 		},
 		kick,
 		async recover(): Promise<void> {

@@ -48,7 +48,7 @@ async function run(
 
 /** Execute one tool call for `active`'s own sandbox; never throws. */
 export async function executeTool(ctx: Ctx, active: ActiveRun, call: ToolCall): Promise<ToolResult> {
-	if (active.decision !== undefined && active.decision.kind !== "normal") return STOPPED;
+	if (active.capRefused || (active.decision !== undefined && active.decision.kind !== "normal")) return STOPPED;
 	const { agentBox, worktree } = active;
 	if (agentBox === undefined || worktree === undefined) return STOPPED;
 	const decision = evaluateToolCall(call.name, call.args, { checkOps: ctx.sandbox.checkOps() });

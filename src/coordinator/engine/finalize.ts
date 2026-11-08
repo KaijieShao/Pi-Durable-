@@ -3,7 +3,9 @@
  *
  * Normal completion: Pi reported `finished` only once it was idle and any successor drained. Close the key, let the
  * process exit (kill after the grace), stop the container and verify it gone, mark the conversation reusable, then
- * the post-run review step runs while the run still holds its slot.
+ * the post-run review step runs while the run still holds its slot. Once the run's request cap was reached, its
+ * unsettled steers expire and none becomes another run. A refusal over the cap after the run's own input was answered
+ * (only a successor whose input never reached the model was cut) is also a normal completion, without reuse.
  *
  * Cancel / limit / failure: revoke FIRST (close the key, so no successor or new request starts; pending follow-ups
  * expire), then abort Pi, let the in-flight tool round settle, terminate and verify; the task ends failed or
@@ -105,10 +107,11 @@ export function applyDelivered(ctx: Ctx, active: ActiveRun, requestIds: readonly
 }
 
 /**
- * Follow-ups left after a normal completion (run already 'finished'). Delivered ones are marked delivered; ones
- * still unconsumed by an idle Pi (the shared request cap was reached: Agent Execution § Finalize "if the cap is
- * already reached, it expires") expire; one Pi never took (it arrived as the run ended) is admitted as another run
- * of the task, like a reply during review, or expires with the admission's reason. Call inside `store.tx()`.
+ * Follow-ups left after a normal completion (run already 'finished'). Delivered ones are marked delivered; once the
+ * run's request cap was reached, every other one expires (Agent Execution § Finalize: "if the cap is already
+ * reached, it expires"; Evaluation "Steer with cap used": no new run), as does one still unconsumed by an idle Pi;
+ * one Pi never took (it arrived as the run ended) is admitted as another run of the task, like a reply during
+ * review, or expires with the admission's reason. Call inside `store.tx()`.
  */
 function settleAfterNormal(ctx: Ctx, active: ActiveRun, finished: FinishedMessage): void {
 	applyDelivered(ctx, active, finished.delivered);
@@ -118,7 +121,7 @@ function settleAfterNormal(ctx: Ctx, active: ActiveRun, finished: FinishedMessag
 	);
 	for (const row of rows) {
 		const requestId = String(row.update_id);
-		if (finished.unconsumed.includes(requestId)) {
+		if (active.capReached || finished.unconsumed.includes(requestId)) {
 			expireFollowup(ctx, row, "limit");
 			continue;
 		}
@@ -162,13 +165,16 @@ function settleAfterNormal(ctx: Ctx, active: ActiveRun, finished: FinishedMessag
 /**
  * Record how the run ends; the first decision wins. Revocation happens here, synchronously, before any abort: the
  * run key is closed, the run leaves 'running' (the relay refuses it), and for an abnormal end every unsettled
- * follow-up expires.
+ * follow-up expires. A run refused over its request cap was revoked already (`onCapRefused`: 'finalizing', no decision
+ * yet); its answer or reason is recorded here.
  */
 export function decide(ctx: Ctx, active: ActiveRun, decision: Decision): void {
 	if (active.decision !== undefined) return;
 	active.decision = decision;
 	if (active.deadline !== undefined) clearTimeout(active.deadline);
 	active.deadline = undefined;
+	if (active.capTimer !== undefined) clearTimeout(active.capTimer);
+	active.capTimer = undefined;
 	if (!ctx.stopped) {
 		try {
 			tx(ctx, () => {
@@ -176,13 +182,15 @@ export function decide(ctx: Ctx, active: ActiveRun, decision: Decision): void {
 				closeRunKeys(ctx.store, active, now);
 				if (decision.kind === "normal") {
 					ctx.store.run(
-						"UPDATE runs SET state = 'finalizing', answer = ? WHERE id = ? AND state IN ('starting', 'running')",
+						`UPDATE runs SET state = 'finalizing', answer = ?
+						 WHERE id = ? AND state IN ('starting', 'running', 'finalizing')`,
 						clipText(decision.finished.answer ?? "", ANSWER_CHARS),
 						active.runId,
 					);
 				} else {
 					ctx.store.run(
-						"UPDATE runs SET state = 'finalizing', reason = ? WHERE id = ? AND state IN ('starting', 'running')",
+						`UPDATE runs SET state = 'finalizing', reason = ?
+						 WHERE id = ? AND state IN ('starting', 'running', 'finalizing')`,
 						decision.reason,
 						active.runId,
 					);
@@ -293,7 +301,7 @@ export async function finalizeRun(ctx: Ctx, active: ActiveRun, decision: Decisio
 	const problem = await stopWorkload(ctx, active, decision);
 	if (ctx.stopped) return;
 	try {
-		if (decision.kind === "normal") await finalizeNormal(ctx, active, decision.finished, problem);
+		if (decision.kind === "normal") await finalizeNormal(ctx, active, decision, problem);
 		else await finalizeAbnormal(ctx, active, decision, problem);
 	} finally {
 		// The slot is released only after verified cleanup (Architecture § Request Flow). An unconfirmed stop keeps it
@@ -308,13 +316,13 @@ export async function finalizeRun(ctx: Ctx, active: ActiveRun, decision: Decisio
 async function finalizeNormal(
 	ctx: Ctx,
 	active: ActiveRun,
-	finished: FinishedMessage,
+	decision: Extract<Decision, { kind: "normal" }>,
 	problem: string | undefined,
 ): Promise<void> {
 	tx(ctx, () => {
 		const now = ctx.now();
 		ctx.store.run("UPDATE runs SET state = 'finished', ended_at = ? WHERE id = ?", now, active.runId);
-		if (problem === undefined) {
+		if (problem === undefined && decision.reusable) {
 			// Quiescence confirmed: the next run of this task may reuse the conversation.
 			ctx.store.run(
 				`UPDATE conversations SET reusable = 1
@@ -322,7 +330,7 @@ async function finalizeNormal(
 				active.runId,
 			);
 		}
-		settleAfterNormal(ctx, active, finished);
+		settleAfterNormal(ctx, active, decision.finished);
 	});
 	if (problem !== undefined) {
 		// review_done stays 0: the review step runs at the recheck after the owner resolves the freeze.

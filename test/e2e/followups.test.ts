@@ -3,7 +3,7 @@
  * Pi runner process) against 127.0.0.1 fakes (Telegram, GitHub, model). Spec: Requirements § Follow-ups,
  * § Permissions; Architecture § Request Flow (follow-up during a run / during review); Agent Execution § Finalize
  * and Pending Inputs; Evaluation fault rows Permissions, Steer while busy, Duplicate update ID, Accepted follow-up
- * outcomes, Steer at normal completion, Follow-up during review, Follow-up after merge.
+ * outcomes, Steer at normal completion, Steer with cap used, Follow-up during review, Follow-up after merge.
  *
  * No sleeps are used as synchronization: the fake model holds a request on a gate that the test opens once the
  * store (or Telegram) shows the state the scenario needs. Every test ends by checking that each accepted follow-up
@@ -16,7 +16,7 @@ import { test } from "node:test";
 import type { Update } from "grammy/types";
 import { waitFor } from "../helpers/env.ts";
 import { type FakeHandler, type FakeStep, type RecordedRequest, userTexts } from "../helpers/fake-model.ts";
-import { agentPosition, GROUP, OWNER, type Stack, startStack, USER1, USER2 } from "./harness.ts";
+import { agentPosition, GROUP, OWNER, REPO, type Stack, startStack, USER1, USER2 } from "./harness.ts";
 
 const TASK_TEXT = "add a greet(name) helper in greet.js with a test";
 const GREET_JS = 'exports.greet = (name) => "Hello, " + name + "!";\n';
@@ -378,6 +378,8 @@ test("a steer arriving as the run answers becomes one successor run in the same 
 	const successor = stack.model.requests[2];
 	assert.equal(agentPosition(successor ?? { body: {} }).input, steerText);
 	assert.ok(JSON.stringify(successor?.body.input).includes("First answer: greet added."), "it continues the run");
+	// Placed as the successor's input, but the model has not answered it yet: not delivered yet.
+	assert.equal(followupState(stack, steer), "submitted");
 	releaseSuccessor.open();
 
 	const review = await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/, { since: ack.id });
@@ -718,11 +720,13 @@ test("the successor run shares the run's request cap; the limit fails the task a
 	await followupReaches(stack, steer, "submitted");
 	releaseAnswer.open();
 
-	// The successor's first request is request 3 of the same run row: the cap was not reset for it.
+	// The successor's first request is request 3 of the same run row: the cap was not reset for it. The steer is
+	// delivered once the model answered that request (it then works on it, so the cap cuts off real work below).
 	await successorAsked.opened;
-	await followupReaches(stack, steer, "delivered");
 	assert.equal(onlyRun(stack).model_requests, 3);
+	assert.equal(followupState(stack, steer), "submitted", "placed, but the model has not answered it yet");
 	releaseSuccessor.open();
+	await followupReaches(stack, steer, "delivered");
 
 	const failed = await stack.waitForBotMessage(/^Task 1 failed: request limit reached \(4 per run\)\./);
 	assert.match(failed.text, /Branch task\/1 kept\. Send a new \/task for further work\./);
@@ -825,7 +829,7 @@ test("every accepted follow-up ends with exactly one outcome: delivered, started
 	await assertOneOutcomeEach(stack, { [a]: "delivered", [b]: "started", [c]: "expired" });
 });
 
-test("a steer still unconsumed when the run's request cap is already used up expires; no successor starts", {
+test("a steer after the run's last allowed request expires; the run completes with its own result, no successor", {
 	timeout: 120_000,
 }, async (t) => {
 	const steerText = "LATE: one more thing";
@@ -853,26 +857,111 @@ test("a steer still unconsumed when the run's request cap is already used up exp
 	await answering.opened;
 	const steer = stack.reply(USER1, ack.id, steerText);
 	await replyTo(stack, steer, /^Follow-up saved; it will be steered into the running Task 1/);
-	await followupReaches(stack, steer, "submitted");
+
+	// Evaluation "Steer with cap used": the steer could only reach the model in a request the cap refuses, so it
+	// expires with the limit reason, while the run itself goes on (its last allowed request may bring the answer).
+	await replyTo(stack, steer, /^Follow-up to Task 1 expired: the run hit a limit\./);
+	assert.equal(onlyRun(stack).state, "running");
 	releaseAnswer.open();
 
-	// Evaluation "Steer with cap used": the steer expires, and no new run starts.
-	await replyTo(stack, steer, /^Follow-up to Task 1 expired: the run hit a limit\./);
+	// Agent Execution § Finalize: the run completed normally, so the task keeps its own result and goes to review.
+	const review = await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/, { since: ack.id });
+	assert.ok(review.text.includes("First answer."), review.text);
 	await stack.coordinator.idle();
 	assert.equal(stack.model.requests.length, 2, "the cap held: nothing beyond the 2nd request reached the model");
 	assert.equal(requestsFor(stack, /^LATE: /).length, 0, "the expired steer never reached the model");
 	const run = onlyRun(stack);
-	assert.equal(run.model_requests, 2);
-	assert.equal(stack.followups<FollowupRow>()[0]?.reason, "expired (limit)");
-	// The task reports its own final state. Spec reading (Agent Execution § Finalize): the run completed normally and
-	// only the steer expires; the built system fails the task instead, because Pi starts the successor and the relay
-	// refuses its first request as "request limit reached". Reported to the lead; not pinned here.
+	assert.deepEqual(
+		[run.kind, run.state, run.reason, run.model_requests, run.answer],
+		["initial", "finished", null, 2, "First answer."],
+	);
 	const task = task1(stack);
-	const final = task.state === "failed" ? /^Task 1 failed: request limit reached/ : /^Task 1 is ready for review/;
-	assert.ok(["failed", "review"].includes(task.state), task.state);
+	assert.deepEqual([task.state, task.reason, task.pr_number], ["review", null, 1]);
+	assert.equal(stack.github.pulls.size, 1);
+	assert.equal(stack.github.pulls.get(1)?.state, "open");
+	assert.equal(await stack.branchSha("task/1"), task.head_commit, "the run's work is pushed to its branch");
+	assert.ok(review.text.includes(`Pull request: https://github.com/${REPO}/pull/1.`), review.text);
+	assert.ok(!stack.bot.sent().some((message) => /^Task 1 failed/.test(message.text)), "the task did not fail");
+	const [followup] = stack.followups<FollowupRow>();
+	assert.deepEqual([followup?.mode, followup?.state, followup?.reason], ["steer", "expired", "expired (limit)"]);
+	await assertOneOutcomeEach(stack, { [steer]: "expired" });
+});
+
+test("a steer queued in Pi when the run's last allowed request is admitted is withdrawn and expires; no successor", {
+	timeout: 120_000,
+}, async (t) => {
+	const steerText = "QUEUED: one more thing";
+	const failing = gate();
+	const releaseFailure = gate();
+	const retrying = gate();
+	const releaseAnswer = gate();
+	let attempts = 0;
+	/** Request 2 fails with a 503 once the test lets it; Pi's durable retry (request 3, the last allowed) answers. */
+	const failThenAnswer = async (): Promise<FakeStep> => {
+		attempts++;
+		if (attempts === 1) {
+			failing.open();
+			await releaseFailure.opened;
+			return { status: 503 };
+		}
+		retrying.open();
+		await releaseAnswer.opened;
+		return { text: "First answer." };
+	};
+	const stack = await startStack({
+		// Test-only: a 3-request cap instead of 30. A retry adds no boundary, so a steer that reached Pi's inbox while
+		// request 2 was out is still queued when the retry, request 3, is admitted as the run's last allowed request.
+		limits: { modelRequestsPerRun: 3 },
+		model: agent([
+			{ when: /^add a greet\(name\) helper/, steps: [write("greet.js", GREET_JS), failThenAnswer] },
+			{ when: /^QUEUED: /, steps: [{ text: "The successor must never reach the model." }] },
+		]),
+	});
+	t.after(() => {
+		releaseFailure.open();
+		releaseAnswer.open();
+		return stack.stop();
+	});
+	stack.sendCommand(USER1, `/task alpha ${TASK_TEXT}`);
+	const ack = await stack.waitForBotMessage(/^Task 1 accepted for agent alpha/);
+	await failing.opened;
+	const steer = stack.reply(USER1, ack.id, steerText);
+	await replyTo(stack, steer, /^Follow-up saved; it will be steered into the running Task 1/);
+	// Sent to the Pi process before the cap was reached: Pi holds it in its inbox while request 2 is out.
+	await followupReaches(stack, steer, "submitted");
+	releaseFailure.open();
+
+	// The retry is admitted as the run's last allowed request: the Pi process withdraws the queued steer from its inbox
+	// (the Coordinator had already sent it, so only the runner can do this), and it expires with the limit reason.
+	await retrying.opened;
+	assert.equal(onlyRun(stack).model_requests, 3);
+	await replyTo(stack, steer, /^Follow-up to Task 1 expired: the run hit a limit\./);
+	assert.equal(onlyRun(stack).state, "running");
+	releaseAnswer.open();
+
+	const review = await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/, { since: ack.id });
+	assert.ok(review.text.includes("First answer."), review.text);
+	await stack.coordinator.idle();
+	assert.equal(stack.model.requests.length, 3, "no successor run reached the model");
+	assert.equal(attempts, 2);
 	assert.ok(
-		stack.bot.sent().some((message) => final.test(message.text)),
-		"the task's final state is posted",
+		!stack.model.requests.some((request) => JSON.stringify(request.body.input).includes(steerText)),
+		"the withdrawn steer never reached the model",
+	);
+	const run = onlyRun(stack);
+	assert.deepEqual([run.state, run.reason, run.model_requests, run.answer], ["finished", null, 3, "First answer."]);
+	const task = task1(stack);
+	assert.deepEqual([task.state, task.reason, task.pr_number], ["review", null, 1]);
+	assert.ok(!stack.bot.sent().some((message) => /^Task 1 failed/.test(message.text)), "the task did not fail");
+	const [followup] = stack.followups<FollowupRow>();
+	assert.deepEqual([followup?.mode, followup?.state, followup?.reason], ["steer", "expired", "expired (limit)"]);
+	assert.deepEqual(
+		piSubmissions(stack, run.conversation_id).map((submission) => [submission.requestId, submission.status]),
+		[
+			[run.request_id, "done"],
+			[String(followup?.update_id), "unanswered"],
+		],
+		"Pi answered the run's input; the steer was withdrawn from its inbox unanswered",
 	);
 	await assertOneOutcomeEach(stack, { [steer]: "expired" });
 });

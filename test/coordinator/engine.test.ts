@@ -424,7 +424,7 @@ function workScript(
 		run.emit({ type: "ready" });
 		run.emit({ type: "tool", id: 1, name: "write", args: { path, content } });
 		await run.next("tool_result");
-		run.emit({ type: "finished", outcome: "answered", answer, delivered: [], unconsumed: [] });
+		run.emit({ type: "finished", outcome: "answered", answer, delivered: [], unconsumed: [], answered: [] });
 		run.exit(0);
 	};
 }
@@ -437,9 +437,9 @@ function holdScript(): Script {
 		await run.next("tool_result");
 		const event = await Promise.race([run.next("abort"), run.released]);
 		if (event === "release") {
-			run.emit({ type: "finished", outcome: "answered", answer: "Done.", delivered: [], unconsumed: [] });
+			run.emit({ type: "finished", outcome: "answered", answer: "Done.", delivered: [], unconsumed: [], answered: [] });
 		} else {
-			run.emit({ type: "finished", outcome: "aborted", delivered: [], unconsumed: [] });
+			run.emit({ type: "finished", outcome: "aborted", delivered: [], unconsumed: [], answered: [] });
 		}
 		run.exit(0);
 	};
@@ -910,6 +910,176 @@ test("limit: key closed before abort, task failed, PR closed, worktree archived,
 	assert.equal(messages(h, "task_final").length, 1);
 });
 
+// Agent Execution § Finalize and Pending Inputs: "if the cap is already reached, it expires"; Evaluation "Steer with
+// cap used": the steer expires and no new run starts, while the run itself completes normally.
+
+type FollowupState = { state: string; reason: string | null };
+const followupRow = (h: Harness, id: number): FollowupState => ({
+	...(h.store.get<FollowupState>("SELECT state, reason FROM followups WHERE id = ?", id) as FollowupState),
+});
+const outcomesOf = (h: Harness, updateId: number) =>
+	h.store
+		.all<{ text: string }>("SELECT text FROM outbox WHERE reply_to = ?", updateId + 100_000)
+		.map((row) => row.text);
+const reusable = (h: Harness, conversationId: string | null | undefined) =>
+	h.store.get<{ reusable: number }>("SELECT reusable FROM conversations WHERE id = ?", conversationId ?? null)
+		?.reusable;
+
+test("cap reached: Pi is told, no steer is sent any more, every unsettled steer expires (limit), no new run", async (t) => {
+	const h = await harness(t);
+	h.fake.control.script = holdScript();
+	const taskId = submitTask(h, "alpha", "use the last request");
+	h.engine.kick();
+	await waitFor(() => h.fake.runs[0]?.received.some((m) => m.type === "tool_result"), { what: "tool result" });
+	const held = h.fake.runs[0] as FakeRun;
+	const runId = runsOf(h, taskId)[0]?.id as number;
+	// A: sent to Pi before the cap was reached; Pi never reports on it (in transit when Pi took the cap).
+	const a = steer(h, taskId, runId, "A: sent before the cap");
+	h.engine.kick();
+	await waitFor(() => held.received.some((m) => m.type === "steer"), { what: "steer A sent" });
+	h.engine.onCapReached(runId);
+	assert.deepEqual(
+		held.received.filter((m) => m.type === "cap_reached"),
+		[{ type: "cap_reached" }],
+	);
+	// B: accepted after the cap was reached: never sent, it expires at once.
+	const b = steer(h, taskId, runId, "B: after the cap");
+	h.engine.kick();
+	await waitFor(() => followupRow(h, b.followupId).state === "expired", { what: "B expired" });
+	assert.equal(held.received.filter((m) => m.type === "steer").length, 1, "B never reaches Pi");
+	assert.equal(runsOf(h, taskId)[0]?.state, "running", "the run goes on: its last request may bring the answer");
+	h.engine.onCapReached(runId);
+	assert.equal(held.received.filter((m) => m.type === "cap_reached").length, 1, "told once");
+
+	held.release();
+	await h.engine.idle();
+	const task = taskRow(h, taskId);
+	assert.deepEqual([task.state, task.pr_number], ["review", 1]);
+	const runs = runsOf(h, taskId);
+	assert.deepEqual(
+		runs.map((run) => run.state),
+		["finished"],
+		"A is not admitted as another run",
+	);
+	for (const { followupId, updateId } of [a, b]) {
+		assert.deepEqual(followupRow(h, followupId), { state: "expired", reason: "expired (limit)" });
+		assert.deepEqual(outcomesOf(h, updateId), [`Follow-up to Task ${taskId} expired: the run hit a limit.`]);
+	}
+	assert.equal(reusable(h, runs[0]?.conversation_id), 1, "the run answered and Pi went idle: reusable");
+	assert.equal(messages(h, "task_final").length, 0);
+});
+
+/** Write wip.txt, take one steer, then on abort report `finished` aborted with `report(steerRequestId)`. */
+function cappedScript(
+	report: (run: FakeRun, steerRequestId: string) => Partial<Extract<FromRunner, { type: "finished" }>>,
+): Script {
+	return async (run) => {
+		run.emit({ type: "ready" });
+		run.emit({ type: "tool", id: 1, name: "write", args: { path: "wip.txt", content: "work in progress\n" } });
+		await run.next("tool_result");
+		const sent = (await run.next("steer")) as Extract<ToRunner, { type: "steer" }>;
+		run.emit({ type: "steer_status", requestId: sent.requestId, status: "submitted" });
+		await run.next("abort");
+		run.emit({
+			type: "finished",
+			outcome: "aborted",
+			delivered: [],
+			unconsumed: [],
+			answered: [],
+			...report(run, sent.requestId),
+		});
+		run.exit(0);
+	};
+}
+
+async function steerThenCapRefusal(h: Harness, taskId: number): Promise<{ runId: number; followupId: number }> {
+	h.engine.kick();
+	await waitFor(() => h.fake.runs[0]?.received.some((m) => m.type === "tool_result"), { what: "tool result" });
+	const runId = runsOf(h, taskId)[0]?.id as number;
+	const { followupId } = steer(h, taskId, runId, "one more thing");
+	h.engine.kick();
+	await waitFor(() => followupRow(h, followupId).state === "submitted", { what: "steer submitted" });
+	h.engine.onRunLimit(runId, "request_cap");
+	// Revoked at once, decided later: the run left 'running' (a reply is refused as "stopping", not taken as a steer).
+	assert.deepEqual([runsOf(h, taskId)[0]?.state, taskRow(h, taskId).state], ["finalizing", "running"]);
+	h.engine.onRunLimit(runId, "request_cap");
+	await h.engine.idle();
+	return { runId, followupId };
+}
+
+test("cap refusal after the run's own input was answered (a successor Pi started anyway): review, steer expired", async (t) => {
+	const h = await harness(t);
+	h.fake.control.script = cappedScript((run, steerId) => ({
+		answer: "Own answer.",
+		answered: [run.start.input.requestId],
+		unconsumed: [steerId],
+	}));
+	const taskId = submitTask(h, "alpha", "answer, then a refused successor");
+	const { followupId } = await steerThenCapRefusal(h, taskId);
+	const held = h.fake.runs[0] as FakeRun;
+	assert.equal(held.keyStateAtAbort, "closed", "revoked before the abort");
+	assert.equal(held.received.filter((m) => m.type === "abort").length, 1);
+	const task = taskRow(h, taskId);
+	assert.deepEqual([task.state, task.reason, task.pr_number, task.archived], ["review", null, 1, 0]);
+	assert.equal(h.world.pulls.get(1)?.state, "open");
+	const runs = runsOf(h, taskId);
+	assert.deepEqual(
+		runs.map((run) => [run.state, run.reason, run.answer, run.review_done]),
+		[["finished", null, "Own answer.", 1]],
+		"the task keeps its own result; no new run",
+	);
+	assert.deepEqual(followupRow(h, followupId), { state: "expired", reason: "expired (limit)" });
+	assert.match(messages(h, "task_review")[0]?.text ?? "", /is ready for review \(run 1\)/);
+	assert.equal(messages(h, "task_final").length, 0);
+	assert.equal(reusable(h, runs[0]?.conversation_id), 0, "Pi was aborted: the next run starts a fresh conversation");
+	assert.equal(slotCount(h), 0);
+});
+
+test("cap refusal that cut off a successor the model was working on is a limit failure", async (t) => {
+	const h = await harness(t);
+	h.fake.control.script = cappedScript((run, steerId) => ({
+		answer: "Own answer.",
+		answered: [run.start.input.requestId],
+		delivered: [steerId],
+	}));
+	const taskId = submitTask(h, "alpha", "answer, then a successor cut by the cap");
+	const { followupId } = await steerThenCapRefusal(h, taskId);
+	const task = taskRow(h, taskId);
+	assert.deepEqual([task.state, task.reason], ["failed", "request limit reached (30 per run)"]);
+	assert.deepEqual(followupRow(h, followupId), { state: "delivered", reason: null });
+	assert.equal(runsOf(h, taskId)[0]?.state, "failed");
+	assert.equal(messages(h, "task_final").length, 1);
+});
+
+test("cap refusal with no runner report within the stop grace is a limit failure", async (t) => {
+	const h = await harness(t);
+	h.fake.control.script = async (run) => {
+		run.emit({ type: "ready" });
+		run.emit({ type: "tool", id: 1, name: "write", args: { path: "wip.txt", content: "work in progress\n" } });
+		await run.next("tool_result");
+		await run.next("abort");
+		// Never reports `finished` and never exits: the stop grace decides, then finalize kills it.
+	};
+	const taskId = submitTask(h, "alpha", "silent after the cap");
+	h.engine.kick();
+	await waitFor(() => h.fake.runs[0]?.received.some((m) => m.type === "tool_result"), { what: "tool result" });
+	const runId = runsOf(h, taskId)[0]?.id as number;
+	h.engine.onRunLimit(runId, "request_cap");
+	assert.deepEqual(
+		[runsOf(h, taskId)[0]?.state, runsOf(h, taskId)[0]?.reason, taskRow(h, taskId).state],
+		["finalizing", null, "running"],
+		"revoked at once; decided only once the runner reports, or after the grace",
+	);
+	await waitFor(() => taskRow(h, taskId).state === "failed", { what: "limit failure after the grace" });
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).reason, "request limit reached (30 per run)");
+	assert.deepEqual(
+		[runsOf(h, taskId)[0]?.state, runsOf(h, taskId)[0]?.reason],
+		["failed", "request limit reached (30 per run)"],
+	);
+	assert.match(messages(h, "task_final")[0]?.text ?? "", /failed: request limit reached \(30 per run\)/);
+});
+
 test("cancel a running task: key closed before abort, steer expired once, final checkpoint pushed, archived", async (t) => {
 	const h = await harness(t);
 	h.fake.control.script = holdScript();
@@ -953,7 +1123,14 @@ test("a steer during a run is delivered once and reported", async (t) => {
 		const message = (await run.next("steer")) as Extract<ToRunner, { type: "steer" }>;
 		run.emit({ type: "steer_status", requestId: message.requestId, status: "submitted" });
 		run.emit({ type: "steer_status", requestId: message.requestId, status: "delivered" });
-		run.emit({ type: "finished", outcome: "answered", answer: "ok", delivered: [message.requestId], unconsumed: [] });
+		run.emit({
+			type: "finished",
+			outcome: "answered",
+			answer: "ok",
+			delivered: [message.requestId],
+			unconsumed: [],
+			answered: [],
+		});
 		run.exit(0);
 	};
 	const taskId = submitTask(h, "alpha", "task with steer");
@@ -993,7 +1170,7 @@ test("tool calls get the second-layer policy, run only in the run's sandbox, and
 			const result = (await run.next("tool_result")) as Extract<ToRunner, { type: "tool_result" }>;
 			results.push(result.result);
 		}
-		run.emit({ type: "finished", outcome: "answered", answer: "ok", delivered: [], unconsumed: [] });
+		run.emit({ type: "finished", outcome: "answered", answer: "ok", delivered: [], unconsumed: [], answered: [] });
 		run.exit(0);
 	};
 	const taskId = submitTask(h, "alpha", "tools");

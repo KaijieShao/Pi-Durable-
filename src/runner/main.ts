@@ -79,7 +79,7 @@ async function begin(raw: unknown): Promise<void> {
 	const start = parseStart(raw);
 	if (typeof start === "string") {
 		note("runner_invalid_start");
-		await io.send({ type: "finished", outcome: "failed", reason: start, delivered: [], unconsumed: [] });
+		await io.send({ type: "finished", outcome: "failed", reason: start, delivered: [], unconsumed: [], answered: [] });
 		exit(1);
 		return;
 	}
@@ -106,6 +106,9 @@ function dispatch(run: RunController, message: ToRunner): void {
 			return;
 		case "abort":
 			void run.abort(typeof message.reason === "string" ? message.reason : "aborted");
+			return;
+		case "cap_reached":
+			run.capReached();
 			return;
 		default:
 			note("runner_unknown_message");

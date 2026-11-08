@@ -103,7 +103,15 @@ export type FinishedMessage = Extract<FromRunner, { type: "finished" }>;
 
 /** How a run ends. The first decision wins; an abnormal one revokes the run before anything else happens. */
 export type Decision =
-	| { readonly kind: "normal"; readonly finished: FinishedMessage }
+	| {
+			readonly kind: "normal";
+			readonly finished: FinishedMessage;
+			/**
+			 * The next run of the task may reuse the conversation (once stop and cleanup are verified). False when the
+			 * request cap cut off a successor run Pi had started (Pi was aborted): the conversation holds unanswered input.
+			 */
+			readonly reusable: boolean;
+	  }
 	| {
 			readonly kind: "cancelled" | "failed";
 			/** Shown to the user ("Task 12 failed: <reason>"). */
@@ -135,6 +143,14 @@ export type ActiveRun = {
 	deadline: NodeJS.Timeout | undefined;
 	exited: boolean;
 	finished: FinishedMessage | undefined;
+	/** The relay admitted the run's last allowed model request: no steer can reach the model any more. */
+	capReached: boolean;
+	/**
+	 * The relay refused a request over the cap. The run is revoked (key closed, Pi aborted) and decided once the runner
+	 * reports what the cap cut (`finished`), or as a limit failure when `capTimer` fires first.
+	 */
+	capRefused: boolean;
+	capTimer: NodeJS.Timeout | undefined;
 };
 
 export type EngineOptions = {

@@ -42,6 +42,10 @@ after(async () => {
 });
 
 type Run = {
+	/** requestId of the run's own input. */
+	readonly requestId: string;
+	/** Path of the run's conversation file. */
+	readonly conversation: string;
 	readonly handle: RunnerHandle;
 	readonly messages: FromRunner[];
 	readonly tools: ToolMessage[];
@@ -102,6 +106,8 @@ async function launch(options: {
 		}
 	});
 	const created: Run = {
+		requestId: start.input.requestId,
+		conversation,
 		handle,
 		messages,
 		tools,
@@ -156,6 +162,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 		}),
 	]);
 }
+
+/** A one-shot latch the test opens to release a held fake model request. */
+function latch(): { readonly opened: Promise<void>; open(): void } {
+	let open: () => void = () => {};
+	const opened = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { opened, open: () => open() };
+}
+
+const statusOf = (requestId: string, status: string) => (message: FromRunner) =>
+	message.type === "steer_status" && message.requestId === requestId && message.status === status;
 
 function statuses(run: Run, requestId: string): string[] {
 	return run.messages.flatMap((message) =>
@@ -240,6 +258,134 @@ describe("Pi runner process", { timeout: 120_000 }, () => {
 		assert.deepEqual(finished.delivered, ["s2"]);
 		assert.equal(fake.requests.length, 2);
 		assert.match(JSON.stringify(fake.requests[1]?.body.input), /First answer\./);
+	});
+
+	it("cap_reached withdraws a steer queued in Pi's inbox and refuses new ones: no successor run starts", async () => {
+		const queuedText = "CAP-QUEUED: one more thing";
+		const answer = latch();
+		script(async ({ index }) => {
+			if (index > 0) return { text: "A successor run must not start." };
+			await answer.opened;
+			return { text: "Only answer." };
+		});
+		const run = await launch({ input: "answer once" });
+		await fake.waitForRequests(1);
+		// The run's answer (its last allowed request) is in flight: the follow-up waits in Pi's inbox as a steer.
+		run.handle.send({ type: "steer", requestId: "cap-queued", content: queuedText });
+		await run.waitFor(statusOf("cap-queued", "submitted"), "steer submitted");
+		run.handle.send({ type: "cap_reached" });
+		await run.waitFor(statusOf("cap-queued", "withdrawn"), "queued steer withdrawn");
+		run.handle.send({ type: "steer", requestId: "cap-late", content: "CAP-LATE: and this" });
+		await run.waitFor(statusOf("cap-late", "withdrawn"), "late steer refused");
+		answer.open();
+
+		const { finished, exit } = await settle(run);
+		assert.equal(finished.outcome, "answered", "a withdrawn steer is not a failure of the run");
+		assert.equal(finished.answer, "Only answer.");
+		assert.deepEqual(finished.answered, [run.requestId]);
+		assert.deepEqual(finished.delivered, []);
+		assert.deepEqual(finished.unconsumed, ["cap-queued"]);
+		assert.deepEqual(statuses(run, "cap-queued"), ["submitted", "withdrawn"]);
+		assert.deepEqual(statuses(run, "cap-late"), ["withdrawn"]);
+		assert.equal(exit.code, 0);
+		await sleep(200);
+		assert.equal(fake.requests.length, 1, "Pi started no successor run with the withdrawn steer");
+
+		// The conversation is quiet and reusable: the next run opens it, and the withdrawn steer is not in its history.
+		script(() => ({ text: "Next run answered." }));
+		const next = await launch({ input: "next run", conversation: run.conversation, fresh: false });
+		const reused = await settle(next);
+		assert.equal(reused.finished.outcome, "answered");
+		assert.equal(fake.requests.length, 1);
+		const history = JSON.stringify(fake.requests[0]?.body.input);
+		assert.match(history, /answer once/);
+		assert.match(history, /Only answer\./);
+		assert.doesNotMatch(history, /CAP-QUEUED|CAP-LATE/);
+	});
+
+	it("reports a steer delivered only after the model answered a request carrying it, not when it is placed", async () => {
+		const steerText = "SEEN-STEER: also add b.txt";
+		const respond = latch();
+		script(async ({ index, userTexts }) => {
+			if (index === 0) return { toolCalls: [{ name: "write", args: { path: "a.txt", content: "a" } }] };
+			if (index === 1) {
+				assert.ok(userTexts.includes(steerText), "the steer is placed into the next request");
+				await respond.opened;
+				return { toolCalls: [{ name: "write", args: { path: "b.txt", content: "b" } }] };
+			}
+			return { status: 400, body: JSON.stringify({ error: { message: "upstream rejected the request" } }) };
+		});
+		const run = await launch({
+			input: "write a.txt",
+			onTool: async (message, self) => {
+				if (message.args.path !== "a.txt") return undefined;
+				self.handle.send({ type: "steer", requestId: "seen", content: steerText });
+				await self.waitFor(statusOf("seen", "submitted"), "steer submitted");
+				return undefined;
+			},
+		});
+		// Placed and sent to the model, which has not answered yet: not delivered.
+		await fake.waitForRequests(2);
+		await sleep(500);
+		assert.deepEqual(statuses(run, "seen"), ["submitted"]);
+		respond.open();
+		await run.waitFor(statusOf("seen", "delivered"), "delivered once the model answered");
+
+		// The run then fails (the next request is refused): the steer the model worked on stays delivered.
+		const { finished } = await settle(run);
+		assert.equal(finished.outcome, "failed");
+		assert.deepEqual(finished.delivered, ["seen"]);
+		assert.deepEqual(finished.unconsumed, []);
+		assert.deepEqual(finished.answered, []);
+		assert.deepEqual(statuses(run, "seen"), ["submitted", "delivered"]);
+		assert.equal(fake.requests.length, 3);
+	});
+
+	it("a steer placed but never answered by the model is reported unconsumed, not delivered", async () => {
+		const steerText = "UNSEEN-STEER: this request is refused";
+		script(({ index }) =>
+			index === 0
+				? { toolCalls: [{ name: "write", args: { path: "a.txt", content: "a" } }] }
+				: { status: 400, body: JSON.stringify({ error: { message: "upstream rejected the request" } }) },
+		);
+		const run = await launch({
+			input: "write a.txt",
+			onTool: async (_message, self) => {
+				self.handle.send({ type: "steer", requestId: "unseen", content: steerText });
+				await self.waitFor(statusOf("unseen", "submitted"), "steer submitted");
+				return undefined;
+			},
+		});
+		const { finished } = await settle(run);
+		assert.equal(finished.outcome, "failed");
+		assert.equal(fake.requests.length, 2);
+		assert.ok(JSON.stringify(fake.requests[1]?.body.input).includes(steerText), "Pi placed it into the request");
+		assert.deepEqual(finished.delivered, []);
+		assert.deepEqual(finished.unconsumed, ["unseen"]);
+		assert.deepEqual(statuses(run, "unseen"), ["submitted"]);
+	});
+
+	it("a successor Pi starts after the answer and whose first request is refused: answered names the run's input", async () => {
+		const answer = latch();
+		script(async ({ index }) => {
+			if (index > 0) return { status: 400, body: JSON.stringify({ error: { message: "request limit reached" } }) };
+			await answer.opened;
+			return { text: "First answer." };
+		});
+		const run = await launch({ input: "answer, then a successor" });
+		await fake.waitForRequests(1);
+		run.handle.send({ type: "steer", requestId: "refused", content: "REFUSED-SUCCESSOR: more" });
+		await run.waitFor(statusOf("refused", "submitted"), "steer submitted");
+		answer.open();
+		const { finished } = await settle(run);
+		// Pi answered the run's input, then the queued steer started a successor whose only request was refused.
+		assert.equal(fake.requests.length, 2);
+		assert.equal(finished.outcome, "failed");
+		assert.equal(finished.answer, "First answer.");
+		assert.deepEqual(finished.answered, [run.requestId]);
+		assert.deepEqual(finished.delivered, []);
+		assert.deepEqual(finished.unconsumed, ["refused"]);
+		assert.deepEqual(statuses(run, "refused"), ["submitted"]);
 	});
 
 	it("submits follow-ups accepted before the process started as steers", async () => {

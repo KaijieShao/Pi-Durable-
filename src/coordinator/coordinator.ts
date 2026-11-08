@@ -187,6 +187,7 @@ function startRelayFor(setup: Setup, store: Store, engine: Engine) {
 		codexGateway: config.model.codexGateway,
 		projectTokenCeiling: config.model.projectTokenCeiling,
 		onRunLimit: (runId, reason) => engine.onRunLimit(runId, reason),
+		onCapReached: (runId) => engine.onCapReached(runId),
 		log,
 		port: config.relay.port,
 		...fetchOption(deps),

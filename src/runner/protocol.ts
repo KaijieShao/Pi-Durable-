@@ -55,6 +55,12 @@ export type ToRunner =
 	| { readonly type: "steer"; readonly requestId: string; readonly content: string }
 	/** Answer to a `tool` request. */
 	| { readonly type: "tool_result"; readonly id: number; readonly result: ToolResult }
+	/**
+	 * The relay admitted the run's last allowed model request (Agent Execution § Limits; Finalize and Pending Inputs
+	 * "if the cap is already reached, it expires"): a steer could only reach the model in a request the cap refuses.
+	 * Withdraw every steer still queued in Pi's inbox and refuse new ones, so Pi starts no successor run.
+	 */
+	| { readonly type: "cap_reached" }
 	/** Cancel or a limit: abort Pi, let the in-flight tool round settle, then exit. */
 	| { readonly type: "abort"; readonly reason: string };
 
@@ -63,10 +69,15 @@ export type SteerStatus =
 	| "submitted"
 	/** Arrived when the run was answering: submitted as the input of one successor run (same requestId). */
 	| "successor"
-	/** Placed into the conversation (consumed by the run or its successor). */
+	/**
+	 * The model received it: Pi placed it into the conversation (in the running run or a successor) and a model
+	 * response to a request that carried it was committed. A steer placed but never answered is not delivered.
+	 */
 	| "delivered"
 	/** Not accepted (e.g. the process is shutting down); the Coordinator expires it. */
-	| "rejected";
+	| "rejected"
+	/** Withdrawn from Pi's inbox, or refused, after `cap_reached`; the Coordinator expires it with the limit reason. */
+	| "withdrawn";
 
 export type RunnerOutcome =
 	/** Pi answered every input and is idle: normal completion (quiescence confirmed). */
@@ -96,10 +107,12 @@ export type FromRunner =
 			readonly reason?: string;
 			/** The final answer text, truncated (the agent's claim, not "passed"). */
 			readonly answer?: string;
-			/** requestIds of steers that were placed into the conversation. */
+			/** requestIds of steers the model received (see SteerStatus "delivered"). */
 			readonly delivered: readonly string[];
-			/** requestIds of steers still unconsumed when Pi went idle or was aborted. */
+			/** requestIds of the other steers: never placed, withdrawn, or placed but never answered by the model. */
 			readonly unconsumed: readonly string[];
+			/** requestIds of the submissions (the run's input, steers, successor inputs) that Pi settled answered. */
+			readonly answered: readonly string[];
 	  }
 	| { readonly type: "error"; readonly message: string };
 
