@@ -169,6 +169,11 @@ export type EngineOptions = {
 	readonly onOutbox?: () => void;
 	/** Base delay between attempts of a GitHub change or a push (doubles per attempt). Tests shorten it. */
 	readonly retryDelayMs?: number;
+	/**
+	 * How often a task held because its branch changed on GitHub outside the Coordinator is looked at again
+	 * (engine/held.ts; default BRANCH_RECHECK_MS). Tests shorten it.
+	 */
+	readonly branchRecheckMs?: number;
 	/** Free bytes of the task disk; defaults to statfs. */
 	readonly freeBytes?: (path: string) => Promise<number>;
 	/** The watchdog: its link (the Coordinator's SQLite in production) and how long to wait for it. */
@@ -201,6 +206,12 @@ export type Ctx = {
 	readonly now: () => number;
 	readonly chatId: number;
 	readonly retryDelayMs: number;
+	/** See EngineOptions.branchRecheckMs. */
+	readonly branchRecheckMs: number;
+	/** Held tasks (branch-hold.ts): task id → when its branch is looked at again (engine/held.ts). */
+	readonly heldDue: Map<number, number>;
+	/** Held reviews whose branch was seen restored: their review step waits for a check slot (engine/held.ts). */
+	readonly heldRestored: Set<number>;
 	readonly freeBytes: (path: string) => Promise<number>;
 	readonly onOutbox: () => void;
 	readonly watchdog: WatchdogOptions;
@@ -229,6 +240,30 @@ export class UnknownEffect extends Error {
 		this.name = "UnknownEffect";
 	}
 }
+
+/**
+ * GitHub refused a push because the task branch changed outside the Coordinator: it is at `github`, which is neither
+ * the commit being pushed nor what the Coordinator believes it pushed last. A definite outcome (nothing was pushed),
+ * so it holds only this task (branch-hold.ts) instead of freezing the group. Also thrown when the branch moved right
+ * after a confirmed push (the review step looks again after updating the pull request).
+ */
+export class BranchMoved extends Error {
+	readonly branch: string;
+	/** GitHub's branch head (full sha). */
+	readonly github: string;
+	/** The commit the Coordinator was pushing or had just pushed (full sha). */
+	readonly local: string;
+	constructor(branch: string, github: string, local: string) {
+		super(`branch ${branch} changed on GitHub outside the Coordinator`);
+		this.name = "BranchMoved";
+		this.branch = branch;
+		this.github = github;
+		this.local = local;
+	}
+}
+
+/** Production interval of the held-task check (EngineOptions.branchRecheckMs). */
+export const BRANCH_RECHECK_MS = 30_000;
 
 export const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set(["merged", "failed", "cancelled"]);
 

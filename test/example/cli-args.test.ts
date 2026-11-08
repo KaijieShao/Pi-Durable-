@@ -271,6 +271,27 @@ test("owner status, unfreeze and failed-events read and change the Coordinator d
 		assert.match(status, /failed events: 1/);
 		assert.match(status, /Quarantined conversations: 1/);
 		assert.ok(!status.includes("secret"), "status shows no task or follow-up text");
+		assert.ok(!status.includes("Held tasks"), "no held task, no section");
+		// A task held because its branch changed on GitHub outside the Coordinator (src/coordinator/branch-hold.ts).
+		store.tx(() =>
+			store.setMeta(
+				"branch_hold:12",
+				JSON.stringify({
+					kind: "review",
+					runId: 1,
+					interrupted: false,
+					branch: "task/12",
+					local: "c0ffee00a1b2c3d4e5f60718293a4b5c6d7e8f90",
+					pushed: "5d6e7f80a1b2c3d4e5f60718293a4b5c6d7e8f90",
+					github: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+					since: 0,
+				}),
+			),
+		);
+		assert.match(
+			ownerStatus(store, GROUP),
+			/\nHeld tasks \(their branch changed on GitHub outside the Coordinator\):\n {2}#12 review: task\/12 on GitHub at 1a2b3c4; c0ffee0 waits in the worktree until the branch is back at 5d6e7f8\n/,
+		);
 
 		const events = ownerFailedEvents(store);
 		assert.match(

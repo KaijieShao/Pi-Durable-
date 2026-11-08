@@ -62,6 +62,8 @@ export type CoordinatorDeps = {
 	readonly pollTimeoutSeconds?: number;
 	/** Tests: base delay between GitHub/push retries (1 s in production). */
 	readonly retryDelayMs?: number;
+	/** Tests: how often a task held because its branch changed on GitHub is looked at again (30 s in production). */
+	readonly branchRecheckMs?: number;
 	/**
 	 * Called when the Coordinator can no longer do its job and must not keep running half-alive, e.g. the poller hit
 	 * a 401 from getUpdates (token revoked) or crashed: command intake has stopped. The CLI stops the Coordinator
@@ -333,6 +335,7 @@ async function boot(setup: Setup, parts: Parts, store: Store, now: () => number,
 		now,
 		onOutbox: () => outboxKick(),
 		...(deps.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs }),
+		...(deps.branchRecheckMs === undefined ? {} : { branchRecheckMs: deps.branchRecheckMs }),
 		watchdog: {
 			link: deps.watchdog?.link ?? createStoreWatchdogLink(store),
 			answerTimeoutMs: deps.watchdog?.answerTimeoutMs ?? WATCHDOG_ANSWER_TIMEOUT_MS,

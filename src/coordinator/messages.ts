@@ -228,8 +228,8 @@ export const PR_CLOSED_REASON = "pull request closed";
 /**
  * For a task in review (its review reminder, /status <task>) whose latest approval the merge step rejected because
  * GitHub's branch or pull request no longer matched, with no new head posted since: point back to that rejection
- * instead of the usual "reply for a follow-up, or /approve". Its steps are the only safe ones: a follow-up or /cancel
- * would push onto a commit pushed outside the Coordinator, be refused, and freeze the group. Else undefined.
+ * instead of the usual "reply for a follow-up, or /approve", since approving again works only after the branch or
+ * pull request is restored. Else undefined.
  */
 export function rejectedApprovalNote(
 	approval: { readonly head_commit: string; readonly state: string; readonly reason: string | null } | undefined,
@@ -269,21 +269,30 @@ function headsDiffer(p: ApprovalFacts): string {
 
 /**
  * GitHub's pull request head is not the approved head and the Coordinator did not push it: someone pushed to the task
- * branch on GitHub. The only ways on: restore the branch to the approved head, then /approve again or /cancel. A
- * follow-up run or /cancel before that would push without force onto the foreign commit; the push is refused and
- * the group freezes (engine/effects.ts pushBranch), so neither is offered.
+ * branch on GitHub. The way on: restore the branch to the approved head, then /approve again or /cancel. A follow-up
+ * run or /cancel before that is safe (a definite refusal of their push holds only this task: engine/effects.ts
+ * pushBranch, branch-hold.ts), but their work then waits in the worktree until the branch is restored. `combined`:
+ * the merge step had combined the task with a newer main when its push was refused (that commit stays local).
  */
-export function approvalBranchChanged(p: ApprovalFacts): string {
+export function approvalBranchChanged(p: ApprovalFacts & { combined?: string | undefined }): string {
+	const combined =
+		p.combined === undefined
+			? []
+			: [
+					`The combination with the latest main, ${sha7(p.combined)}, was not pushed; it stays in the task's ` +
+						"worktree, and the next approval, follow-up or /cancel builds on it.",
+				];
 	return [
 		rejectedHeadline(p.taskId),
 		`${headsDiffer(p)} The branch changed outside the Coordinator.`,
+		...combined,
 		`What to do: restore ${p.branch} on GitHub to ${sha7(p.approvedHead)}, for example from a clone after ` +
 			"git fetch origin:",
 		`git push --force origin ${p.approvedHead}:refs/heads/${p.branch}`,
 		"(this drops the commits pushed since; save them on another branch first if you need them). " +
 			`Then send /approve ${p.taskId} again to approve that head, or /cancel ${p.taskId} to drop the task.`,
-		`Until the branch is restored, do not reply with a follow-up or send /cancel ${p.taskId}: the Coordinator never ` +
-			"overwrites commits on GitHub, so its push would be refused and the group would freeze.",
+		"The Coordinator never overwrites commits on GitHub: a follow-up run or a /cancel before the branch is " +
+			"restored keeps its work in the task's worktree until then. The other tasks and the group carry on.",
 	].join("\n");
 }
 
@@ -335,6 +344,153 @@ export function approvalLocalMoved(p: Omit<ApprovalFacts, "githubHead"> & { loca
 		`What to do: this is not expected; the group owner should check /status ${p.taskId} and the Coordinator's ` +
 			"log before anyone approves it again.",
 	].join("\n");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A task held because its branch changed on GitHub outside the Coordinator (branch-hold.ts, engine/held.ts): GitHub
+// refused a push of the task branch, a definite outcome. Only that task waits; the group carries on.
+
+/** What the Coordinator knows about a held task's branch. */
+export type HoldFacts = {
+	readonly taskId: number;
+	readonly branch: string;
+	/** GitHub's branch head when the Coordinator last looked (full sha). */
+	readonly github: string;
+	/** The commit in the task's worktree that waits to be on GitHub (full sha). */
+	readonly local: string;
+	/** The commit the Coordinator last pushed to the branch (full sha); null: it never pushed the branch. */
+	readonly pushed: string | null;
+};
+
+function holdWhy(p: HoldFacts): string {
+	if (p.pushed === null) {
+		return (
+			`Why: branch ${p.branch} exists on GitHub (at ${sha7(p.github)}), but the Coordinator has not pushed it yet: ` +
+			"it was created outside the Coordinator. The Coordinator never overwrites commits on GitHub."
+		);
+	}
+	return (
+		`Why: branch ${p.branch} on GitHub is at ${sha7(p.github)}, but the Coordinator last pushed ` +
+		`${sha7(p.pushed)} there: the branch changed outside the Coordinator. The Coordinator never overwrites commits ` +
+		"on GitHub."
+	);
+}
+
+/** How to put the branch back where the Coordinator can push again without force. */
+function holdRestore(p: HoldFacts): string[] {
+	if (p.pushed === null) {
+		return [
+			`What to do: delete ${p.branch} on GitHub, for example from a clone:`,
+			`git push origin --delete ${p.branch}`,
+			"(save its commits on another branch first if you need them).",
+		];
+	}
+	return [
+		`What to do: restore ${p.branch} on GitHub to ${sha7(p.pushed)}, for example from a clone after git fetch origin:`,
+		`git push --force origin ${p.pushed}:refs/heads/${p.branch}`,
+		"(this drops the commits pushed since; save them on another branch first if you need them).",
+	];
+}
+
+function heldReviewLead(p: HoldFacts & { runNo: number; interrupted: boolean }): string {
+	const task = taskRef(p.taskId);
+	if (p.local === p.pushed) {
+		return p.interrupted
+			? `${task} was interrupted by restart (run ${p.runNo}); its work so far was pushed, but then its branch changed ` +
+					"on GitHub. Nothing was merged."
+			: `${task} finished run ${p.runNo} and its checkpoint was pushed, but then its branch changed on GitHub. ` +
+					"Nothing was merged.";
+	}
+	return p.interrupted
+		? `${task} was interrupted by restart (run ${p.runNo}), and GitHub refused the push of its work so far. Nothing ` +
+				"was merged."
+		: `${task} finished run ${p.runNo}, but GitHub refused the push of its checkpoint. Nothing was merged.`;
+}
+
+/**
+ * The review step of a run could not put its checkpoint on GitHub because the branch changed outside the Coordinator
+ * (its push was refused, or the branch moved right after it). The task waits in review with its worktree; once the
+ * branch is restored, the Coordinator pushes the checkpoint and posts it for review.
+ */
+export function reviewHeld(p: HoldFacts & { runNo: number; tests: string; interrupted: boolean }): string {
+	const head = sha7(p.local);
+	const pushedIt = p.local === p.pushed;
+	const kept = pushedIt
+		? `Kept: the task's worktree, at ${head} (tests: ${p.tests}).`
+		: `Kept: the run's work is committed in the task's worktree as ${head} (tests: ${p.tests}); it is not on GitHub yet.`;
+	const then = pushedIt
+		? `Once that is done, the Coordinator posts ${head} for review again`
+		: `Once that is done, the Coordinator pushes ${head} and posts it for review`;
+	return [
+		heldReviewLead(p),
+		holdWhy(p),
+		kept,
+		...holdRestore(p),
+		`${then}; approve it then with /approve ${p.taskId}. Or send /cancel ${p.taskId} to drop the task.`,
+		`Until then /approve ${p.taskId} is rejected. The other tasks and the group carry on.`,
+	].join("\n");
+}
+
+/**
+ * The final push of a cancelled or failed task was refused because its branch changed outside the Coordinator: its
+ * worktree is kept (the folder is deleted only after GitHub confirms the push) until the branch is restored.
+ * `lead`: "Task 12 cancelled." / "Task 12 failed: <reason>.".
+ */
+export function archiveHeld(p: HoldFacts & { lead: string; prClosed: boolean }): string {
+	const kept =
+		p.local === p.pushed
+			? `Kept: the worktree, at ${sha7(p.local)}.`
+			: `Kept: the task's work is committed in its worktree as ${sha7(p.local)}; it is not on GitHub yet.`;
+	return [
+		`${p.lead} Its worktree is kept: GitHub refused its final push.`,
+		holdWhy(p),
+		`${kept} Nothing was merged.${p.prClosed ? " Its pull request is closed." : ""}`,
+		...holdRestore(p),
+		`Once that is done, the Coordinator pushes ${sha7(p.local)} and archives the worktree; the branch is kept.`,
+	].join("\n");
+}
+
+function restoredWord(p: HoldFacts): string {
+	return p.pushed === null ? "deleted" : `restored to ${sha7(p.pushed)}`;
+}
+
+/** /approve of a task held in review (the reason of the rejection). */
+export function heldApproval(p: HoldFacts): string {
+	const task = taskRef(p.taskId);
+	const seen = `it was at ${sha7(p.github)} when the Coordinator last looked`;
+	if (p.local === p.pushed) {
+		return (
+			`branch ${p.branch} of ${task} changed on GitHub outside the Coordinator after ${sha7(p.local)} was pushed ` +
+			`(${seen}); once it is ${restoredWord(p)}, the bot posts ${sha7(p.local)} for review again; approve it then`
+		);
+	}
+	return (
+		`the latest checkpoint of ${task}, ${sha7(p.local)}, is not on GitHub yet: branch ${p.branch} changed on GitHub ` +
+		`outside the Coordinator (${seen}); once it is ${restoredWord(p)}, the bot pushes ${sha7(p.local)} and posts ` +
+		"it for review; approve it then"
+	);
+}
+
+/** For /status <task> and the review reminder of a held task: what it waits for. */
+export function holdNote(p: HoldFacts & { kind: "review" | "archive" }): string {
+	if (p.kind === "archive") {
+		return (
+			`Its worktree is kept until branch ${p.branch} on GitHub is ${restoredWord(p)}: the branch changed outside ` +
+			"the Coordinator and GitHub refused the final push. See the bot's message about it for what to do."
+		);
+	}
+	return (
+		`Its latest checkpoint ${sha7(p.local)} waits until branch ${p.branch} on GitHub is ${restoredWord(p)}: the ` +
+		"branch changed outside the Coordinator. See the bot's message about it for what to do."
+	);
+}
+
+/** A follow-up run admitted while its task is held in review: its result waits too. */
+export function heldFollowupNote(branch: string): string {
+	return (
+		`Branch ${branch} on GitHub still differs from what the Coordinator pushed, so this run's result is pushed ` +
+		"only once the branch is restored"
+	);
 }
 
 /**
@@ -496,6 +652,8 @@ export type StatusTaskLine = {
 	readonly note?: string | undefined;
 	readonly cancelling: boolean;
 	readonly prUrl: string | null;
+	/** Held: its branch changed on GitHub outside the Coordinator (branch-hold.ts). */
+	readonly held?: boolean | undefined;
 };
 
 export function describeState(state: TaskState): string {
@@ -507,6 +665,7 @@ function statusLine(t: StatusTaskLine): string {
 	if (t.position !== undefined && t.position > 0) parts.push(`queue position ${t.position}`);
 	if (t.note !== undefined) parts.push(lowerFirst(t.note));
 	if (t.cancelling) parts.push("cancelling");
+	if (t.held === true) parts.push("waiting for its branch on GitHub to be restored");
 	if (t.prUrl !== null) parts.push(t.prUrl);
 	return parts.join(" · ");
 }
@@ -552,6 +711,8 @@ export type StatusDetail = {
 	archived: boolean;
 	/** rejectedApprovalNote for a task in review whose last approval was rejected; replaces the usual next step. */
 	rejectedNote?: string | undefined;
+	/** holdNote for a task held because its branch changed on GitHub; replaces the usual next step. */
+	heldNote?: string | undefined;
 };
 
 export function statusDetail(p: StatusDetail): string {
@@ -563,7 +724,8 @@ export function statusDetail(p: StatusDetail): string {
 		...branchLines(p),
 		...runLines(p),
 	];
-	if (p.state === "review") {
+	if (p.heldNote !== undefined) lines.push(p.heldNote);
+	else if (p.state === "review") {
 		lines.push(p.rejectedNote ?? `Reply to a message of this task for a follow-up, or send /approve ${p.id}.`);
 	}
 	return fitText(lines.join("\n"));

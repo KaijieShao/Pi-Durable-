@@ -34,7 +34,9 @@ test outputs, the watchdog and the GitHub repository settings. Untrusted: model 
 - **Fail closed.** If Docker or the images are unavailable, or the Pi process isolation (systemd, the slice, the
   host setup), or the watchdog (no verified sweep, or no heartbeat for 15 s), no execution starts; commands are still
   saved and queued. If a stop or a GitHub outcome cannot be confirmed, by the Coordinator or by the watchdog, the group
-  freezes until the owner resolves it and unfreezes it with the owner CLI.
+  freezes until the owner resolves it and unfreezes it with the owner CLI. A push GitHub refuses because a task branch
+  was changed outside the Coordinator is a known outcome (nothing was pushed): the Coordinator never force-pushes, and
+  only that task waits, with its worktree kept, until the branch is restored.
 - **Logs are metadata only:** ids, counts, outcomes, denial categories and hashes; never message text, prompts, tool
   output, headers or secrets. Raw task and follow-up text is stored only in the Coordinator's SQLite database (mode
   600; 660 shared with the watchdog's group when `PI_STATE_GROUP` is set) and the Pi conversation stores under `PI_DATA_DIR` (mode 700 locally; under systemd isolation 0660 files in a

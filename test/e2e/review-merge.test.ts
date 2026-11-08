@@ -198,7 +198,8 @@ function onGitHubCall(github: FakeGitHub, hook: (call: FakeCall) => void): void 
 
 /**
  * The rejection posted when GitHub's pull request head (`onGitHub`) is not the approved head: which task, nothing
- * merged, why, and what works (restore the branch, then /approve or /cancel; not a follow-up or /cancel before).
+ * merged, why, and what works (restore the branch, then /approve or /cancel; a follow-up or /cancel before that keeps
+ * its work in the worktree, and the group carries on: test/e2e/branch-moved.test.ts).
  */
 function staleApprovalText(id: number, onGitHub: string, approvedHead: string): string {
 	return [
@@ -210,8 +211,8 @@ function staleApprovalText(id: number, onGitHub: string, approvedHead: string): 
 		`git push --force origin ${approvedHead}:refs/heads/task/${id}`,
 		"(this drops the commits pushed since; save them on another branch first if you need them). Then send " +
 			`/approve ${id} again to approve that head, or /cancel ${id} to drop the task.`,
-		`Until the branch is restored, do not reply with a follow-up or send /cancel ${id}: the Coordinator never ` +
-			"overwrites commits on GitHub, so its push would be refused and the group would freeze.",
+		"The Coordinator never overwrites commits on GitHub: a follow-up run or a /cancel before the branch is " +
+			"restored keeps its work in the task's worktree until then. The other tasks and the group carry on.",
 	].join("\n");
 }
 

@@ -49,6 +49,9 @@ With the bot's privacy mode on, address every command to the bot (`/task@smule_c
 - **Review and merge:** after each run the Coordinator runs the tests, commits a checkpoint, pushes the branch and
   opens or updates the task's pull request. Merges run one at a time; GitHub's "up to date" rule refuses a merge after
   `main` moved, and a moved `main` is combined, retested and approved again; a conflict starts a new admitted run.
+  The Coordinator never force-pushes: if someone changes a task branch on GitHub, the approval is rejected and GitHub
+  refuses the Coordinator's next push of it. That is a definite outcome, so only that task waits, its work kept in its
+  worktree, until the branch is restored; the group and the other tasks carry on.
 - **Recovery:** after a restart nothing in progress resumes. An interrupted run is marked failed, its work is pushed,
   its conversation is quarantined, and a later follow-up starts a fresh conversation. A run that had not reached Pi
   yet (no run key opened, no Pi process) is queued again in its place. Whenever the Coordinator cannot confirm a stop

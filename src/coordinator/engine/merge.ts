@@ -29,6 +29,7 @@ import {
 } from "../messages.ts";
 import { GitHubError, type MergeResult, type PullRequest } from "../ports.ts";
 import {
+	type BranchMoved,
 	type Ctx,
 	enqueueTask,
 	groupHeld,
@@ -41,7 +42,7 @@ import {
 	tx,
 	UnknownEffect,
 } from "./context.ts";
-import { archiveTask, effectFailed, ghRead, pushBranch } from "./effects.ts";
+import { archiveTask, effectFailed, ghRead, pushOrMoved } from "./effects.ts";
 import { runTests, testsText } from "./review.ts";
 
 const MAX_LOOPS = 3;
@@ -447,6 +448,32 @@ function conflictFound(
 	ctx.log.info("merge_conflict", { task: task.id, files: files.length });
 }
 
+/**
+ * The push of the combined result was refused: the task branch changed on GitHub outside the Coordinator after the
+ * merge step checked it. A definite outcome: the approval is rejected as for any changed branch, nothing merges, the
+ * combined commit stays in the worktree, and the group carries on.
+ */
+function combinePushRefused(
+	ctx: Ctx,
+	task: TaskRow,
+	p: { approval: ApprovalRow; intentId: number; moved: BranchMoved; combined: string },
+): void {
+	returnToReview(ctx, task, {
+		approvalId: p.approval.id,
+		intentId: p.intentId,
+		intentState: "failed",
+		reason: BRANCH_CHANGED_REASON,
+		kind: "merge_rejected",
+		text: approvalBranchChanged({
+			taskId: task.id,
+			branch: p.moved.branch,
+			approvedHead: p.approval.head_commit,
+			githubHead: p.moved.github,
+			combined: p.combined,
+		}),
+	});
+}
+
 /** Main moved: merge it into the task branch in the worktree (the check slot is held by the caller). */
 async function combineWithMain(ctx: Ctx, task: TaskRow, approval: ApprovalRow, intentId: number): Promise<void> {
 	const path = task.worktree_path as string;
@@ -454,7 +481,9 @@ async function combineWithMain(ctx: Ctx, task: TaskRow, approval: ApprovalRow, i
 	if (result.conflict) return conflictFound(ctx, task, approval, intentId, result.files);
 	const head = result.commit;
 	const tests = await runTests(ctx, task, path);
-	await pushBranch(ctx, task.branch as string, path, head);
+	const branch = task.branch as string;
+	const moved = await pushOrMoved(ctx, { branch, path, head, expected: task.head_commit });
+	if (moved !== undefined) return combinePushRefused(ctx, task, { approval, intentId, moved, combined: head });
 	const passedHead = tests.passed ? head : null;
 	tx(ctx, () => {
 		const now = ctx.now();

@@ -1647,30 +1647,420 @@ async function rejectedAfterForeignPush(h: Harness) {
 	const taskId = await runToReview(h);
 	approve(h, taskId);
 	const branch = `task/${taskId}`;
-	h.world.remote.set(branch, h.world.commitOn(taskRow(h, taskId).posted_head as string, "late.txt", "late\n"));
+	const posted = taskRow(h, taskId).posted_head as string;
+	const foreign = h.world.commitOn(posted, "late.txt", "late\n");
+	h.world.remote.set(branch, foreign);
 	h.engine.kick();
 	await h.engine.idle();
-	assert.match(messages(h, "merge_rejected")[0]?.text ?? "", /do not reply with a follow-up or send \/cancel/);
-	return { taskId, branch };
+	assert.match(
+		messages(h, "merge_rejected")[0]?.text ?? "",
+		/a follow-up run or a \/cancel before the branch is restored/,
+	);
+	return { taskId, branch, posted, foreign };
 }
 
-for (const [what, act] of [
-	["a follow-up run", (h: Harness, id: number) => void followupRun(h, id, "one more thing")],
-	["/cancel", (h: Harness, id: number) => requestCancel(h, id)],
-] as const) {
-	test(`stale approval: ${what} before the branch is restored freezes the group, as the rejection warns`, async (t) => {
-		const h = await harness(t);
-		const { taskId, branch } = await rejectedAfterForeignPush(h);
-		const foreign = h.world.remote.get(branch);
-		act(h, taskId);
-		h.engine.kick();
-		await h.engine.idle();
-		const group = h.store.groupState(CHAT);
-		assert.equal(group.state, "frozen");
-		assert.equal(group.reason, `GitHub rejected the push of ${branch} (the remote branch changed)`);
-		assert.equal(h.world.remote.get(branch), foreign, "the commit pushed outside is never overwritten");
-	});
+const HOLD_KEY = (taskId: number) => `branch_hold:${taskId}`;
+const holdOf = (h: Harness, taskId: number) => {
+	const raw = h.store.getMeta(HOLD_KEY(taskId));
+	return raw === undefined ? undefined : (JSON.parse(raw) as Record<string, unknown>);
+};
+
+/** The engine's clock moves past the held-task check interval (30 s in production), then the engine settles. */
+async function nextHeldLook(h: Harness, clock: { later: number }): Promise<void> {
+	clock.later += 31_000;
+	h.engine.kick();
+	await h.engine.idle();
 }
+
+test("branch changed outside the Coordinator, then a follow-up run: its checkpoint stays local, only the task is held (no freeze); restored → pushed, posted, approved, merged", async (t) => {
+	const clock = { later: 0 };
+	const h = await harness(t, { now: () => Date.now() + clock.later });
+	const { taskId, branch, posted, foreign } = await rejectedAfterForeignPush(h);
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n", "Added more.");
+	followupRun(h, taskId, "one more thing");
+	h.engine.kick();
+	await h.engine.idle();
+
+	// A definite refusal: the group carries on, the foreign commit is never overwritten, the run's work is kept.
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.remote.get(branch), foreign, "the commit pushed outside is never overwritten");
+	const task = taskRow(h, taskId);
+	const local = await h.world.git.head(task.worktree_path as string);
+	assert.notEqual(local, posted);
+	assert.ok(await h.world.git.isAncestor(posted, local), "the run's checkpoint builds on the posted head");
+	assert.equal(h.world.files(local).get("src/more.js"), "export const more = 2;\n");
+	assert.deepEqual(
+		[task.state, task.head_commit, task.posted_head, task.reason],
+		["review", posted, posted, null],
+		"in review; head_commit and posted_head stay at what GitHub got from the Coordinator",
+	);
+	const run2 = runsOf(h, taskId)[1] as RunRecord;
+	assert.deepEqual([run2.state, run2.review_done, run2.checkpoint_commit], ["finished", 0, null]);
+	assert.deepEqual(holdOf(h, taskId), {
+		kind: "review",
+		runId: run2.id,
+		interrupted: false,
+		branch,
+		local,
+		pushed: posted,
+		github: foreign,
+		since: holdOf(h, taskId)?.since,
+	});
+	const held = messages(h, "task_held");
+	assert.equal(held.length, 1);
+	assert.ok(held[0]?.text.startsWith(`Task ${taskId} finished run 2, but GitHub refused the push of its checkpoint.`));
+	assert.ok(held[0]?.text.includes(`git push --force origin ${posted}:refs/heads/${branch}`), held[0]?.text);
+	assert.equal(messages(h, "task_review").length, 1, "run 2 was not posted for review");
+	assert.equal(slotCount(h), 0, "the run's slot is released");
+
+	// Still changed at the next look: nothing is pushed and nothing is posted again.
+	await nextHeldLook(h, clock);
+	assert.equal(h.world.remote.get(branch), foreign);
+	assert.equal(messages(h, "task_held").length, 1);
+
+	// The branch is restored on GitHub: the next look pushes the kept checkpoint and posts it for review.
+	h.world.remote.set(branch, posted);
+	await nextHeldLook(h, clock);
+	const reviewed = taskRow(h, taskId);
+	assert.equal(h.world.remote.get(branch), local, "the kept checkpoint is pushed (a fast-forward)");
+	assert.deepEqual([reviewed.state, reviewed.head_commit, reviewed.posted_head], ["review", local, local]);
+	assert.equal(holdOf(h, taskId), undefined);
+	assert.equal(runsOf(h, taskId)[1]?.review_done, 1);
+	assert.match(
+		messages(h, "task_review").at(-1)?.text ?? "",
+		new RegExp(`^Task ${taskId} is ready for review \\(run 2\\)`),
+	);
+	approve(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, taskId).state, "merged");
+	assert.ok(await h.world.git.isAncestor(local, h.world.state.main));
+	assert.equal(h.world.files(h.world.state.main).get("late.txt"), undefined, "the commit pushed outside never merges");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("branch changed outside the Coordinator, then /cancel: cancelled, PR closed, worktree kept (no freeze); restored → archived", async (t) => {
+	const clock = { later: 0 };
+	const h = await harness(t, { now: () => Date.now() + clock.later });
+	const { taskId, branch, posted, foreign } = await rejectedAfterForeignPush(h);
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.remote.get(branch), foreign, "the commit pushed outside is never overwritten");
+	const task = taskRow(h, taskId);
+	assert.equal(task.state, "cancelled");
+	assert.ok(task.worktree_path !== null && existsSync(task.worktree_path), "the worktree is kept");
+	assert.equal(task.archived, 0);
+	assert.equal(h.world.pulls.get(task.pr_number as number)?.state, "closed");
+	assert.equal(holdOf(h, taskId)?.kind, "archive");
+	assert.equal(
+		messages(h, "task_held")[0]?.text.split("\n")[0],
+		`Task ${taskId} cancelled. Its worktree is kept: GitHub refused its final push.`,
+	);
+	assert.equal(messages(h, "task_final").length, 0, "the task is not reported archived yet");
+
+	await nextHeldLook(h, clock);
+	assert.ok(existsSync(task.worktree_path as string), "still kept while the branch is changed");
+
+	h.world.remote.set(branch, posted);
+	await nextHeldLook(h, clock);
+	const archived = taskRow(h, taskId);
+	assert.deepEqual([archived.state, archived.worktree_path, archived.archived], ["cancelled", null, 1]);
+	assert.ok(!existsSync(task.worktree_path as string));
+	assert.equal(h.world.remote.get(branch), posted, "the branch keeps the task's work");
+	assert.equal(
+		messages(h, "task_final")[0]?.text,
+		`Task ${taskId} cancelled. Pull request closed; branch ${branch} kept.`,
+	);
+	assert.equal(holdOf(h, taskId), undefined);
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("a running task cancelled after its branch changed outside: the final checkpoint is kept in the worktree, then pushed once restored", async (t) => {
+	const clock = { later: 0 };
+	const h = await harness(t, { now: () => Date.now() + clock.later });
+	const taskId = await runToReview(h);
+	const branch = `task/${taskId}`;
+	const posted = taskRow(h, taskId).posted_head as string;
+	h.fake.control.script = holdScript();
+	followupRun(h, taskId, "keep going");
+	h.engine.kick();
+	await waitFor(() => runsOf(h, taskId)[1]?.state === "running" && h.fake.runs[1]?.received.length === 1, {
+		what: "run 2 wrote wip.txt",
+	});
+	const foreign = h.world.commitOn(posted, "late.txt", "late\n");
+	h.world.remote.set(branch, foreign);
+	requestCancel(h, taskId);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.remote.get(branch), foreign);
+	const task = taskRow(h, taskId);
+	assert.equal(task.state, "cancelled");
+	const local = await h.world.git.head(task.worktree_path as string);
+	assert.equal(h.world.files(local).get("wip.txt"), "work in progress\n", "the final checkpoint holds the run's work");
+	assert.equal(holdOf(h, taskId)?.local, local);
+	h.world.remote.set(branch, posted);
+	await nextHeldLook(h, clock);
+	assert.equal(h.world.remote.get(branch), local, "the final checkpoint is on GitHub");
+	assert.equal(taskRow(h, taskId).worktree_path, null);
+});
+
+test("the branch moved right after the review step's push: held (no freeze) instead of posting a head GitHub lacks; restored → posted again", async (t) => {
+	const clock = { later: 0 };
+	const h = await harness(t, { now: () => Date.now() + clock.later });
+	let foreign: string | undefined;
+	const update = h.world.github.updatePullRequest.bind(h.world.github);
+	h.world.github.updatePullRequest = async (number, params) => {
+		const pr = await update(number, params);
+		if (foreign === undefined && taskRow(h, 1).state !== "review") {
+			foreign = h.world.commitOn(pr.headSha, "late.txt", "late\n");
+			h.world.remote.set(pr.headRef, foreign);
+		}
+		return pr;
+	};
+	const taskId = await runToReview(h);
+	const posted = taskRow(h, taskId).posted_head as string;
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h, taskId, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.ok(foreign !== undefined);
+	const branch = `task/${taskId}`;
+	const task = taskRow(h, taskId);
+	const pushed = await h.world.git.head(task.worktree_path as string);
+	assert.notEqual(pushed, posted);
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.remote.get(branch), foreign);
+	assert.deepEqual([task.state, task.head_commit, task.posted_head], ["review", pushed, posted]);
+	assert.equal(runsOf(h, taskId)[1]?.checkpoint_commit, pushed, "the pushed checkpoint is recorded");
+	assert.deepEqual([holdOf(h, taskId)?.local, holdOf(h, taskId)?.pushed], [pushed, pushed]);
+	assert.ok(
+		(messages(h, "task_held")[0]?.text ?? "").startsWith(
+			`Task ${taskId} finished run 2 and its checkpoint was pushed, but then its branch changed on GitHub.`,
+		),
+	);
+	h.world.remote.set(branch, pushed);
+	await nextHeldLook(h, clock);
+	assert.deepEqual([taskRow(h, taskId).posted_head, holdOf(h, taskId)], [pushed, undefined]);
+	assert.match(messages(h, "task_review").at(-1)?.text ?? "", /is ready for review \(run 2\)/);
+});
+
+test("the combined result's push is refused (branch changed after the merge step's check): approval rejected, combination kept, no freeze", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	const branch = `task/${taskId}`;
+	const posted = taskRow(h, taskId).posted_head as string;
+	approve(h, taskId);
+	h.world.advanceMain("CHANGELOG.md", "other work\n");
+	let foreign: string | undefined;
+	const mergeBase = h.world.git.mergeBase.bind(h.world.git);
+	h.world.git.mergeBase = async (path) => {
+		const result = await mergeBase(path);
+		foreign ??= h.world.commitOn(posted, "late.txt", "late\n");
+		h.world.remote.set(branch, foreign);
+		return result;
+	};
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(h.world.remote.get(branch), foreign);
+	const task = taskRow(h, taskId);
+	assert.deepEqual([task.state, task.head_commit, task.posted_head], ["review", posted, posted]);
+	const combined = await h.world.git.head(task.worktree_path as string);
+	assert.ok((await h.world.git.isAncestor(posted, combined)) && combined !== posted);
+	const text = messages(h, "merge_rejected")[0]?.text ?? "";
+	assert.ok(text.startsWith(`Approval of Task ${taskId} rejected; nothing was merged.\n`), text);
+	assert.ok(text.includes(`The combination with the latest main, ${combined.slice(0, 7)}, was not pushed`), text);
+	assert.equal(
+		h.store.get<{ reason: string }>("SELECT reason FROM approvals ORDER BY id DESC LIMIT 1")?.reason,
+		"branch changed after approval",
+	);
+	assert.equal(count(h.world.calls, "mergePullRequest"), 0);
+});
+
+test("a push GitHub refuses whose outcome cannot be read back still freezes the group (uncertain, not definite)", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	const branch = `task/${taskId}`;
+	const posted = taskRow(h, taskId).posted_head as string;
+	h.world.remote.set(branch, h.world.commitOn(posted, "late.txt", "late\n"));
+	const read = h.world.git.remoteBranchSha.bind(h.world.git);
+	let down = false;
+	h.world.git.remoteBranchSha = async (name) => {
+		if (down) throw new GitError("timeout", "network down");
+		return read(name);
+	};
+	const push = h.world.git.push.bind(h.world.git);
+	h.world.git.push = async (path, name) => {
+		down = true;
+		return push(path, name);
+	};
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h, taskId, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	const group = h.store.groupState(CHAT);
+	assert.equal(group.state, "frozen");
+	assert.equal(group.reason, `the push of ${branch} could not be confirmed`);
+	assert.equal(holdOf(h, taskId), undefined, "not held: the outcome is not known");
+});
+
+test("a push GitHub refuses although its branch is where the Coordinator left it freezes the group (refused for an unknown reason)", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	let pushes = 0;
+	h.world.git.push = async () => {
+		pushes++;
+		throw new GitError("rejected", "push rejected: remote rejected (protected branch hook declined)");
+	};
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h, taskId, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	const group = h.store.groupState(CHAT);
+	assert.equal(group.state, "frozen");
+	assert.equal(group.reason, `GitHub refused the push of task/${taskId}`);
+	assert.equal(holdOf(h, taskId), undefined);
+	assert.equal(pushes, 3, "a failed call is retried with backoff (reading the branch first) before the freeze");
+});
+
+test("a push GitHub refuses once although its branch had not moved is tried again (after reading the branch): it lands, no freeze, no hold", async (t) => {
+	const h = await harness(t);
+	const taskId = await runToReview(h);
+	const push = h.world.git.push.bind(h.world.git);
+	let refusals = 0;
+	h.world.git.push = async (path, name) => {
+		if (refusals++ === 0) throw new GitError("rejected", "push rejected: remote rejected (try again)");
+		return push(path, name);
+	};
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h, taskId, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(holdOf(h, taskId), undefined);
+	const task = taskRow(h, taskId);
+	assert.equal(h.world.remote.get(`task/${taskId}`), task.posted_head);
+	assert.match(messages(h, "task_review").at(-1)?.text ?? "", /is ready for review \(run 2\)/);
+});
+
+test("looking at a held task's branch takes no execution slot: other work dispatches while GitHub answers slowly; once restored, the review step waits for a free slot", async (t) => {
+	const clock = { later: 0 };
+	const h = await harness(t, { now: () => Date.now() + clock.later, limits: { maxConcurrentRuns: 1 } });
+	const { taskId, branch, posted } = await rejectedAfterForeignPush(h);
+	h.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h, taskId, "one more thing");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(holdOf(h, taskId)?.kind, "review");
+
+	// GitHub answers slowly (up to git's 120 s network timeout in production) when the held branch is read.
+	let answer: () => void = () => {};
+	let looks = 0;
+	let answered = false;
+	const read = h.world.git.remoteBranchSha.bind(h.world.git);
+	h.world.git.remoteBranchSha = async (name) => {
+		if (name === branch && looks++ === 0) {
+			await new Promise<void>((resolve) => {
+				answer = resolve;
+			});
+			answered = true;
+		}
+		return read(name);
+	};
+	t.after(() => answer());
+	clock.later += 31_000;
+	h.engine.kick();
+	await waitFor(() => looks === 1, { what: "the look at the held branch" });
+	assert.equal(slotCount(h), 0, "the look holds no execution slot");
+	// Meanwhile another task gets the only slot and runs.
+	h.fake.control.script = holdScript();
+	const other = submitTask(h, "beta", "other work");
+	h.engine.kick();
+	await waitFor(() => runsOf(h, other)[0]?.state === "running", { what: "the other task runs" });
+
+	// Restored while the other run holds the only slot: the review step waits for it, then runs.
+	h.world.remote.set(branch, posted);
+	answer();
+	await waitFor(() => answered, { what: "GitHub's answer" });
+	await sleep(100);
+	assert.equal(h.world.remote.get(branch), posted, "nothing pushed while no slot is free");
+	assert.equal(slotCount(h), 1, "only the other run's slot");
+	assert.ok(holdOf(h, taskId) !== undefined);
+	h.fake.runs.at(-1)?.release();
+	await h.engine.idle();
+	assert.equal(holdOf(h, taskId), undefined);
+	assert.match(messages(h, "task_review").at(-1)?.text ?? "", /^Task \d+ is ready for review \(run 2\)/);
+	assert.equal(h.world.remote.get(branch), taskRow(h, taskId).posted_head);
+	assert.equal(taskRow(h, other).state, "review");
+	assert.equal(slotCount(h), 0);
+});
+
+test("a held review survives a restart: recovery redoes the refused push without posting it again; restored → posted", async (t) => {
+	const clock = { later: 0 };
+	const h1 = await harness(t, { now: () => Date.now() + clock.later });
+	const { taskId, branch, posted } = await rejectedAfterForeignPush(h1);
+	h1.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h1, taskId, "more");
+	h1.engine.kick();
+	await h1.engine.idle();
+	assert.equal(messages(h1, "task_held").length, 1);
+	await h1.engine.stop();
+
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, now: () => Date.now() + clock.later });
+	await h2.engine.recover();
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(h2.store.groupState(CHAT).state, "normal");
+	assert.equal(messages(h2, "task_held").length, 1, "the same refusal is not posted again");
+	assert.equal(taskRow(h2, taskId).state, "review");
+	h2.world.remote.set(branch, posted);
+	await nextHeldLook(h2, clock);
+	assert.equal(holdOf(h2, taskId), undefined);
+	assert.match(messages(h2, "task_review").at(-1)?.text ?? "", /is ready for review \(run 2\)/);
+	assert.equal(h2.world.remote.get(branch), taskRow(h2, taskId).posted_head);
+});
+
+test("a held review, then /cancel: the hold becomes an archive hold; it survives a restart (no second message, worktree kept); restored → run 2's checkpoint pushed, archived", async (t) => {
+	const clock = { later: 0 };
+	const h1 = await harness(t, { now: () => Date.now() + clock.later });
+	const { taskId, branch, posted, foreign } = await rejectedAfterForeignPush(h1);
+	h1.fake.control.script = workScript("src/more.js", "export const more = 2;\n");
+	followupRun(h1, taskId, "more");
+	h1.engine.kick();
+	await h1.engine.idle();
+	const local = holdOf(h1, taskId)?.local as string;
+	assert.equal(holdOf(h1, taskId)?.kind, "review");
+	requestCancel(h1, taskId);
+	h1.engine.kick();
+	await h1.engine.idle();
+	assert.deepEqual([holdOf(h1, taskId)?.kind, holdOf(h1, taskId)?.local], ["archive", local]);
+	assert.equal(messages(h1, "task_held").length, 2, "the review hold's message, then the archive hold's");
+	assert.equal(h1.world.remote.get(branch), foreign);
+	const path = taskRow(h1, taskId).worktree_path as string;
+	await h1.engine.stop();
+
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, now: () => Date.now() + clock.later });
+	await h2.engine.recover();
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(h2.store.groupState(CHAT).state, "normal");
+	assert.equal(messages(h2, "task_held").length, 2, "the same refusal is not posted again after the restart");
+	assert.ok(existsSync(path), "the worktree is still kept");
+	assert.equal(h2.world.remote.get(branch), foreign);
+	assert.equal(messages(h2, "task_final").length, 0);
+
+	h2.world.remote.set(branch, posted);
+	await nextHeldLook(h2, clock);
+	assert.equal(h2.world.remote.get(branch), local, "run 2's checkpoint reached GitHub before the folder went");
+	assert.equal(h2.world.files(local).get("src/more.js"), "export const more = 2;\n");
+	assert.ok(!existsSync(path));
+	assert.deepEqual([taskRow(h2, taskId).state, taskRow(h2, taskId).archived], ["cancelled", 1]);
+	assert.equal(holdOf(h2, taskId), undefined);
+	assert.equal(messages(h2, "task_final").length, 1);
+});
 
 /**
  * An earlier merge attempt combined the worktree with a newer main and pushed it, then was interrupted before it saved

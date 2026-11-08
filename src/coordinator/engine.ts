@@ -7,15 +7,18 @@
  * approvals) and kicks the engine, which then acts. Every engine write is one synchronous `store.tx()`; network,
  * git, container and IPC work happens outside transactions. A tick (on kick, every second, and after each piece of
  * work) runs, in order: frozen-group cancels, the post-unfreeze recheck, the watchdog's late answer, recovery jobs,
- * cancels, steers, review reminders, the merge worker, and dispatch. Recovery jobs, merges and dispatch wait for
- * this Coordinator's verified watchdog sweep and a fresh watchdog heartbeat (engine/watchdog.ts).
+ * cancels, steers, review reminders, the merge worker, the look at tasks held because their branch changed on GitHub
+ * (engine/held.ts), and dispatch. Recovery jobs, merges, held reviews and dispatch wait for this Coordinator's
+ * verified watchdog sweep and a fresh watchdog heartbeat (engine/watchdog.ts).
  */
 
 import type { Logger } from "../runtime/log.ts";
+import { readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import { processCancels } from "./engine/cancel.ts";
 import {
 	type ActiveRun,
+	BRANCH_RECHECK_MS,
 	type Ctx,
 	describeError,
 	type EngineOptions,
@@ -27,6 +30,7 @@ import {
 } from "./engine/context.ts";
 import { dispatchOnce } from "./engine/dispatch.ts";
 import { decide } from "./engine/finalize.ts";
+import { retryHeldTasks } from "./engine/held.ts";
 import { mergeTask, nextMergeTask } from "./engine/merge.ts";
 import { type RecoveryJob, reconcile, runRecoveryJob } from "./engine/recovery.ts";
 import {
@@ -39,7 +43,7 @@ import {
 	sendPendingSteers,
 } from "./engine/runs.ts";
 import { newWatchdogGate, pollWatchdog, watchdogReady } from "./engine/watchdog.ts";
-import { rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
+import { holdNote, rejectedApprovalNote, reviewReminder, taskRef } from "./messages.ts";
 import type { Availability, RunLauncher, Sandbox } from "./ports.ts";
 import { projectTokensSpent } from "./relay.ts";
 
@@ -353,7 +357,11 @@ function remind(ctx: Ctx, task: TaskRow): void {
 			task.id,
 		).changes;
 		if (changes === 0) return;
-		const rejectedNote = rejectedApprovalNote(ctx.store.latestApproval(task.id), task.posted_head);
+		const hold = readBranchHold(ctx.store, task.id);
+		const rejectedNote =
+			hold === undefined
+				? rejectedApprovalNote(ctx.store.latestApproval(task.id), task.posted_head)
+				: holdNote({ ...hold, taskId: task.id });
 		enqueueTask(ctx, task, "review_reminder", reviewReminder({ taskId: task.id, prUrl: task.pr_url, rejectedNote }));
 	});
 }
@@ -372,8 +380,14 @@ function tickOnce(ctx: Ctx, state: EngineState): boolean {
 	];
 	sendPendingSteers(ctx);
 	reminders(ctx, state);
-	// Merges first: a merge waiting for a check slot gets the next free one before new runs. Both need the watchdog.
-	if (dispatchOpen(ctx, state) && watchdogReady(ctx)) did.push(maybeMerge(ctx, state), dispatchAll(ctx, state));
+	// Merges first: a merge waiting for a check slot gets the next free one before new runs. Both need the watchdog;
+	// so does a held task's review step (its tests), while a held archive only pushes.
+	if (dispatchOpen(ctx, state)) {
+		const ready = watchdogReady(ctx);
+		if (ready) did.push(maybeMerge(ctx, state));
+		did.push(retryHeldTasks(ctx, ready));
+		if (ready) did.push(dispatchAll(ctx, state));
+	}
 	return did.some(Boolean);
 }
 
@@ -460,6 +474,9 @@ export function createEngine(options: EngineOptions): Engine {
 		now: options.now ?? options.store.now,
 		chatId: options.config.telegram.groupChatId,
 		retryDelayMs: options.retryDelayMs ?? 1000,
+		branchRecheckMs: options.branchRecheckMs ?? BRANCH_RECHECK_MS,
+		heldDue: new Map<number, number>(),
+		heldRestored: new Set<number>(),
 		freeBytes: options.freeBytes ?? defaultFreeBytes,
 		onOutbox: options.onOutbox ?? (() => {}),
 		watchdog: options.watchdog,

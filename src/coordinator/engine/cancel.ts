@@ -6,7 +6,8 @@
  *   running → the run is finalized as cancelled (revoke, abort, verify, final checkpoint, push, close PR, archive);
  *   queued with a worktree (a later run waiting) → the queued run is cancelled, then the archive procedure;
  *   review → close the PR and archive (the final checkpoint is a no-op: each run ended with one).
- * Merging tasks are not cancellable.
+ * Merging tasks are not cancellable. A final push GitHub refuses because the branch changed outside the Coordinator
+ * keeps the worktree: the task is cancelled, held until the branch is restored, then archived (engine/held.ts).
  */
 import { taskCancelled } from "../messages.ts";
 import {
@@ -98,8 +99,12 @@ async function cancelWithArchive(ctx: Ctx, taskId: number): Promise<void> {
 	});
 	if (!proceed) return;
 	try {
-		await archiveTask(ctx, taskId, (result) => terminalText(loadTask(ctx, taskId), "cancelled", "cancelled", result));
-		ctx.log.info("task_cancelled", { task: taskId, archived: true });
+		const done = await archiveTask(ctx, taskId, (result) =>
+			terminalText(loadTask(ctx, taskId), "cancelled", "cancelled", result),
+		);
+		// "held": the final push was refused because the branch changed outside the Coordinator; the worktree is kept
+		// and archived once the branch is restored (engine/held.ts).
+		ctx.log.info("task_cancelled", { task: taskId, archived: done === "archived" });
 	} catch (error) {
 		effectFailed(ctx, error, `archiving the cancelled ${taskRef(taskId)}`);
 		archivePending(ctx, taskId, "cancelled", "cancelled");

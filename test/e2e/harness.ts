@@ -373,6 +373,8 @@ export async function startStack(options: StackOptions = {}) {
 		pollTimeoutSeconds: 1,
 		// Test-only: 50 ms base delay between GitHub/push retries (1 s in production).
 		retryDelayMs: 50,
+		// Test-only: a task held because its branch changed on GitHub is looked at every second (30 s in production).
+		branchRecheckMs: 1000,
 		...optional("onFatal", options.onFatal),
 		...optional("watchdog", options.watchdogTimings),
 	};

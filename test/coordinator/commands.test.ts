@@ -842,3 +842,88 @@ describe("handleUpdate: /status and /help", () => {
 		assert.match(text, /\/status/);
 	});
 });
+
+describe("a task held because its branch changed on GitHub outside the Coordinator (branch-hold.ts)", () => {
+	const GITHUB = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+	const LOCAL = "c0ffee00a1b2c3d4e5f60718293a4b5c6d7e8f90";
+	/** What engine/review.ts holdReview leaves: the task in review at HEAD, run 2's checkpoint LOCAL not pushed. */
+	function hold(f: Fixture, id: number, kind: "review" | "archive" = "review"): void {
+		const value = { kind, runId: kind === "review" ? 1 : null, interrupted: false, branch: `task/${id}` };
+		f.store.setMeta(
+			`branch_hold:${id}`,
+			JSON.stringify({ ...value, local: LOCAL, pushed: HEAD, github: GITHUB, since: 0 }),
+		);
+	}
+
+	test("/approve is rejected with which branch, both heads and what happens next; nothing is approved", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		hold(f, id);
+		const sent = f.send(ANA, `/approve ${id}`);
+		assert.equal(
+			f.reply(sent.messageId),
+			`/approve rejected: the latest checkpoint of Task ${id}, c0ffee0, is not on GitHub yet: branch task/${id} ` +
+				"changed on GitHub outside the Coordinator (it was at 1a2b3c4 when the Coordinator last looked); once it is " +
+				"restored to a1b2c3d, the bot pushes c0ffee0 and posts it for review; approve it then.",
+		);
+		assert.equal(f.count("approvals"), 0);
+		assert.equal(f.task(id).state, "review");
+		// Once the engine dropped the hold (the checkpoint is on GitHub and posted), /approve works as usual.
+		f.store.run("DELETE FROM meta WHERE key = ?", `branch_hold:${id}`);
+		const again = f.send(ANA, `/approve ${id}`);
+		assert.match(f.reply(again.messageId), new RegExp(`^Approved Task ${id} at a1b2c3d;`));
+	});
+
+	test("a follow-up still starts another run, and says its result waits for the branch too", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		hold(f, id);
+		const sent = f.send(ANA, "also handle plus signs", { replyTo: f.post(id) });
+		assert.equal(
+			f.reply(sent.messageId),
+			`Follow-up started another run of Task ${id} on the same branch and pull request. Queue position 1. Branch ` +
+				`task/${id} on GitHub still differs from what the Coordinator pushed, so this run's result is pushed only ` +
+				"once the branch is restored.",
+		);
+		assert.equal(f.count("runs", "task_id = ? AND state = 'queued'", id), 1);
+	});
+
+	test("/status <task> says what the task waits for instead of the usual next step; /status marks it", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		hold(f, id);
+		const detail = f.reply(f.send(CAROL, `/status ${id}`).messageId);
+		assert.ok(
+			detail.endsWith(
+				`\nIts latest checkpoint c0ffee0 waits until branch task/${id} on GitHub is restored to a1b2c3d: the branch ` +
+					"changed outside the Coordinator. See the bot's message about it for what to do.",
+			),
+			detail,
+		);
+		assert.ok(!detail.includes("for a follow-up, or send /approve"), detail);
+		const group = f.reply(f.send(CAROL, "/status").messageId);
+		assert.ok(
+			group.includes(`Task ${id} · alpha · in review · waiting for its branch on GitHub to be restored · https://`),
+			group,
+		);
+	});
+
+	test("a cancelled task whose archive is held: /status says its worktree is kept until the branch is restored", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha");
+		f.toReview(id);
+		f.store.run("UPDATE tasks SET state = 'cancelled', reason = 'cancelled' WHERE id = ?", id);
+		hold(f, id, "archive");
+		const detail = f.reply(f.send(CAROL, `/status ${id}`).messageId);
+		assert.ok(
+			detail.endsWith(
+				`\nIts worktree is kept until branch task/${id} on GitHub is restored to a1b2c3d: the branch changed outside ` +
+					"the Coordinator and GitHub refused the final push. See the bot's message about it for what to do.",
+			),
+			detail,
+		);
+	});
+});

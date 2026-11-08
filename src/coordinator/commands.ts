@@ -20,6 +20,7 @@ import { dirname, resolve } from "node:path";
 import type { Update } from "grammy/types";
 import type { Logger } from "../runtime/log.ts";
 import { admitRun, agentQueuePosition, openTaskCount, waitingCapReason, waitingCounts } from "./admission.ts";
+import { type BranchHold, readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import type { Limits } from "./limits.ts";
 import {
@@ -35,7 +36,10 @@ import {
 	followupStarted,
 	followupSteered,
 	frozenNotice,
+	heldApproval,
+	heldFollowupNote,
 	helpText,
+	holdNote,
 	MERGE_CONFLICT_REASON,
 	mergeInProgress,
 	noPullRequest,
@@ -419,7 +423,7 @@ function runFollowup(store: Store, ctx: CommandContext, task: TaskRow, reply: Re
 	).lastInsertRowid;
 	store.run("UPDATE runs SET followup_id = ? WHERE id = ?", followupId, admitted.runId);
 	bumpFollowups(store, task.id, now);
-	const note = waitNote(store, ctx.limits, { chatId: task.chat_id, agent: task.agent_id, initial: false });
+	const note = followupNote(store, ctx.limits, task);
 	const hasPullRequest = task.pr_number !== null || task.pr_url !== null;
 	return {
 		kind: "followup",
@@ -429,6 +433,15 @@ function runFollowup(store: Store, ctx: CommandContext, task: TaskRow, reply: Re
 		reply: followupStarted({ taskId: task.id, position: admitted.position, hasPullRequest, note }),
 		kick: true,
 	};
+}
+
+/** The waiting note of a follow-up run, and, if its task is held in review, that its result waits for the branch. */
+function followupNote(store: Store, limits: Limits, task: TaskRow): string | undefined {
+	const wait = waitNote(store, limits, { chatId: task.chat_id, agent: task.agent_id, initial: false });
+	const hold = readBranchHold(store, task.id);
+	if (hold?.kind !== "review") return wait;
+	const held = heldFollowupNote(hold.branch);
+	return wait === undefined ? held : `${wait}. ${held}`;
 }
 
 function bumpFollowups(store: Store, taskId: number, now: number): void {
@@ -573,8 +586,8 @@ function onApprove(store: Store, ctx: CommandContext, cmd: CommandMessage): Resu
 }
 
 /**
- * Rule order: permission, frozen group, task state, no run admitted since the post, a pull request to merge, and
- * the branch head still equal to the head the bot posted.
+ * Rule order: permission, frozen group, task state, no run admitted since the post, the task not held because its
+ * branch changed on GitHub, a pull request to merge, and the branch head still equal to the head the bot posted.
  */
 function approveBlocker(store: Store, ctx: CommandContext, task: TaskRow, cmd: CommandMessage): Blocker | undefined {
 	if (!permitted(ctx.config, task, cmd.userId)) return ["permission", notPermitted("approve", task.id)];
@@ -583,14 +596,25 @@ function approveBlocker(store: Store, ctx: CommandContext, task: TaskRow, cmd: C
 	if (isTerminal(task.state)) return ["state", terminalForCommand(task.id, task.state)];
 	if (task.cancel_requested === 1) return ["cancelling", beingCancelled(task.id)];
 	if (task.state === "merging") return ["merging", `${taskRef(task.id)} is already approved and merging`];
+	return reviewBlocker(store, task);
+}
+
+/** The /approve rules that look at the task's review: its runs, a branch hold, its pull request and posted head. */
+function reviewBlocker(store: Store, task: TaskRow): Blocker | undefined {
 	const busy = busyRunKind(store, task.id);
 	if (busy !== undefined) {
 		return ["run_admitted", runAdmitted({ taskId: task.id, postedHead: task.posted_head, kind: busy })];
 	}
 	if (task.state !== "review") return ["state", notInReview(task.id, task.state)];
+	const hold = readBranchHold(store, task.id);
+	if (hold?.kind === "review") return ["branch_held", heldApproval(holdFacts(task.id, hold))];
 	if (task.pr_number === null) return ["no_pr", noPullRequest(task.id)];
 	if (task.posted_head === null || task.head_commit !== task.posted_head) return staleHeadBlocker(task);
 	return undefined;
+}
+
+function holdFacts(taskId: number, hold: BranchHold) {
+	return { taskId, branch: hold.branch, github: hold.github, local: hold.local, pushed: hold.pushed };
 }
 
 function staleHeadBlocker(task: TaskRow): Blocker {
@@ -673,7 +697,13 @@ function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
 		cancelling: task.cancel_requested === 1,
 		archived: task.archived === 1,
 		rejectedNote: rejectedApprovalNote(store.latestApproval(task.id), task.posted_head),
+		heldNote: heldNoteOf(store, task.id),
 	});
+}
+
+function heldNoteOf(store: Store, taskId: number): string | undefined {
+	const hold = readBranchHold(store, taskId);
+	return hold === undefined ? undefined : holdNote({ ...holdFacts(taskId, hold), kind: hold.kind });
 }
 
 function statusLineOf(store: Store, limits: Limits, task: TaskRow): StatusTaskLine {
@@ -686,6 +716,7 @@ function statusLineOf(store: Store, limits: Limits, task: TaskRow): StatusTaskLi
 		note: queue.note,
 		cancelling: task.cancel_requested === 1,
 		prUrl: task.pr_url,
+		held: readBranchHold(store, task.id) !== undefined,
 	};
 }
 

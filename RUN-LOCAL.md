@@ -219,9 +219,16 @@ from the bot quote the command or message they answer.
      commit you pushed). Then `/approve@smule_code_bot 3` again → "Task 3 merged into main (…)" (if `main` moved
      meanwhile: "Main moved; …" and a new approval), or `/cancel@smule_code_bot 3` → "Task 3 cancelled. Pull request
      closed; branch task/3 kept."
-   - Do not reply with a follow-up or send `/cancel` before the branch is restored: the Coordinator never overwrites a
-     commit on GitHub (it pushes without force), so its push is refused and the group freezes until the owner
-     resolves it and unfreezes the group with the owner CLI.
+   - A follow-up or `/cancel` before the branch is restored does not freeze the group: the Coordinator never
+     overwrites a commit on GitHub (it pushes without force), so GitHub refuses its push, a definite outcome, and only
+     task 3 waits; the other tasks keep running and merging. A follow-up run's result stays committed in task 3's
+     worktree and the bot says so ("Task 3 finished run 2, but GitHub refused the push of its checkpoint. Nothing was
+     merged.", with both heads and what to do); `/approve` is rejected until the branch is restored, then the bot
+     pushes that checkpoint and posts it for review ("Task 3 is ready for review (run 2)…") and you approve it. A
+     `/cancel` closes the pull request but keeps the worktree ("Task 3 cancelled. Its worktree is kept: GitHub
+     refused its final push."); once the branch is restored the bot pushes the final checkpoint and archives it
+     ("Task 3 cancelled. Pull request closed; branch task/3 kept."). The Coordinator looks at such a branch again
+     every 30 seconds; `/status@smule_code_bot 3` and `owner status` show what it waits for.
 
 ## Privacy mode
 
@@ -283,7 +290,9 @@ node src/cli/main.ts owner unfreeze --env-file .env.local        # frozen group 
 last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it.
 
 A group **freezes** when the Coordinator or the watchdog cannot confirm a stop, or the Coordinator the outcome of a
-GitHub change. Resolve the cause
+GitHub change (for example a push whose answer was lost while GitHub could not be read back). A push GitHub refuses
+because a task branch was changed outside the Coordinator is not unknown and does not freeze the group: only that task
+waits until the branch is restored (step 7 of the walkthrough; `owner status` lists such held tasks). Resolve the cause
 first (no leftover containers or Pi processes, see above; GitHub branch and pull request state as expected), then
 unfreeze. Unfreezing sets the group to normal with `recheck_required=1`: the Coordinator repeats its recovery checks,
 including a new watchdog sweep (`reason=recheck`), before it dispatches queued work again. Nothing that was cancelled

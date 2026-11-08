@@ -46,6 +46,13 @@
   `deploy/systemd/pi-durable-coordinator.service` (after the watchdog, `RequiresMountsFor=` the task disk) and a
   Docker drop-in for the task disk.
 
+- A task branch changed on GitHub outside the Coordinator no longer freezes the group. GitHub refusing the
+  Coordinator's push of it (a follow-up run's checkpoint, the combination with main, or the final push of `/cancel` or
+  a limit) is a definite outcome: only that task waits, its work kept committed in its worktree (a cancelled task keeps
+  its worktree too), `/approve` is rejected with both heads and what to do, and once the branch is restored the
+  Coordinator pushes without force and posts the kept head for review (or archives the cancelled task). `/status`,
+  the review reminder and `owner status` show held tasks. A push whose outcome stays unknown still freezes the group.
+
 - Honor `OPENAI_BASE_URL` for API-key-backed OpenAI-compatible Responses gateways, including after secret scrubbing.
   The Coordinator's relay forwards to it; `OPENAI_CODEX_GATEWAY=1` adapts requests for a Codex-backed gateway.
 

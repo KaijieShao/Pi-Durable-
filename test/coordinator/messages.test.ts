@@ -1,7 +1,9 @@
 /**
  * The approval-rejection texts (src/coordinator/messages.ts): each names the task, says that the approval was
  * rejected or set aside and that nothing merged, says why, and offers only what the system supports next
- * (Interfaces and Storage § Telegram: "Each rejection gives its reason"; Architecture § Review and merge).
+ * (Interfaces and Storage § Telegram: "Each rejection gives its reason"; Architecture § Review and merge). Also the
+ * texts of a task held because its branch changed on GitHub outside the Coordinator (a definite refusal of its push:
+ * which branch, both heads, nothing merged, what is kept and what to do; no freeze).
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -11,10 +13,15 @@ import {
 	approvalMergedElsewhere,
 	approvalPrClosed,
 	approvalUnfinishedCombine,
+	archiveHeld,
+	heldApproval,
+	heldFollowupNote,
+	holdNote,
 	mainMoved,
 	mergeConflict,
 	rejected,
 	rejectedApprovalNote,
+	reviewHeld,
 	reviewReminder,
 	runAdmitted,
 	staleHead,
@@ -23,6 +30,17 @@ import {
 const APPROVED = "5d6e7f80a1b2c3d4e5f60718293a4b5c6d7e8f90";
 const ON_GITHUB = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
 const FACTS = { taskId: 3, branch: "task/3", approvedHead: APPROVED, githubHead: ON_GITHUB };
+const COMBINED = "c0ffee00a1b2c3d4e5f60718293a4b5c6d7e8f90";
+/** A held task: GitHub's branch is at ON_GITHUB, the Coordinator last pushed APPROVED, the worktree has COMBINED. */
+const HELD = { taskId: 3, branch: "task/3", github: ON_GITHUB, local: COMBINED, pushed: APPROVED };
+const RESTORE = [
+	"What to do: restore task/3 on GitHub to 5d6e7f8, for example from a clone after git fetch origin:",
+	`git push --force origin ${APPROVED}:refs/heads/task/3`,
+	"(this drops the commits pushed since; save them on another branch first if you need them).",
+];
+const WHY_MOVED =
+	"Why: branch task/3 on GitHub is at 1a2b3c4, but the Coordinator last pushed 5d6e7f8 there: the branch changed " +
+	"outside the Coordinator. The Coordinator never overwrites commits on GitHub.";
 
 describe("merge step: the pull request head on GitHub is not the approved head", () => {
 	test("pushed outside the Coordinator: why (both heads, outside) and what to do (restore, then /approve or /cancel)", () => {
@@ -36,17 +54,29 @@ describe("merge step: the pull request head on GitHub is not the approved head",
 				`git push --force origin ${APPROVED}:refs/heads/task/3`,
 				"(this drops the commits pushed since; save them on another branch first if you need them). " +
 					"Then send /approve 3 again to approve that head, or /cancel 3 to drop the task.",
-				"Until the branch is restored, do not reply with a follow-up or send /cancel 3: the Coordinator never " +
-					"overwrites commits on GitHub, so its push would be refused and the group would freeze.",
+				"The Coordinator never overwrites commits on GitHub: a follow-up run or a /cancel before the branch is " +
+					"restored keeps its work in the task's worktree until then. The other tasks and the group carry on.",
 			].join("\n"),
 		);
 	});
 
-	test("the old, false advice is gone: nothing will ever post a head for a commit pushed outside the Coordinator", () => {
+	test("the old, false advice is gone: no freeze warning, and nothing posts a head for a commit pushed outside", () => {
 		const text = approvalBranchChanged(FACTS);
+		assert.doesNotMatch(text, /freeze/, "a refused push holds only this task; the group carries on");
+		assert.doesNotMatch(text, /do not reply with a follow-up/);
 		assert.doesNotMatch(text, /once the bot posts it/);
 		assert.doesNotMatch(text, /approve the new head/);
-		assert.doesNotMatch(text, /for a follow-up run/, "a follow-up would push onto the foreign commit and freeze");
+		assert.doesNotMatch(text, /for a follow-up run/, "a follow-up is not the way to merge the approved head");
+	});
+
+	test("the combined result's push was refused: the same steps, and the combination stays in the worktree", () => {
+		const text = approvalBranchChanged({ ...FACTS, combined: COMBINED });
+		assert.equal(
+			text.split("\n")[2],
+			"The combination with the latest main, c0ffee0, was not pushed; it stays in the task's worktree, and the " +
+				"next approval, follow-up or /cancel builds on it.",
+		);
+		assert.equal(text.replace(`${text.split("\n")[2]}\n`, ""), approvalBranchChanged(FACTS));
 	});
 
 	test("pushed by the Coordinator itself (an interrupted combine with main): a follow-up run or /cancel", () => {
@@ -229,5 +259,114 @@ describe("after a rejected approval: the review reminder points back to the reje
 		assert.equal(rejectedApprovalNote({ ...changed, state: "valid" }, APPROVED), undefined);
 		assert.equal(rejectedApprovalNote(changed, ON_GITHUB), undefined);
 		assert.equal(rejectedApprovalNote(changed, null), undefined);
+	});
+});
+
+describe("a task held because its branch changed on GitHub outside the Coordinator (no freeze)", () => {
+	test("a run's checkpoint push refused: which branch, both heads, nothing merged, the kept commit, what to do", () => {
+		assert.equal(
+			reviewHeld({ ...HELD, runNo: 2, tests: "passed", interrupted: false }),
+			[
+				"Task 3 finished run 2, but GitHub refused the push of its checkpoint. Nothing was merged.",
+				WHY_MOVED,
+				"Kept: the run's work is committed in the task's worktree as c0ffee0 (tests: passed); it is not on GitHub yet.",
+				...RESTORE,
+				"Once that is done, the Coordinator pushes c0ffee0 and posts it for review; approve it then with /approve 3. " +
+					"Or send /cancel 3 to drop the task.",
+				"Until then /approve 3 is rejected. The other tasks and the group carry on.",
+			].join("\n"),
+		);
+	});
+
+	test("an interrupted run's push refused, and a branch that moved right after the push", () => {
+		const interrupted = reviewHeld({ ...HELD, runNo: 2, tests: "failed (failed)", interrupted: true }).split("\n");
+		assert.equal(
+			interrupted[0],
+			"Task 3 was interrupted by restart (run 2), and GitHub refused the push of its work so far. Nothing was merged.",
+		);
+		assert.match(interrupted[2] ?? "", /as c0ffee0 \(tests: failed \(failed\)\); it is not on GitHub yet\.$/);
+		const after = reviewHeld({ ...HELD, local: APPROVED, runNo: 2, tests: "passed", interrupted: false }).split("\n");
+		assert.deepEqual(after.slice(0, 3), [
+			"Task 3 finished run 2 and its checkpoint was pushed, but then its branch changed on GitHub. Nothing was merged.",
+			WHY_MOVED,
+			"Kept: the task's worktree, at 5d6e7f8 (tests: passed).",
+		]);
+		assert.equal(
+			after[6],
+			"Once that is done, the Coordinator posts 5d6e7f8 for review again; approve it then with /approve 3. Or send " +
+				"/cancel 3 to drop the task.",
+		);
+		assert.match(
+			reviewHeld({ ...HELD, local: APPROVED, runNo: 2, tests: "passed", interrupted: true }),
+			/^Task 3 was interrupted by restart \(run 2\); its work so far was pushed, but then its branch changed on GitHub\./,
+		);
+	});
+
+	test("a branch the Coordinator never pushed was created outside it: delete it on GitHub", () => {
+		const lines = reviewHeld({ ...HELD, pushed: null, runNo: 1, tests: "passed", interrupted: false }).split("\n");
+		assert.deepEqual(lines.slice(1, 6), [
+			"Why: branch task/3 exists on GitHub (at 1a2b3c4), but the Coordinator has not pushed it yet: it was created " +
+				"outside the Coordinator. The Coordinator never overwrites commits on GitHub.",
+			"Kept: the run's work is committed in the task's worktree as c0ffee0 (tests: passed); it is not on GitHub yet.",
+			"What to do: delete task/3 on GitHub, for example from a clone:",
+			"git push origin --delete task/3",
+			"(save its commits on another branch first if you need them).",
+		]);
+	});
+
+	test("a cancelled or failed task's final push refused: the worktree is kept until the branch is restored", () => {
+		assert.equal(
+			archiveHeld({ ...HELD, lead: "Task 3 cancelled.", prClosed: true }),
+			[
+				"Task 3 cancelled. Its worktree is kept: GitHub refused its final push.",
+				WHY_MOVED,
+				"Kept: the task's work is committed in its worktree as c0ffee0; it is not on GitHub yet. Nothing was merged. " +
+					"Its pull request is closed.",
+				...RESTORE,
+				"Once that is done, the Coordinator pushes c0ffee0 and archives the worktree; the branch is kept.",
+			].join("\n"),
+		);
+		const failed = archiveHeld({ ...HELD, local: APPROVED, lead: "Task 3 failed: limit.", prClosed: false });
+		assert.deepEqual(failed.split("\n").slice(0, 3), [
+			"Task 3 failed: limit. Its worktree is kept: GitHub refused its final push.",
+			WHY_MOVED,
+			"Kept: the worktree, at 5d6e7f8. Nothing was merged.",
+		]);
+	});
+
+	test("/approve while held, /status and the reminder, and a follow-up admitted meanwhile", () => {
+		assert.equal(
+			rejected("/approve", heldApproval(HELD)),
+			"/approve rejected: the latest checkpoint of Task 3, c0ffee0, is not on GitHub yet: branch task/3 changed on " +
+				"GitHub outside the Coordinator (it was at 1a2b3c4 when the Coordinator last looked); once it is restored to " +
+				"5d6e7f8, the bot pushes c0ffee0 and posts it for review; approve it then.",
+		);
+		assert.equal(
+			rejected("/approve", heldApproval({ ...HELD, local: APPROVED })),
+			"/approve rejected: branch task/3 of Task 3 changed on GitHub outside the Coordinator after 5d6e7f8 was pushed " +
+				"(it was at 1a2b3c4 when the Coordinator last looked); once it is restored to 5d6e7f8, the bot posts 5d6e7f8 " +
+				"for review again; approve it then.",
+		);
+		assert.match(heldApproval({ ...HELD, pushed: null }), /; once it is deleted, the bot pushes c0ffee0/);
+		assert.equal(
+			holdNote({ ...HELD, kind: "review" }),
+			"Its latest checkpoint c0ffee0 waits until branch task/3 on GitHub is restored to 5d6e7f8: the branch changed " +
+				"outside the Coordinator. See the bot's message about it for what to do.",
+		);
+		assert.equal(
+			holdNote({ ...HELD, kind: "archive" }),
+			"Its worktree is kept until branch task/3 on GitHub is restored to 5d6e7f8: the branch changed outside the " +
+				"Coordinator and GitHub refused the final push. See the bot's message about it for what to do.",
+		);
+		assert.equal(
+			reviewReminder({ taskId: 3, prUrl: null, rejectedNote: holdNote({ ...HELD, kind: "review" }) }),
+			"Reminder: Task 3 is waiting for review. Its latest checkpoint c0ffee0 waits until branch task/3 on GitHub is " +
+				"restored to 5d6e7f8: the branch changed outside the Coordinator. See the bot's message about it for what to do.",
+		);
+		assert.equal(
+			heldFollowupNote("task/3"),
+			"Branch task/3 on GitHub still differs from what the Coordinator pushed, so this run's result is pushed only " +
+				"once the branch is restored",
+		);
 	});
 });

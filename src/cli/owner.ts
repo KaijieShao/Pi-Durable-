@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { readBranchHold } from "../coordinator/branch-hold.ts";
 import { DEMO_LIMITS } from "../coordinator/limits.ts";
 import { Store } from "../coordinator/store.ts";
 import { createStoreWatchdogLink, WATCHDOG_HEARTBEAT_MAX_AGE_MS } from "../coordinator/watchdog-link.ts";
@@ -89,8 +90,32 @@ export function ownerStatus(store: Store, chatId: number): string {
 		RECENT_TERMINAL,
 	);
 	if (recent.length > 0) lines.push(`Recent finished tasks (last ${RECENT_TERMINAL}):`, ...recent.map(taskLine));
-	lines.push(...housekeepingLines(store));
+	lines.push(...heldLines(store, chatId), ...housekeepingLines(store));
 	return lines.join("\n");
+}
+
+/**
+ * Tasks held because their branch changed on GitHub outside the Coordinator (src/coordinator/branch-hold.ts): which
+ * commit waits in the worktree and where GitHub's branch must be for the Coordinator to push it. Shown only if any.
+ */
+function heldLines(store: Store, chatId: number): string[] {
+	const ids = store.all<{ id: number }>(
+		`SELECT id FROM tasks WHERE chat_id = ? AND EXISTS (SELECT 1 FROM meta WHERE key = 'branch_hold:' || tasks.id)
+		 ORDER BY id`,
+		chatId,
+	);
+	const lines: string[] = [];
+	for (const { id } of ids) {
+		const hold = readBranchHold(store, id);
+		if (hold === undefined) continue;
+		const target = hold.pushed === null ? "deleted" : `back at ${hold.pushed.slice(0, 7)}`;
+		lines.push(
+			`  #${id} ${hold.kind}: ${hold.branch} on GitHub at ${hold.github.slice(0, 7)}; ${hold.local.slice(0, 7)} waits ` +
+				`in the worktree until the branch is ${target}`,
+		);
+	}
+	if (lines.length === 0) return [];
+	return ["Held tasks (their branch changed on GitHub outside the Coordinator):", ...lines];
 }
 
 function groupLine(store: Store, chatId: number): string {

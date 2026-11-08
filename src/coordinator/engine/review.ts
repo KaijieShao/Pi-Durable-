@@ -4,11 +4,18 @@
  * checkpoint, push the branch (compared with GitHub first), open the task's pull request once or update it, and
  * post the link, the test result, the head commit and the test files the task changed. The task is then in review
  * and its agent is free. Idempotent: recovery redoes it for runs whose review did not complete.
+ *
+ * If GitHub refuses the push because the task branch changed outside the Coordinator, or the branch moved right after
+ * the push, the outcome is definite: the checkpoint stays committed in the worktree, the task waits in review held
+ * (branch-hold.ts), the message says which branch, both heads and what to do, and the group carries on. The run's
+ * review stays not done; it is redone once the branch is restored (engine/held.ts, and recovery after a restart).
  */
 
-import { clip, listFiles, sha7 } from "../messages.ts";
+import type { BranchHold } from "../branch-hold.ts";
+import { clip, listFiles, reviewHeld, sha7 } from "../messages.ts";
 import type { CheckOutcome, PullRequest } from "../ports.ts";
 import {
+	BranchMoved,
 	type Ctx,
 	clipText,
 	describeError,
@@ -21,7 +28,7 @@ import {
 	taskRef,
 	tx,
 } from "./context.ts";
-import { ensurePullRequest, pushBranch } from "./effects.ts";
+import { clearHold, ensurePullRequest, lastPushed, pushOrMoved, saveHold } from "./effects.ts";
 
 const ANSWER_IN_MESSAGE = 1500;
 const TEST_FILE =
@@ -128,6 +135,19 @@ function hasQueuedRun(ctx: Ctx, taskId: number): boolean {
 	return (n ?? 0) > 0;
 }
 
+/**
+ * Earlier runs of the task whose review is still not done (held: their push was refused) are superseded: this run's
+ * checkpoint builds on theirs in the same worktree, so their review is never redone. Inside the transaction.
+ */
+function supersedeEarlierReviews(ctx: Ctx, taskId: number, runId: number): void {
+	ctx.store.run(
+		`UPDATE runs SET review_done = 1
+		 WHERE task_id = ? AND id < ? AND review_done = 0 AND state IN ('finished', 'failed')`,
+		taskId,
+		runId,
+	);
+}
+
 /** Record the review result and post it, in one transaction. */
 function recordReview(ctx: Ctx, runId: number, f: ReviewFacts): void {
 	const postedHead = f.pr === undefined ? null : f.head;
@@ -139,6 +159,9 @@ function recordReview(ctx: Ctx, runId: number, f: ReviewFacts): void {
 		const now = ctx.now();
 		const current = loadTask(ctx, f.taskId);
 		ctx.store.run("UPDATE runs SET checkpoint_commit = ?, review_done = 1 WHERE id = ?", f.head, runId);
+		supersedeEarlierReviews(ctx, f.taskId, runId);
+		// The checkpoint is on GitHub: a hold of the task (an earlier run's refused push) is over.
+		clearHold(ctx, f.taskId);
 		if (TERMINAL_TASK_STATES.has(current.state)) return;
 		// A follow-up admitted during the review step keeps the task queued (approval waits for that run).
 		const queued = hasQueuedRun(ctx, f.taskId);
@@ -162,9 +185,100 @@ function recordReview(ctx: Ctx, runId: number, f: ReviewFacts): void {
 	});
 }
 
+type Published = {
+	readonly pr: PullRequest | undefined;
+	/** The branch changed outside the Coordinator: the push was refused, or GitHub moved right after it. */
+	readonly moved: BranchMoved | undefined;
+	/** GitHub confirmed the push of the checkpoint. */
+	readonly pushed: boolean;
+};
+
+/**
+ * After the pull request step, GitHub's branch must still be at the pushed head (Interfaces § Coordinator to GitHub:
+ * read GitHub's state). If it moved meanwhile, the review is held instead of posting a head GitHub no longer has. An
+ * unreadable branch is left to the merge step, which reads GitHub's pull request again before any merge.
+ */
+async function movedSincePush(ctx: Ctx, branch: string, head: string): Promise<BranchMoved | undefined> {
+	const now = await ctx.git.remoteBranchSha(branch).catch(() => head);
+	if (now === undefined || now === head) return undefined;
+	ctx.log.warn("push_branch_moved_after", { branch });
+	return new BranchMoved(branch, now, head);
+}
+
+/** Push the checkpoint, then open or update the pull request (a branch with no commits beyond its base gets none). */
+async function publish(
+	ctx: Ctx,
+	task: TaskRow,
+	p: { branch: string; path: string; head: string; base: string; runNo: number; tests: TestResult; answer: string },
+): Promise<Published> {
+	const refused = await pushOrMoved(ctx, { branch: p.branch, path: p.path, head: p.head, expected: task.head_commit });
+	if (refused !== undefined) return { pr: undefined, moved: refused, pushed: false };
+	const pr =
+		p.head !== p.base
+			? await ensurePullRequest(ctx, task, {
+					title: pullRequestTitle(task),
+					body: pullRequestBody(task, { runNo: p.runNo, tests: p.tests, head: p.head, answer: p.answer }),
+				})
+			: undefined;
+	return { pr, moved: await movedSincePush(ctx, p.branch, p.head), pushed: true };
+}
+
+type HeldReview = {
+	readonly task: TaskRow;
+	readonly runNo: number;
+	readonly head: string;
+	readonly tests: TestResult;
+	readonly interrupted: boolean;
+	readonly published: Published & { readonly moved: BranchMoved };
+};
+
+/** The task waits in review (or queued, if a follow-up run was admitted meanwhile). Inside the transaction. */
+function setHeldTask(ctx: Ctx, current: TaskRow, runId: number, h: HeldReview, now: number): void {
+	const { pr, pushed: pushedNow } = h.published;
+	supersedeEarlierReviews(ctx, current.id, runId);
+	// A checkpoint GitHub confirmed before the branch moved is the run's checkpoint and the task's head.
+	if (pushedNow) ctx.store.run("UPDATE runs SET checkpoint_commit = ? WHERE id = ?", h.head, runId);
+	ctx.store.run(
+		`UPDATE tasks SET state = ?, reason = ?, head_commit = ?, pr_number = COALESCE(?, pr_number),
+		   pr_url = COALESCE(?, pr_url), review_since = ?, review_reminded = 0, updated_at = ?
+		 WHERE id = ?`,
+		hasQueuedRun(ctx, current.id) ? "queued" : "review",
+		h.interrupted ? INTERRUPTED_NOTE : null,
+		pushedNow ? h.head : current.head_commit,
+		pr?.number ?? null,
+		pr?.url ?? null,
+		now,
+		now,
+		current.id,
+	);
+}
+
+/**
+ * The checkpoint could not be put on GitHub because the branch changed outside the Coordinator: the task waits with
+ * its worktree, held until the branch is restored (its review_done stays 0), and the message says why and what to do.
+ */
+function holdReview(ctx: Ctx, runId: number, h: HeldReview): void {
+	const { moved, pushed: pushedNow } = h.published;
+	const pushed = pushedNow ? h.head : lastPushed(ctx, h.task);
+	const facts = { taskId: h.task.id, branch: moved.branch, github: moved.github, local: h.head, pushed };
+	tx(ctx, () => {
+		const now = ctx.now();
+		const current = loadTask(ctx, h.task.id);
+		if (TERMINAL_TASK_STATES.has(current.state)) return;
+		setHeldTask(ctx, current, runId, h, now);
+		const { taskId, ...rest } = facts;
+		const hold: BranchHold = { kind: "review", runId, interrupted: h.interrupted, ...rest, since: now };
+		if (!saveHold(ctx, taskId, hold)) return;
+		const text = reviewHeld({ ...facts, runNo: h.runNo, tests: testsText(h.tests), interrupted: h.interrupted });
+		enqueueTask(ctx, current, "task_held", text);
+	});
+	ctx.log.warn("review_held", { task: h.task.id, run: runId, pushed: pushedNow, tests: h.tests.outcome });
+}
+
 /**
  * The review step for `runId`; the caller holds an execution slot. Throws on an unknown effect (the caller
- * freezes the group; review_done stays 0 so the step is redone after resolution).
+ * freezes the group; review_done stays 0 so the step is redone after resolution). A branch changed outside the
+ * Coordinator holds the task instead (holdReview).
  */
 export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted: boolean }): Promise<void> {
 	const run = loadRun(ctx, runId);
@@ -178,34 +292,29 @@ export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted
 	const runNo = runNumber(ctx, run);
 	const tests = await runTests(ctx, task, path);
 	const head = (await ctx.git.checkpoint(path, `${taskRef(task.id)}: run ${runNo} checkpoint`)).commit;
-	await pushBranch(ctx, branch, path, head);
 	const answer = run.answer ?? "";
-	const changed = head !== base;
-	const pr = changed
-		? await ensurePullRequest(ctx, task, {
-				title: pullRequestTitle(task),
-				body: pullRequestBody(task, { runNo, tests, head, answer }),
-			})
-		: undefined;
-	const testFiles = changed ? (await ctx.git.changedFiles(base, head)).filter(isTestFile) : [];
-	const facts: ReviewFacts = {
-		taskId: task.id,
-		runNo,
-		branch,
-		head,
-		tests,
-		pr,
-		testFiles,
-		answer,
-		interrupted: options.interrupted,
-	};
-	recordReview(ctx, runId, facts);
+	const published = await publish(ctx, task, { branch, path, head, base, runNo, tests, answer });
+	const { interrupted } = options;
+	if (published.moved !== undefined) {
+		holdReview(ctx, runId, {
+			task,
+			runNo,
+			head,
+			tests,
+			interrupted,
+			published: { ...published, moved: published.moved },
+		});
+		return;
+	}
+	const pr = published.pr;
+	const testFiles = head !== base ? (await ctx.git.changedFiles(base, head)).filter(isTestFile) : [];
+	recordReview(ctx, runId, { taskId: task.id, runNo, branch, head, tests, pr, testFiles, answer, interrupted });
 	ctx.log.info("review_posted", {
 		task: task.id,
 		run: runId,
 		tests: tests.outcome,
 		pr: pr?.number,
 		test_files: testFiles.length,
-		interrupted: options.interrupted,
+		interrupted,
 	});
 }

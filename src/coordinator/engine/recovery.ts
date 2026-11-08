@@ -13,7 +13,8 @@
  *      quarantined, their pending follow-ups expired "(interrupted)"; uncertain budget reservations kept as
  *      unknown; saved merge intents checked against GitHub (main already contains the head → merged, no second
  *      merge); review steps and archives that did not complete are redone (comparing with GitHub before any push,
- *      finding the PR before opening one). Anything unresolved freezes the group.
+ *      finding the PR before opening one). Anything unresolved freezes the group; a push GitHub refuses because the
+ *      branch changed outside the Coordinator is resolved (definite: nothing pushed) and holds only that task.
  *      A run still 'starting' that never reached Pi (no Pi process recorded, no run key opened for its generation)
  *      did not start from Pi's point of view: it goes back to the queue (same run row and request id, so the same
  *      FIFO place; pending steers stay pending), at most START_RETURNS_LIMIT times, then its task fails. A first
@@ -48,7 +49,7 @@ import {
 	worktreeCheckKey,
 	worktreePath,
 } from "./context.ts";
-import { archiveTask, effectFailed, ghRead, terminalText } from "./effects.ts";
+import { archiveEnded, effectFailed, ghRead, terminalText } from "./effects.ts";
 import { expireFollowup, expireFollowups } from "./finalize.ts";
 import { closeAllRunKeys } from "./keys.ts";
 import { reviewStep } from "./review.ts";
@@ -448,10 +449,9 @@ async function reconcileFirstWorktree(ctx: Ctx, taskId: number): Promise<void> {
 export async function runRecoveryJob(ctx: Ctx, job: RecoveryJob): Promise<void> {
 	if (job.kind === "worktree") return reconcileFirstWorktree(ctx, job.taskId);
 	if (job.kind === "archive") {
-		const task = loadTask(ctx, job.taskId);
-		if (task.state === "merged") return archiveTask(ctx, job.taskId, undefined);
-		const kind = task.state === "cancelled" ? "cancelled" : "failed";
-		return archiveTask(ctx, job.taskId, (result) => terminalText(loadTask(ctx, job.taskId), kind, task.reason, result));
+		// A final push refused because the branch changed outside the Coordinator holds the task (no freeze).
+		await archiveEnded(ctx, job.taskId);
+		return;
 	}
 	const task = loadTask(ctx, job.taskId);
 	const slotId = tx(
