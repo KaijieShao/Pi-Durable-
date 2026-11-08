@@ -260,10 +260,16 @@ before it dispatches queued work again. Nothing that was cancelled resumes.
 
 ## Conductor
 
-The workspace's Conductor actions in `.conductor/settings.toml` (Setup, **Bot**, Doctor, Login) belong to the old
-private-chat bot: **Bot** starts it from `dist/` with the main checkout's `.env.local`. Stop it before a live test and
-never run it and the Coordinator with the same token. Those actions do not work with this branch's code once `dist/`
-is rebuilt from it (they load modules this branch removed), so start the Coordinator from a terminal as above.
+The Conductor actions in `.conductor/settings.toml` (Setup, **Bot**, Doctor, Login) belong to the old private-chat
+bot. In this workspace's copy, Setup no longer runs the Bot action automatically (`auto_run_after_setup = false`), and
+**Bot** fails at once with a message pointing here instead of starting the old bot (nothing is installed, built or
+read). Start the Coordinator from a terminal as above.
+
+Check which settings Conductor actually uses on your Mac: repository-local settings in the main checkout
+(`<main checkout>/.conductor/settings.local.toml`) take precedence and may still have `auto_run_after_setup = true`
+and a Bot command that runs the main checkout's own `.conductor/workspace.mjs`, which still starts the old bot. Turn
+that off too (or stop the Bot run) before a live test, and never run the old bot and the Coordinator with the same
+token: Telegram allows one poller per token.
 
 ## Security notes
 

@@ -68,6 +68,8 @@ export type StackOptions = {
 	 * production Docker sandbox from the config (pi-durable-agent:demo / pi-durable-check:demo, this user's uid:gid).
 	 */
 	readonly sandbox?: "local" | "docker";
+	/** Passed to startCoordinator as deps.onFatal (the CLI exits non-zero on it). */
+	readonly onFatal?: (reason: string, error: unknown) => void;
 };
 
 export type BotMatch = RegExp | ((message: ServerMessage) => boolean);
@@ -183,6 +185,7 @@ export async function startStack(options: StackOptions = {}) {
 		pollTimeoutSeconds: 1,
 		// Test-only: 50 ms base delay between GitHub/push retries (1 s in production).
 		retryDelayMs: 50,
+		...(options.onFatal === undefined ? {} : { onFatal: options.onFatal }),
 	};
 	const stopFakes = async (): Promise<void> => {
 		await Promise.allSettled([model.stop(), github.stop(), bot.stop()]);

@@ -12,7 +12,11 @@ export const EXIT = { ok: 0, fatal: 1, config: 2, locked: 3 } as const;
 /** What the CLI needs from a started Coordinator (src/coordinator/coordinator.ts returns more). */
 export type CoordinatorHandle = { stop(): Promise<void> };
 
-export type StartCoordinator = (config: CoordinatorConfig, deps: { log: Logger }) => Promise<CoordinatorHandle>;
+/** `onFatal`: the running Coordinator lost a vital part (e.g. the Telegram poller stopped on a 401). */
+export type StartCoordinator = (
+	config: CoordinatorConfig,
+	deps: { log: Logger; onFatal: (reason: string, error: unknown) => void },
+) => Promise<CoordinatorHandle>;
 
 export type RunOptions = {
 	readonly envFile?: string | undefined;
@@ -56,7 +60,13 @@ export async function runCoordinatorCli(options: RunOptions): Promise<number | R
 		},
 	});
 	if (options.processHandlers !== false) installProcessHandlers(controller, log);
-	starting = options.start(config, { log });
+	// A fatal error after startup (poller 401 or crash) stops the Coordinator and exits non-zero instead of leaving a
+	// process that runs without taking commands: 2 for a rejected bot token (needs a person), 1 otherwise.
+	const onFatal = (reason: string, error: unknown): void => {
+		log.error("fatal", { reason, error: errorSummary(error) });
+		void controller.trigger(startupExitCode(error) === EXIT.config ? EXIT.config : EXIT.fatal, reason);
+	};
+	starting = options.start(config, { log, onFatal });
 	try {
 		const handle = await starting;
 		log.info("coordinator_running", { group: config.telegram.groupChatId, agents: config.agents.length });

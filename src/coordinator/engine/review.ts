@@ -6,7 +6,7 @@
  * and its agent is free. Idempotent: recovery redoes it for runs whose review did not complete.
  */
 
-import { clip, sha7 } from "../messages.ts";
+import { clip, listFiles, sha7 } from "../messages.ts";
 import type { CheckOutcome, PullRequest } from "../ports.ts";
 import {
 	type Ctx,
@@ -109,7 +109,7 @@ function reviewNext(f: ReviewFacts, queued: boolean): string {
  * none>." + the agent's answer (its claim) + how to continue.
  */
 export function reviewText(f: ReviewFacts, queued: boolean): string {
-	const files = f.testFiles.length === 0 ? "none" : clip(f.testFiles.join(", "), 500);
+	const files = f.testFiles.length === 0 ? "none" : listFiles(f.testFiles);
 	const where =
 		f.pr === undefined
 			? ` Branch ${f.branch} is at main (${sha7(f.head)}); there is no pull request, so there is nothing to approve.`

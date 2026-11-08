@@ -12,7 +12,7 @@
  * review for a new approval. Merge tests hold a 'check' execution slot.
  */
 import { admitRun } from "../admission.ts";
-import { clip, sha7 } from "../messages.ts";
+import { listFiles, sha7 } from "../messages.ts";
 import { GitHubError, type MergeResult, type PullRequest } from "../ports.ts";
 import {
 	type Ctx,
@@ -364,7 +364,7 @@ function conflictFound(
 	intentId: number,
 	files: readonly string[],
 ): void {
-	const listed = files.length === 0 ? "(unknown files)" : clip(files.join(", "), 600);
+	const listed = files.length === 0 ? "(unknown files)" : listFiles(files);
 	tx(ctx, () => {
 		const now = ctx.now();
 		settleCombined(ctx, approval.id, intentId, "merge conflict");

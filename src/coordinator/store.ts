@@ -1,4 +1,5 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { splitTelegramText } from "./telegram/split.ts";
 
 /**
  * The Coordinator's one SQLite file (Interfaces and Storage § Where Each Record Lives, § Storage Choices):
@@ -300,6 +301,11 @@ export class Store {
 	 * Queue a Telegram message. Must be called inside the same `tx()` as the state change it reports, so an accepted
 	 * command, its change and its acknowledgement are stored together or not at all. A progress message replaces any
 	 * pending progress message of the same task (only the latest progress update is kept).
+	 *
+	 * A text over Telegram's 4096-character limit is split into ordered parts ("[1/3] ..."), queued as consecutive
+	 * rows in this transaction; the outbox's strict (priority, id) order sends them in order. Only the first part
+	 * replies to `replyTo`; every part belongs to the task, so a reply to any of them is a follow-up. Returns the id
+	 * of the first part.
 	 */
 	enqueue(message: OutboxMessage): number {
 		const now = this.now();
@@ -307,18 +313,22 @@ export class Store {
 		if (priority === 1 && message.taskId !== undefined) {
 			this.run("DELETE FROM outbox WHERE state = 'pending' AND priority = 1 AND task_id = ?", message.taskId);
 		}
-		return this.run(
-			`INSERT INTO outbox(chat_id, task_id, priority, kind, text, reply_to, state, next_attempt_at, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-			message.chatId,
-			message.taskId ?? null,
-			priority,
-			message.kind,
-			message.text,
-			message.replyTo ?? null,
-			now,
-			now,
-		).lastInsertRowid;
+		const ids = splitTelegramText(message.text).map(
+			(part, index) =>
+				this.run(
+					`INSERT INTO outbox(chat_id, task_id, priority, kind, text, reply_to, state, next_attempt_at, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+					message.chatId,
+					message.taskId ?? null,
+					priority,
+					message.kind,
+					part,
+					index === 0 ? (message.replyTo ?? null) : null,
+					now,
+					now,
+				).lastInsertRowid,
+		);
+		return ids[0] ?? 0;
 	}
 
 	groupState(chatId: number): { state: "normal" | "sealing" | "frozen"; reason: string | null; recheck: boolean } {

@@ -1,7 +1,8 @@
 /**
  * Every user-facing text of the command front, plus a few the engine shares (taskRef, sha7, frozenNotice,
  * helpText, followupExpired). Plain text: the outbox sends without a parse mode, so nothing here is escaped.
- * Each builder returns at most TELEGRAM_TEXT_LIMIT characters.
+ * Builders do not cut whole messages: a text over Telegram's limit is split into ordered parts when it is queued
+ * (Store.enqueue → src/coordinator/telegram/split.ts). Only echoed fragments are clipped (`clip`).
  *
  * Interfaces and Storage § Telegram: "Each acknowledgement carries the task ID and queue position. Each rejection
  * gives its reason."
@@ -22,15 +23,27 @@ export function sha7(sha: string): string {
 	return sha.slice(0, 7);
 }
 
-/** Clamp to Telegram's message limit, marking the cut. */
-export function fitText(text: string, limit: number = TELEGRAM_TEXT_LIMIT): string {
-	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+/**
+ * A whole message as queued. Kept as the single place builders pass their result through; it no longer cuts at
+ * Telegram's limit, because Store.enqueue splits long texts into ordered parts. An explicit `limit` still clamps.
+ */
+export function fitText(text: string, limit?: number): string {
+	return limit === undefined || text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
 /** One line, at most `max` characters: for echoing user-supplied fragments (agent names, task text previews). */
 export function clip(text: string, max: number): string {
 	const line = text.replace(/\s+/g, " ").trim();
 	return line.length <= max ? line : `${line.slice(0, max - 1)}…`;
+}
+
+/**
+ * A file list as shown in Telegram: every name (long messages are split into parts, not cut), bounded at `max`
+ * names with "and N more" so a huge conflict cannot flood the group.
+ */
+export function listFiles(files: readonly string[], max = 200): string {
+	if (files.length <= max) return files.join(", ");
+	return `${files.slice(0, max).join(", ")} and ${files.length - max} more`;
 }
 
 function plural(n: number, one: string, many: string = `${one}s`): string {

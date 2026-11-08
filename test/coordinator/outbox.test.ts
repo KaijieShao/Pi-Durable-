@@ -3,10 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { fitTelegramText, startOutbox, TELEGRAM_TEXT_LIMIT } from "../../src/coordinator/outbox.ts";
+import { fitTelegramText, OUTBOX_HOLD_KEY, startOutbox, TELEGRAM_TEXT_LIMIT } from "../../src/coordinator/outbox.ts";
 import type { SendMessageParams, TelegramApi } from "../../src/coordinator/ports.ts";
 import { type OutboxMessage, Store } from "../../src/coordinator/store.ts";
 import { createTelegramApi } from "../../src/coordinator/telegram/api.ts";
+import { MAX_TELEGRAM_PARTS, splitTelegramText } from "../../src/coordinator/telegram/split.ts";
 import { createLogger, silentLogger } from "../../src/runtime/log.ts";
 import { FakeBotApi } from "../fixtures/fake-bot-api.ts";
 import { sleep, waitFor } from "../helpers/env.ts";
@@ -164,6 +165,38 @@ describe("outbox: failures", () => {
 		assert.equal(row(store, a).attempts, 1, "a 429 is flow control, not a failed attempt");
 	});
 
+	it("keeps a 429 hold across a restart: the saved retry_after is honoured by the next sender", async () => {
+		const store = openStore();
+		let clock = Date.now();
+		const now = () => clock;
+		fake.failNext("sendMessage", { status: 429, retryAfter: 30 });
+		const a = enqueue(store, { text: "held" });
+		const first = start(store, { now });
+		await waitFor(() => store.getMeta(OUTBOX_HOLD_KEY), { what: "saved hold" });
+		const holdUntil = Number(store.getMeta(OUTBOX_HOLD_KEY));
+		assert.equal(holdUntil, clock + 30_000, "the hold's end is saved in the store");
+		await first.stop();
+		const attempts = fake.count("sendMessage");
+		assert.equal(attempts, 1, "one refused attempt before the restart");
+
+		// "Restart": a new sender on the same database, 10 s later, still inside Telegram's retry_after.
+		clock += 10_000;
+		const second = start(store, { now });
+		for (let i = 0; i < 5; i++) {
+			second.kick();
+			await sleep(40);
+		}
+		assert.equal(fake.count("sendMessage"), attempts, "nothing is sent while the saved hold lasts");
+		assert.equal(row(store, a).state, "pending");
+
+		// Once the clock passes the saved hold, the row goes out.
+		clock = holdUntil + 1;
+		second.kick();
+		await waitFor(() => row(store, a).state === "sent", { what: "sent after the hold" });
+		assert.deepEqual(fake.textsIn(G), ["held"]);
+		assert.equal(row(store, a).attempts, 1, "the 429 did not count as a failed attempt");
+	});
+
 	it("retries 5xx and dropped connections with backoff until Telegram confirms", async () => {
 		const store = openStore();
 		fake.failNext("sendMessage", { status: 500 });
@@ -279,21 +312,75 @@ describe("outbox: what is sent", () => {
 		assert.deepEqual(fake.textsIn(-200), ["to H"]);
 	});
 
-	it("cuts texts above 4096 characters with an ellipsis", async () => {
+	it("splits texts above 4096 characters into ordered parts instead of cutting them", async () => {
 		const store = openStore();
-		enqueue(store, { text: "x".repeat(5000) });
+		const lines = Array.from({ length: 400 }, (_, i) => `line ${String(i).padStart(3, "0")} ${"x".repeat(20)}`);
+		const long = lines.join("\n");
+		assert.ok(long.length > 2 * TELEGRAM_TEXT_LIMIT, "needs three parts");
+		const firstId = enqueue(store, { text: long, taskId: 7, replyTo: 42 });
+		enqueue(store, { text: "after" });
 		const sender = start(store);
 		await sender.idle();
-		const text = fake.sent()[0]?.text ?? "";
-		assert.equal(text.length, TELEGRAM_TEXT_LIMIT);
-		assert.ok(text.endsWith("…"));
+		const sent = fake.sent();
+		assert.deepEqual(
+			sent.map((m) => m.text.slice(0, 6)),
+			["[1/3] ", "[2/3] ", "[3/3] ", "after"],
+			"parts go out in order, before the next message",
+		);
+		for (const m of sent) assert.ok(m.text.length <= TELEGRAM_TEXT_LIMIT, `part of ${m.text.length} characters`);
+		// Nothing is lost: the parts without their markers, joined at the line breaks they were split at, are the text.
+		const rebuilt = sent
+			.slice(0, 3)
+			.map((m) => m.text.replace(/^\[\d+\/\d+\] /, ""))
+			.join("\n");
+		assert.equal(rebuilt, long);
+		assert.ok(!sent.some((m) => m.text.includes("…")), "no ellipsis cut");
+		// Only the first part replies to the user's message; every part belongs to the task (replies are follow-ups).
+		assert.deepEqual(
+			sent.map((m) => m.replyTo),
+			[42, undefined, undefined, undefined],
+		);
+		const mapped = store.all<{ message_id: number }>(
+			"SELECT message_id FROM task_messages WHERE task_id = 7 ORDER BY message_id",
+		);
+		assert.deepEqual(
+			mapped.map((r) => r.message_id),
+			sent.slice(0, 3).map((m) => m.id),
+		);
+		const rows = store.all<{ id: number; state: string }>("SELECT id, state FROM outbox ORDER BY id");
+		assert.equal(rows[0]?.id, firstId, "enqueue returns the first part's id");
+		assert.deepEqual(
+			rows.map((r) => r.state),
+			["sent", "sent", "sent", "sent"],
+		);
+	});
+
+	it("splitTelegramText: line, then word, then hard breaks; never a split surrogate pair; bounded parts", () => {
+		assert.deepEqual(splitTelegramText("short"), ["short"]);
+		assert.deepEqual(splitTelegramText("y".repeat(4096)), ["y".repeat(4096)], "exactly the limit stays whole");
+		// Words without line breaks break at a space.
+		const words = Array.from({ length: 1500 }, (_, i) => `w${i}`).join(" ");
+		const wordParts = splitTelegramText(words);
+		assert.ok(wordParts.length >= 2);
+		assert.equal(wordParts.map((p) => p.replace(/^\[\d+\/\d+\] /, "")).join(" "), words);
+		// No spaces at all: a hard cut that never separates a surrogate pair.
+		const emoji = "😀".repeat(5000);
+		const emojiParts = splitTelegramText(emoji);
+		for (const part of emojiParts) {
+			assert.ok(part.length <= TELEGRAM_TEXT_LIMIT);
+			assert.ok(!/[\ud800-\udbff]$/.test(part) && !/^\[\d+\/\d+\] [\udc00-\udfff]/.test(part));
+		}
+		assert.equal(emojiParts.map((p) => p.replace(/^\[\d+\/\d+\] /, "")).join(""), emoji);
+		// A runaway text is bounded: at most MAX_TELEGRAM_PARTS parts, the last says what was left out.
+		const huge = "z".repeat(TELEGRAM_TEXT_LIMIT * (MAX_TELEGRAM_PARTS + 5));
+		const bounded = splitTelegramText(huge);
+		assert.equal(bounded.length, MAX_TELEGRAM_PARTS);
+		assert.match(bounded.at(-1) ?? "", /… \[\d+ more characters not sent\]$/);
+		for (const part of bounded) assert.ok(part.length <= TELEGRAM_TEXT_LIMIT);
+		// The send-time guard still cuts a row that was written without enqueue (never splits a surrogate pair).
 		assert.equal(fitTelegramText("short"), "short");
-		assert.equal(fitTelegramText("y".repeat(4096)).length, 4096);
-		// Never splits a surrogate pair.
-		const emoji = `${"a".repeat(4094)}😀😀`;
-		const cut = fitTelegramText(emoji);
-		assert.ok(cut.length <= TELEGRAM_TEXT_LIMIT);
-		assert.ok(!/[\ud800-\udbff]…$/.test(cut));
+		const cut = fitTelegramText(`${"a".repeat(4094)}😀😀`);
+		assert.ok(cut.length <= TELEGRAM_TEXT_LIMIT && !/[\ud800-\udbff]…$/.test(cut));
 	});
 
 	it("kick() makes a newly enqueued row go out without waiting for the poll interval", async () => {

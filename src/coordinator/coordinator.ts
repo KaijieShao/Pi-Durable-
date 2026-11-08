@@ -49,6 +49,12 @@ export type CoordinatorDeps = {
 	readonly pollTimeoutSeconds?: number;
 	/** Tests: base delay between GitHub/push retries (1 s in production). */
 	readonly retryDelayMs?: number;
+	/**
+	 * Called when the Coordinator can no longer do its job and must not keep running half-alive, e.g. the poller hit
+	 * a 401 from getUpdates (token revoked) or crashed: command intake has stopped. The CLI stops the Coordinator
+	 * and exits non-zero so systemd (or the operator) sees it (Requirements § Availability: restarts automatically).
+	 */
+	readonly onFatal?: (reason: string, error: unknown) => void;
 };
 
 export type Coordinator = {
@@ -201,7 +207,10 @@ function startPollerFor(setup: Setup, store: Store, telegram: TelegramApi, engin
 			outbox.kick();
 			if (result.kick) engine.kick();
 		},
-		onFatal: (error) => log.error("telegram_poller_fatal", { error: errorSummary(error) }),
+		onFatal: (error) => {
+			log.error("telegram_poller_fatal", { error: errorSummary(error) });
+			deps.onFatal?.("telegram_poller_fatal", error);
+		},
 	});
 }
 

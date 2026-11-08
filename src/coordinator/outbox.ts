@@ -1,6 +1,7 @@
 import { errorSummary, type Logger } from "../runtime/log.ts";
 import { type TelegramApi, TelegramError } from "./ports.ts";
 import type { Store } from "./store.ts";
+import { TELEGRAM_TEXT_LIMIT } from "./telegram/split.ts";
 
 /**
  * Durable outbox sender (Interfaces and Storage § Outbox to Telegram). Rows are queued by `Store.enqueue()` inside the
@@ -13,13 +14,16 @@ import type { Store } from "./store.ts";
  *   `INSERT OR IGNORE task_messages(chat_id, message_id, task_id)`, so a reply to it is a follow-up to that task.
  * - Network error, 5xx (and 401/404: token trouble, the poller reports it) → attempts + 1, retried after
  *   `backoffMs(attempts)` (1 s · 2^(n-1), at most 60 s). Events stay pending until Telegram confirms them.
- * - 429 → no send at all (to any chat: the limit is per bot) until Telegram's retry_after has passed.
+ * - 429 → no send at all (to any chat: the limit is per bot) until Telegram's retry_after has passed. The hold's
+ *   end is saved in the store (meta `outbox_hold_until`) and read back at start, so a restart still honours it.
  * - Any other 4xx → state failed + a failed_events row (outbox kind and a metadata-only reason) for the owner CLI.
  * - Delivery is at-least-once: a crash (or a lost response) between Telegram accepting a message and the row being
  *   marked sent makes the row go out again after restart. Nothing is ever dropped.
  *
- * Texts are plain (no parse mode) and cut to 4096 characters with "…". The chat id comes from the row; the forum
- * topic (`threadId`) is the deployment's, omitted for General (1) and groups without topics.
+ * Texts are plain (no parse mode). `Store.enqueue` already split longer texts into ordered parts of at most 4096
+ * characters (src/coordinator/telegram/split.ts); the send-time cut below is only a guard for rows written some other
+ * way. The chat id comes from the row; the forum topic (`threadId`) is the deployment's, omitted for General (1) and
+ * groups without topics.
  */
 export type OutboxOptions = {
 	readonly store: Store;
@@ -43,9 +47,12 @@ export type OutboxSender = {
 	idle(): Promise<void>;
 };
 
-export const TELEGRAM_TEXT_LIMIT = 4096;
+export { TELEGRAM_TEXT_LIMIT } from "./telegram/split.ts";
+
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_RETRY_AFTER_S = 5;
+/** Store meta key: epoch ms before which nothing may be sent (Telegram's last 429 retry_after). */
+export const OUTBOX_HOLD_KEY = "outbox_hold_until";
 const STOP_GRACE_MS = 1000;
 
 export function defaultOutboxBackoff(attempt: number): number {
@@ -75,7 +82,7 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 	let stopped = false;
 	let kicked = false;
 	/** No send of any row before this (429 retry_after, or a store that could not record an outcome). */
-	let holdUntil = 0;
+	let holdUntil = savedHold(store, log);
 	let wake: (() => void) | undefined;
 	const idleWaiters: (() => void)[] = [];
 
@@ -109,7 +116,7 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 		try {
 			store.tx(fn);
 		} catch (error) {
-			holdUntil = now() + backoffMs(1);
+			holdUntil = Math.max(holdUntil, now() + backoffMs(1));
 			log.error("outbox_record_failed", { outbox_id: row.id, outcome: what, error: errorSummary(error) });
 		}
 	};
@@ -137,6 +144,9 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 	const holdForRateLimit = (row: OutboxRow, error: TelegramError): void => {
 		const seconds = error.retryAfterSeconds ?? DEFAULT_RETRY_AFTER_S;
 		holdUntil = Math.max(holdUntil, now() + Math.max(1, seconds) * 1000);
+		// Saved, so a Coordinator restarted during the hold does not send before Telegram allows it.
+		const until = holdUntil;
+		record(row, "rate_limited", () => store.setMeta(OUTBOX_HOLD_KEY, String(until)));
 		log.warn("outbox_rate_limited", { outbox_id: row.id, retry_after_s: seconds });
 	};
 
@@ -269,7 +279,21 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 	};
 }
 
-/** Telegram's 4096-character limit, counted in UTF-16 units (never more than Telegram counts); cut with "…". */
+/** The saved 429 hold (0 if none or unreadable: a store that cannot be read sends nothing anyway). */
+function savedHold(store: Store, log: Logger): number {
+	try {
+		const value = Number(store.getMeta(OUTBOX_HOLD_KEY) ?? 0);
+		return Number.isFinite(value) && value > 0 ? value : 0;
+	} catch (error) {
+		log.error("outbox_hold_read_failed", { error: errorSummary(error) });
+		return 0;
+	}
+}
+
+/**
+ * Guard at send time: Telegram's 4096-character limit in UTF-16 units, cut with "…". Rows from `Store.enqueue` are
+ * already split into parts that fit, so this never cuts them.
+ */
 export function fitTelegramText(text: string): string {
 	if (text.length <= TELEGRAM_TEXT_LIMIT) return text;
 	let cut = TELEGRAM_TEXT_LIMIT - 1;

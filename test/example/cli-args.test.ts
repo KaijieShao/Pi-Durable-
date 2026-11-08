@@ -134,6 +134,50 @@ test("run: starts with the parsed config and a logger, scrubs secrets from the e
 	}
 });
 
+test("run: a fatal error after startup (poller 401 or crash) stops the Coordinator and exits non-zero", async () => {
+	const { dir, cleanup } = await tempDir();
+	try {
+		for (const [error, code] of [
+			[new TelegramError("unauthorized", "getUpdates: unauthorized", 401), EXIT.config],
+			[new Error("poller crashed"), EXIT.fatal],
+		] as const) {
+			const lines: string[] = [];
+			const exits: number[] = [];
+			let stopped = 0;
+			let fatal: ((reason: string, error: unknown) => void) | undefined;
+			const result = await runCoordinatorCli({
+				env: validEnv(dir),
+				start: async (_config, deps) => {
+					fatal = deps.onFatal;
+					return { stop: async () => void stopped++ } satisfies CoordinatorHandle;
+				},
+				createLog: () => createLogger({ level: "debug", sink: (_level, line) => lines.push(line) }),
+				exit: (exitCode) => exits.push(exitCode),
+				processHandlers: false,
+			});
+			assert.ok(typeof result === "object", "the Coordinator started");
+			assert.deepEqual(exits, [], "nothing exits before the fatal error");
+			assert.ok(fatal !== undefined, "the CLI hands the Coordinator an onFatal callback");
+			fatal("telegram_poller_fatal", error);
+			await waitUntil(() => exits.length > 0);
+			assert.equal(stopped, 1, "the Coordinator is stopped before exiting");
+			assert.deepEqual(exits, [code]);
+			assert.notEqual(code, 0);
+			assert.ok(lines.some((line) => line.startsWith("error fatal reason=telegram_poller_fatal")));
+		}
+	} finally {
+		await cleanup();
+	}
+});
+
+async function waitUntil(check: () => boolean): Promise<void> {
+	const deadline = Date.now() + 5000;
+	while (!check()) {
+		if (Date.now() > deadline) throw new Error("timed out");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 test("run: a failed start runs the shutdown path and exits 1, 2 (rejected token) or 3 (data dir locked)", async () => {
 	const { dir, cleanup } = await tempDir();
 	try {
