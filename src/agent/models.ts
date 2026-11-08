@@ -48,7 +48,7 @@ export async function createAgentModels(options: {
 	readonly credentials: CredentialStore;
 	readonly authContext?: AuthContext;
 }): Promise<MutableModels> {
-	const provider = await loadProvider(options.provider);
+	const provider = await loadProvider(options.provider, options.authContext);
 	if (provider === undefined)
 		throw new StartupError(`PI_PROVIDER: unknown provider ${JSON.stringify(options.provider)}`, 2);
 	const models = createModels({

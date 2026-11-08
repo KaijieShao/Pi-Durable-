@@ -1,0 +1,56 @@
+# Pi Durable: the group Coordinator (spec/deployment.md § Processes: "coordinator systemd unit — Telegram poller,
+# relay, outbox and owner socket — one process, restarted automatically by systemd"). Install after the host setup of
+# docs/isolation.md and docs/security.md ("The watchdog"):
+#
+#   sudo install -m 0644 deploy/systemd/pi-durable-coordinator.service /etc/systemd/system/
+#   sudo install -m 0600 -o pi-coordinator -g pi-coordinator /dev/null /etc/pi-durable/coordinator.env
+#   sudoedit /etc/pi-durable/coordinator.env     # .env.example; at least the variables below
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pi-durable-coordinator
+#
+# In coordinator.env, besides the Telegram, model and GitHub settings:
+#   PI_DATA_DIR=/var/lib/pi-durable
+#   PI_TASK_DIR=/mnt/pi-durable-tasks
+#   PI_REQUIRE_TASK_MOUNT=1
+#   PI_STATE_GROUP=pi-watchdog        (share the database and the lock with the watchdog's user)
+#
+# The watchdog unit starts first; the Coordinator dispatches nothing until the watchdog has verified its restart
+# sweep, and nothing new while the watchdog's heartbeat is stale.
+#
+# The owner socket is /var/lib/pi-durable/owner/owner.sock (0700 directory, 0600 socket and token, this unit's user
+# only; docs/security.md "The owner socket"). Run the owner CLI as that user, e.g. (it reads only PI_DATA_DIR,
+# PI_TASK_DIR, TELEGRAM_GROUP_CHAT_ID and the disk sizes from the file, never a secret):
+#   sudo -u pi-coordinator /usr/bin/node /opt/pi-durable/src/cli/main.ts owner status --env-file /etc/pi-durable/coordinator.env
+
+[Unit]
+Description=Pi Durable group Coordinator (Telegram, relay, outbox, runs)
+Wants=network-online.target pi-durable-watchdog.service docker.service
+After=network-online.target pi-durable-watchdog.service docker.service
+# The task disk and the data directory: without the task disk mounted the Coordinator does not start, so task writes
+# never land on the boot disk (spec/deployment.md § Disk and Data). Docker gets the same rule (docker.service.d/).
+RequiresMountsFor=/mnt/pi-durable-tasks /var/lib/pi-durable
+
+[Service]
+Type=simple
+User=pi-coordinator
+Group=pi-coordinator
+# pi-durable: the conversations directory shared with the Pi user; pi-watchdog: hand the database and the lock to the
+# watchdog's group (PI_STATE_GROUP); docker: the agent and check containers.
+SupplementaryGroups=pi-durable pi-watchdog docker
+EnvironmentFile=/etc/pi-durable/coordinator.env
+Environment=NODE_NO_WARNINGS=1
+ExecStart=/usr/bin/node /opt/pi-durable/src/cli/main.ts run
+Restart=always
+RestartSec=3
+# 2 = configuration problem or rejected bot token, 3 = data directory locked by another Coordinator: need a person.
+RestartPreventExitStatus=2 3
+# Runs get 15 s to stop, then their containers are verified gone (the CLI exits by itself after 30 s at most).
+TimeoutStopSec=40
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+# The Coordinator talks to systemd over D-Bus (systemd-run, systemctl) and to Docker over its socket: keep AF_UNIX.
+
+[Install]
+WantedBy=multi-user.target

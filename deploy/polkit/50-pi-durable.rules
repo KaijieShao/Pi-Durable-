@@ -1,0 +1,27 @@
+// Pi Durable: lets ONLY the Coordinator's user manage the transient units of the Pi processes (docs/isolation.md).
+// Install as /etc/polkit-1/rules.d/50-pi-durable.rules (root:root, mode 0644); polkit reloads rules by itself.
+// If your Coordinator user is not pi-coordinator, change COORDINATOR below.
+//
+// Allowed: start (systemd-run), stop and kill (systemctl) of units named
+//   pi-run-<16 hex digits>-r<run id>-g<generation>.service
+// and nothing else: no other unit, no other verb, no other user. Reading units (systemctl show, list-units) needs no
+// rule.
+//
+// Limit: polkit sees the unit's name and the verb, not the unit's properties. It cannot check that such a unit is in
+// the Pi slice or runs as the Pi user; the Coordinator (a trusted component, spec/architecture.md § Trust
+// Boundaries) sets those, and the Linux deployment test checks them. Whoever controls the Coordinator's user can
+// start a pi-run-* unit as any user, root included: treat that account as privileged.
+// A systemd that passes no unit name to polkit for transient units makes action.lookup("unit") undefined: then this
+// rule allows nothing, every start is refused and the deployment test fails (fail closed).
+var COORDINATOR = "pi-coordinator";
+var PI_RUN_UNIT = /^pi-run-[0-9a-f]{16}-r[0-9]+-g[0-9]+\.service$/;
+
+polkit.addRule(function (action, subject) {
+	if (action.id !== "org.freedesktop.systemd1.manage-units") return polkit.Result.NOT_HANDLED;
+	if (subject.user !== COORDINATOR) return polkit.Result.NOT_HANDLED;
+	var unit = action.lookup("unit");
+	var verb = action.lookup("verb");
+	if (typeof unit !== "string" || !PI_RUN_UNIT.test(unit)) return polkit.Result.NOT_HANDLED;
+	if (verb === "start" || verb === "stop" || verb === "kill") return polkit.Result.YES;
+	return polkit.Result.NOT_HANDLED;
+});

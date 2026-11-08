@@ -1,0 +1,82 @@
+# Pi Durable: the watchdog, the independent stop path (spec/deployment.md § Processes: "watchdog systemd unit —
+# Independent stop path — Separate unit; survives a Coordinator crash"; spec/architecture.md § Watchdog). Its own
+# unit and its own user: it keeps running when the Coordinator crashes or restarts, and it holds no secret (no bot
+# token, no model key, no GitHub token) and has no network. What it does (src/watchdog/watchdog.ts):
+#   - answers the Coordinator's sweep requests (every restart, and the recovery checks of an owner unfreeze): kills
+#     everything in the Pi slice and every container labelled pi-durable.managed=1, verifies both are empty, and only
+#     then lets admission reopen; unverified → the group freezes;
+#   - while no Coordinator runs (its lock is gone or stale), kills whatever it left;
+#   - enforces each run's 10-minute deadline on its own;
+#   - writes a heartbeat every second; the Coordinator dispatches nothing while it is older than 15 s.
+#
+# Install (docs/security.md "The watchdog"; the user, the shared group and the data-dir ACL come first):
+#
+#   sudo install -m 0644 deploy/systemd/pi-durable-watchdog.service /etc/systemd/system/
+#   sudo install -d -m 0755 /etc/pi-durable
+#   sudo install -m 0640 -o root -g pi-watchdog /dev/null /etc/pi-durable/watchdog.env
+#   sudoedit /etc/pi-durable/watchdog.env      # PI_DATA_DIR=/var/lib/pi-durable and TELEGRAM_GROUP_CHAT_ID=-100...
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pi-durable-watchdog
+#
+# Its env file has only its own variables (PI_DATA_DIR, TELEGRAM_GROUP_CHAT_ID, and if not the defaults DOCKER_BIN,
+# PI_RUNNER_ISOLATION, PI_RUNNER_SLICE, SYSTEMCTL_BIN, LOG_LEVEL); never point it at the Coordinator's env file.
+
+[Unit]
+Description=Pi Durable watchdog (independent stop path: the Pi slice and the labelled containers)
+Wants=docker.service
+After=docker.service
+Before=pi-durable-coordinator.service
+RequiresMountsFor=/var/lib/pi-durable
+# Deliberately no BindsTo= / PartOf= on the Coordinator: the watchdog must survive it.
+
+[Service]
+Type=simple
+User=pi-watchdog
+Group=pi-watchdog
+# docker: list and remove the labelled containers through the Docker socket. Nothing else.
+SupplementaryGroups=docker
+EnvironmentFile=/etc/pi-durable/watchdog.env
+Environment=NODE_NO_WARNINGS=1
+ExecStart=/usr/bin/node /opt/pi-durable/src/cli/main.ts watchdog
+Restart=always
+RestartSec=1
+# Exit code 2: a configuration problem; it needs a person, not a restart loop.
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+
+# CAP_KILL only: SIGKILL the Pi user's processes in the slice. No other capability, no way to gain one.
+AmbientCapabilities=CAP_KILL
+CapabilityBoundingSet=CAP_KILL
+NoNewPrivileges=yes
+# Everything read-only except the Coordinator's data directory (the shared database: answers, heartbeat, a freeze);
+# file permissions still apply there (docs/security.md: the database is shared with this user's group, nothing else).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pi-durable
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# /sys/fs/cgroup read-only: the slice's cgroup.procs are read, never written.
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Not ProtectProc=invisible: the Pi user's processes must stay visible to be listed and killed.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Only Unix sockets (the Docker socket, systemd's D-Bus for `systemctl show`): no network at all, no metadata server.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+# The docker CLI's HOME (its config directory), owned by this user.
+StateDirectory=pi-durable-watchdog
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/pi-durable-watchdog
+UMask=0007
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

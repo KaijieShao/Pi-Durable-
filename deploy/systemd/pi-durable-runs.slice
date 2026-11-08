@@ -1,0 +1,30 @@
+# Pi Durable: the dedicated slice of the Pi processes (spec/deployment.md § Processes: "Pi processes run as their own
+# unprivileged user in a dedicated systemd slice"). The Coordinator starts every run as one transient unit
+#   pi-run-<deployment>-r<run>-g<generation>.service
+# in this slice, as the Pi user, with systemd-run (src/coordinator/runner-systemd.ts). Install and verify: see
+# docs/isolation.md. The Coordinator refuses to run tasks while this slice is not loaded (fails closed).
+#
+#   sudo install -m 0644 deploy/systemd/pi-durable-runs.slice /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   systemctl show --property=LoadState --value pi-durable-runs.slice     # loaded
+#
+# Dashes are the slice hierarchy: this slice lives at pi.slice/pi-durable.slice/pi-durable-runs.slice.
+
+[Unit]
+Description=Pi Durable: Pi processes (one transient unit per run)
+Before=slices.target
+
+[Slice]
+# Budget of all Pi processes together, inside the host reserve of spec/capacity.md (Coordinator, watchdog, the
+# concurrent Pi processes and Docker share 1 vCPU and 2 GiB). Provisional, to be validated by the stress test. Each
+# unit has its own MemoryMax=512M, TasksMax=64 and RuntimeMaxSec = run deadline + 60 s on top.
+CPUAccounting=yes
+CPUQuota=100%
+MemoryAccounting=yes
+MemoryMax=1G
+TasksAccounting=yes
+TasksMax=256
+# The same IP filter as every unit (loopback only: the relay is on 127.0.0.1), at the slice level too.
+IPAccounting=yes
+IPAddressDeny=any
+IPAddressAllow=localhost

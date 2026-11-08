@@ -1,0 +1,20 @@
+<svg viewBox="0 0 760 326" role="img" aria-labelledby="dgt dgd" xmlns="http://www.w3.org/2000/svg" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+<title id="dgt">Task-to-conversation mapping</title>
+<desc id="dgd">User 1 submits Task A and User 2 submits Task B in the same group. Task A is assigned to agent A and bound to a conversation; Task B is assigned to agent B and bound to a conversation. User 1's follow-up reply to Task A, sent while Task A is busy, is steered into Task A's conversation; after Task A's run ends and before its pull request merges, a follow-up starts another admitted run of Task A, which may reuse the conversation if the earlier run ended cleanly.</desc>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#71717a"/></marker><marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker></defs>
+<g font-size="11" font-weight="600" fill="#a1a1aa" letter-spacing=".06em"><text x="80" y="22" text-anchor="middle">USERS</text><text x="350" y="22" text-anchor="middle">ONE TELEGRAM GROUP</text><text x="640" y="22" text-anchor="middle">CONVERSATIONS</text></g>
+<rect x="210" y="36" width="280" height="270" rx="14" fill="#fafafa" stroke="#e4e4e7"/>
+<g fill="#fff" stroke="#d4d4d8"><rect x="20" y="88" width="120" height="48" rx="10"/><rect x="20" y="226" width="120" height="48" rx="10"/></g>
+<g font-size="14" font-weight="600" fill="#18181b" text-anchor="middle"><text x="80" y="117">User 1</text><text x="80" y="255">User 2</text></g>
+<rect x="240" y="56" width="220" height="56" rx="10" fill="#fff" stroke="#2563eb" stroke-width="1.5"/>
+<rect x="240" y="136" width="220" height="56" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="5 4"/>
+<rect x="240" y="226" width="220" height="56" rx="10" fill="#fff" stroke="#a1a1aa" stroke-width="1.5"/>
+<g text-anchor="middle"><text x="350" y="81" font-size="14" font-weight="600" fill="#18181b">Task A</text><text x="350" y="99" font-size="12" fill="#71717a">assigned to agent A</text>
+<text x="350" y="161" font-size="14" font-weight="600" fill="#1d4ed8">Follow-up to Task A</text><text x="350" y="179" font-size="12" fill="#71717a">reply to Task A</text>
+<text x="350" y="251" font-size="14" font-weight="600" fill="#18181b">Task B</text><text x="350" y="269" font-size="12" fill="#71717a">assigned to agent B</text></g>
+<g fill="#fff" stroke-width="1.5"><rect x="560" y="76" width="160" height="96" rx="12" stroke="#2563eb"/><rect x="560" y="226" width="160" height="56" rx="12" stroke="#a1a1aa"/></g>
+<g text-anchor="middle"><text x="640" y="118" font-size="14" font-weight="600" fill="#18181b">Task A conversation</text><text x="640" y="137" font-size="12" fill="#71717a">agent A</text>
+<text x="640" y="251" font-size="14" font-weight="600" fill="#18181b">Task B conversation</text><text x="640" y="269" font-size="12" fill="#71717a">agent B</text></g>
+<g fill="none" stroke-width="1.5"><path d="M140 104C190 104 190 84 238 84" stroke="#71717a" marker-end="url(#ah)"/><path d="M140 120C190 120 190 164 238 164" stroke="#2563eb" stroke-dasharray="5 4" marker-end="url(#ahb)"/><path d="M140 254H238" stroke="#71717a" marker-end="url(#ah)"/>
+<path d="M460 84C510 84 510 106 558 106" stroke="#71717a" marker-end="url(#ah)"/><path d="M460 164C510 164 510 142 558 142" stroke="#2563eb" stroke-dasharray="5 4" marker-end="url(#ahb)"/><path d="M460 254H558" stroke="#71717a" marker-end="url(#ah)"/></g>
+<text x="510" y="188" text-anchor="middle" font-size="11" fill="#2563eb">while the task</text><text x="510" y="203" text-anchor="middle" font-size="11" fill="#2563eb">is running</text></svg>

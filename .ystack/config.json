@@ -1,0 +1,94 @@
+{
+  "project": "pi-durable-telegram",
+  "runtime": "claude-code",
+  "docs": {
+    "root": "docs",
+    "framework": null
+  },
+  "monorepo": {
+    "enabled": false
+  },
+  "modules": {
+    "agent": {
+      "doc": "how-it-works",
+      "scope": [
+        "src/agent/**",
+        "scripts/patch-pi-durable.mjs"
+      ]
+    },
+    "auth": {
+      "doc": "install",
+      "scope": [
+        "src/auth/**",
+        "src/cli/login.ts"
+      ]
+    },
+    "channel": {
+      "doc": "how-it-works",
+      "scope": [
+        "src/channel/**",
+        "src/status/**"
+      ]
+    },
+    "delivery": {
+      "doc": "how-it-works",
+      "scope": [
+        "src/delivery/**",
+        "src/format/**"
+      ]
+    },
+    "telegram": {
+      "doc": "how-it-works",
+      "scope": [
+        "src/telegram/**"
+      ]
+    },
+    "media": {
+      "doc": "how-it-works",
+      "scope": [
+        "src/media/**"
+      ]
+    },
+    "plugins": {
+      "doc": "plugins",
+      "scope": [
+        "src/plugins/**"
+      ]
+    },
+    "config": {
+      "doc": "configuration",
+      "scope": [
+        "src/config/**"
+      ]
+    },
+    "daemon": {
+      "doc": "install",
+      "scope": [
+        "src/cli/main.ts",
+        "src/cli/run.ts",
+        "src/cli/args.ts",
+        "src/runtime/**"
+      ]
+    },
+    "library": {
+      "doc": "library",
+      "scope": [
+        "src/index.ts"
+      ]
+    },
+    "install": {
+      "doc": "install",
+      "scope": [
+        "install.sh",
+        "deploy/**",
+        "skills/**",
+        ".conductor/**"
+      ]
+    }
+  },
+  "workflow": {
+    "plan_checker": true,
+    "fresh_context_per_task": true,
+    "auto_docs_check": true
+  }
+}

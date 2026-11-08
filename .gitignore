@@ -4,7 +4,13 @@ data/
 coverage/
 .notes/
 .env*
+!.env.example
+.conductor/runtime/
+.conductor/settings.local.toml
 *.sqlite
 *.sqlite-*
 *.log
 .DS_Store
+.context/
+.claude/hooks/
+.claude/scheduled_tasks.lock

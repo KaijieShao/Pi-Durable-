@@ -1,0 +1,6 @@
+{
+  "setup": ["sh", "{setupScript}"],
+  "test": ["npm", "test", "--silent"],
+  "lint": ["npm", "run", "--if-present", "lint"],
+  "build": ["npm", "run", "--if-present", "build"]
+}

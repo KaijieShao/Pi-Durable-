@@ -1,0 +1,42 @@
+{
+  "skill_name": "review",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "/review",
+      "expected_output": "Reviews current branch changes against the plan. Consumes QA-REPORT.md when present, trusts QA evidence for covered criteria, carries open QA issues into the verdict, and runs multi-agent code review with confidence scores.",
+      "assertions": [
+        "The plan (PLAN.md) is read and verified against",
+        "QA-REPORT.md is read when present and its status is reflected in the review",
+        "Success criteria already verified by QA are not re-tested; they are cited as QA evidence",
+        "Open QA issues are carried into the final verdict rather than re-proved or ignored",
+        "Multiple review dimensions are covered (security, correctness, performance)",
+        "Each finding includes a confidence score",
+        "A summary verdict is provided (pass/fail/conditional)"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/review owner/repo#42",
+      "expected_output": "Fetches the external PR via gh CLI, reviews the diff without plan verification (no local plan exists), and produces a structured code review.",
+      "assertions": [
+        "The PR is fetched using gh pr view and gh pr diff",
+        "Plan verification is skipped for external PRs",
+        "The review covers the full PR diff",
+        "Findings are categorized by severity or type",
+        "Review comments are actionable and specific"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "check my work, is this ready to ship?",
+      "expected_output": "Activates review from natural language, performs a QA-aware goal check plus code review, and gives a clear ship/no-ship recommendation.",
+      "assertions": [
+        "The skill activates from the natural language trigger",
+        "Both QA-aware goal check and code review phases run when QA is passed or absent",
+        "A clear recommendation is provided (ship or not)",
+        "Any blockers are listed with specific file references"
+      ]
+    }
+  ]
+}

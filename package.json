@@ -46,7 +46,8 @@
     "deploy",
     "skills",
     "docs",
-    "scripts/patch-pi-durable.mjs"
+    "RUN-LOCAL.md",
+    "scripts/build-images.sh"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
@@ -55,8 +56,7 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
-    "prepack": "npm run build",
-    "postinstall": "node scripts/patch-pi-durable.mjs"
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@earendil-works/chord": "1.5.0",
