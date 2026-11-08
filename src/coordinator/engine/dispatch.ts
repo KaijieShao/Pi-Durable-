@@ -6,6 +6,7 @@
  * the run's key and containers.
  */
 import { openTaskCount } from "../admission.ts";
+import { blocksTaskRuns, readBranchHold } from "../branch-hold.ts";
 import { taskDiskToldKey } from "../disk.ts";
 import { taskDiskWait } from "../messages.ts";
 import { projectTokensSpent } from "../relay.ts";
@@ -39,6 +40,7 @@ function count(ctx: Ctx, sql: string, ...params: (string | number)[]): number {
 /** Per-candidate checks that need no group-wide count: cancel, task state, in-flight work, held slots. */
 function candidateBlocked(ctx: Ctx, c: Candidate): boolean {
 	if (c.cancel_requested === 1 || !DISPATCHABLE_TASK_STATES.has(c.task_state) || ctx.busy.has(c.task_id)) return true;
+	if (blocksTaskRuns(readBranchHold(ctx.store, c.task_id))) return true;
 	if (count(ctx, "SELECT COUNT(*) AS n FROM slots WHERE task_id = ?", c.task_id) > 0) return true;
 	return (
 		count(ctx, "SELECT COUNT(*) AS n FROM slots WHERE kind = 'run' AND agent_id = ?", c.agent_id) >=

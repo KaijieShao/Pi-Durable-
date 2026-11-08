@@ -12,7 +12,7 @@
  */
 
 import type { BranchHold } from "../branch-hold.ts";
-import { clip, listFiles, reviewHeld, sha7 } from "../messages.ts";
+import { clip, INTERRUPTED_KEPT_REASON, listFiles, reviewHeld, sha7 } from "../messages.ts";
 import type { CheckOutcome, PullRequest } from "../ports.ts";
 import {
 	BranchMoved,
@@ -22,6 +22,7 @@ import {
 	enqueueTask,
 	loadRun,
 	loadTask,
+	type RunRow,
 	runNumber,
 	type TaskRow,
 	TERMINAL_TASK_STATES,
@@ -29,7 +30,7 @@ import {
 	tx,
 	UnknownEffect,
 } from "./context.ts";
-import { clearHold, ensurePullRequest, lastPushed, pushOrMoved, saveHold } from "./effects.ts";
+import { clearHold, ensurePullRequest, findTaskPullRequest, lastPushed, pushOrMoved, saveHold } from "./effects.ts";
 import { effectsOpen } from "./intents.ts";
 
 const ANSWER_IN_MESSAGE = 1500;
@@ -195,6 +196,29 @@ type Published = {
 	readonly pushed: boolean;
 };
 
+async function closedOriginal(ctx: Ctx, taskId: number, branch: string, head: string): Promise<Published | undefined> {
+	const existing = await findTaskPullRequest(ctx, loadTask(ctx, taskId));
+	if (existing === undefined || (existing.state === "open" && !existing.merged)) return undefined;
+	const remote = await ctx.git.remoteBranchSha(branch);
+	return {
+		pr: existing,
+		moved: new BranchMoved(branch, remote ?? null, head, remote === undefined ? "branch_deleted" : "pr_closed"),
+		pushed: false,
+	};
+}
+
+async function publishedResult(
+	ctx: Ctx,
+	pr: PullRequest | undefined,
+	branch: string,
+	head: string,
+): Promise<Published> {
+	const moved = await movedSincePush(ctx, branch, head);
+	if (pr !== undefined && (pr.state !== "open" || pr.merged))
+		return { pr, moved: moved ?? new BranchMoved(branch, pr.headSha || null, head, "pr_closed"), pushed: true };
+	return { pr, moved, pushed: true };
+}
+
 /**
  * After the pull request step, GitHub's branch must still be at the pushed head (Interfaces § Coordinator to GitHub:
  * read GitHub's state). If it moved meanwhile, the review is held instead of posting a head GitHub no longer has. An
@@ -202,7 +226,8 @@ type Published = {
  */
 async function movedSincePush(ctx: Ctx, branch: string, head: string): Promise<BranchMoved | undefined> {
 	const now = await ctx.git.remoteBranchSha(branch).catch(() => head);
-	if (now === undefined || now === head) return undefined;
+	if (now === head) return undefined;
+	if (now === undefined) return new BranchMoved(branch, null, head, "branch_deleted");
 	ctx.log.warn("push_branch_moved_after", { branch });
 	return new BranchMoved(branch, now, head);
 }
@@ -211,10 +236,35 @@ async function movedSincePush(ctx: Ctx, branch: string, head: string): Promise<B
 async function publish(
 	ctx: Ctx,
 	task: TaskRow,
-	p: { branch: string; path: string; head: string; base: string; runNo: number; tests: TestResult; answer: string },
+	p: {
+		runId: number;
+		branch: string;
+		path: string;
+		head: string;
+		base: string;
+		runNo: number;
+		tests: TestResult;
+		answer: string;
+	},
 ): Promise<Published> {
-	const refused = await pushOrMoved(ctx, { branch: p.branch, path: p.path, head: p.head, expected: task.head_commit });
+	// Recover and bind PR history before any push. This also covers a crash after first publication/PR creation
+	// but before either local confirmation was saved, followed by branch deletion and GitHub auto-closing the PR.
+	const closed = await closedOriginal(ctx, task.id, p.branch, p.head);
+	if (closed !== undefined) return closed;
+	const refused = await pushOrMoved(ctx, {
+		branch: p.branch,
+		path: p.path,
+		head: p.head,
+		expected: task.head_commit,
+		mustExist: loadTask(ctx, task.id).pr_number !== null || lastPushed(ctx, task) !== null,
+	});
 	if (refused !== undefined) return { pr: undefined, moved: refused, pushed: false };
+	// Persist confirmed publication before opening/updating a PR: a restart must remember the branch existed even
+	// when its first PR response was lost. This is a checkpoint confirmation, not completion of the review step.
+	tx(ctx, () => {
+		ctx.store.run("UPDATE runs SET checkpoint_commit = ? WHERE id = ?", p.head, p.runId);
+		ctx.store.run("UPDATE tasks SET head_commit = ? WHERE id = ?", p.head, task.id);
+	});
 	const pr =
 		p.head !== p.base
 			? await ensurePullRequest(ctx, task, {
@@ -222,7 +272,7 @@ async function publish(
 					body: pullRequestBody(task, { runNo: p.runNo, tests: p.tests, head: p.head, answer: p.answer }),
 				})
 			: undefined;
-	return { pr, moved: await movedSincePush(ctx, p.branch, p.head), pushed: true };
+	return publishedResult(ctx, pr, p.branch, p.head);
 }
 
 type HeldReview = {
@@ -262,12 +312,25 @@ function setHeldTask(ctx: Ctx, current: TaskRow, runId: number, h: HeldReview, n
 function holdReview(ctx: Ctx, runId: number, h: HeldReview): void {
 	const { moved, pushed: pushedNow } = h.published;
 	const pushed = pushedNow ? h.head : lastPushed(ctx, h.task);
-	const facts = { taskId: h.task.id, branch: moved.branch, github: moved.github, local: h.head, pushed };
+	const prNumber = h.published.pr?.number ?? loadTask(ctx, h.task.id).pr_number ?? undefined;
+	const facts = {
+		taskId: h.task.id,
+		branch: moved.branch,
+		github: moved.github,
+		local: h.head,
+		pushed,
+		cause: moved.cause,
+		prNumber,
+	};
 	tx(ctx, () => {
 		const now = ctx.now();
 		const current = loadTask(ctx, h.task.id);
 		if (TERMINAL_TASK_STATES.has(current.state)) return;
 		setHeldTask(ctx, current, runId, h, now);
+		ctx.store.run(
+			"UPDATE approvals SET state = 'invalidated', reason = 'task review held' WHERE task_id = ? AND state = 'valid'",
+			current.id,
+		);
 		const { taskId, ...rest } = facts;
 		const hold: BranchHold = { kind: "review", runId, interrupted: h.interrupted, ...rest, since: now };
 		if (!saveHold(ctx, taskId, hold)) return;
@@ -289,6 +352,8 @@ export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted
 	if (effectsOpen(ctx.store, run.task_id))
 		throw new UnknownEffect(`the file changes of ${taskRef(run.task_id)} are not reconciled`);
 	const task = loadTask(ctx, run.task_id);
+	// A later interrupted run keeps uncommitted edits for a fresh admitted run. An old review may not publish them.
+	if (task.reason === INTERRUPTED_KEPT_REASON) return;
 	const { worktree_path: path, branch, base_commit: base } = task;
 	if (path === null || branch === null || base === null) {
 		tx(ctx, () => ctx.store.run("UPDATE runs SET review_done = 1 WHERE id = ?", runId));
@@ -298,7 +363,7 @@ export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted
 	const tests = await runTests(ctx, task, path);
 	const head = (await ctx.git.checkpoint(path, `${taskRef(task.id)}: run ${runNo} checkpoint`)).commit;
 	const answer = run.answer ?? "";
-	const published = await publish(ctx, task, { branch, path, head, base, runNo, tests, answer });
+	const published = await publish(ctx, task, { runId, branch, path, head, base, runNo, tests, answer });
 	const { interrupted } = options;
 	if (published.moved !== undefined) {
 		holdReview(ctx, runId, {
@@ -322,4 +387,69 @@ export async function reviewStep(ctx: Ctx, runId: number, options: { interrupted
 		test_files: testFiles.length,
 		interrupted,
 	});
+}
+
+/** Idle published review: hold a deleted branch/closed original PR, without tests or a slot. Revalidate after I/O. */
+export function holdPublishedReview(
+	ctx: Ctx,
+	before: TaskRow,
+	github: string | undefined,
+	pr: PullRequest | undefined,
+): void {
+	tx(ctx, () => {
+		const task = loadTask(ctx, before.id);
+		if (!unchangedIdleReview(ctx, task, before)) return;
+		const run = latestReviewedRun(ctx, task);
+		if (run === undefined || !reviewUnavailable(github, pr)) return;
+		markIdleHeld(ctx, task, run, github, pr);
+	});
+}
+
+function reviewUnavailable(github: string | undefined, pr: PullRequest | undefined): boolean {
+	return github === undefined || (pr !== undefined && (pr.state !== "open" || pr.merged));
+}
+
+function markIdleHeld(
+	ctx: Ctx,
+	task: TaskRow,
+	run: RunRow,
+	github: string | undefined,
+	pr: PullRequest | undefined,
+): void {
+	const head = task.head_commit as string;
+	const moved = new BranchMoved(
+		task.branch as string,
+		github ?? null,
+		head,
+		github === undefined ? "branch_deleted" : "pr_closed",
+	);
+	ctx.store.run("UPDATE runs SET review_done = 0 WHERE id = ?", run.id);
+	const passed = task.tests_passed_head === head;
+	holdReview(ctx, run.id, {
+		task,
+		runNo: runNumber(ctx, run),
+		head,
+		tests: { passed, outcome: passed ? "passed" : "failed" },
+		interrupted: false,
+		published: { pr, moved, pushed: true },
+	});
+}
+
+function unchangedIdleReview(ctx: Ctx, task: TaskRow, before: TaskRow): boolean {
+	return (
+		task.state === "review" &&
+		task.cancel_requested === 0 &&
+		task.head_commit === before.head_commit &&
+		task.generation === before.generation &&
+		task.reason !== INTERRUPTED_KEPT_REASON &&
+		!effectsOpen(ctx.store, task.id)
+	);
+}
+
+function latestReviewedRun(ctx: Ctx, task: TaskRow): RunRow | undefined {
+	if (task.branch === null || task.head_commit === null) return undefined;
+	const run = ctx.store.get<RunRow>("SELECT * FROM runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", task.id);
+	return run?.state === "finished" && run.review_done === 1 && run.checkpoint_commit === task.head_commit
+		? run
+		: undefined;
 }

@@ -7,6 +7,7 @@
  * Interfaces and Storage § Telegram: "Each acknowledgement carries the task ID and queue position. Each rejection
  * gives its reason."
  */
+import type { BranchHoldCause } from "./branch-hold.ts";
 import type { WorktreeChange } from "./git.ts";
 import { DEMO_LIMITS, type Limits } from "./limits.ts";
 
@@ -403,7 +404,9 @@ export type HoldFacts = {
 	readonly taskId: number;
 	readonly branch: string;
 	/** GitHub's branch head when the Coordinator last looked (full sha). */
-	readonly github: string;
+	readonly github: string | null;
+	readonly cause?: BranchHoldCause;
+	readonly prNumber?: number;
 	/** The commit in the task's worktree that waits to be on GitHub (full sha). */
 	readonly local: string;
 	/** The commit the Coordinator last pushed to the branch (full sha); null: it never pushed the branch. */
@@ -411,6 +414,10 @@ export type HoldFacts = {
 };
 
 function holdWhy(p: HoldFacts): string {
+	if (p.github === null)
+		return `Why: branch ${p.branch} was deleted on GitHub. The Coordinator will not recreate an active task's published branch.`;
+	if (p.cause === "pr_closed")
+		return `Why: the original pull request${p.prNumber === undefined ? "" : ` #${p.prNumber}`} is closed or merged on GitHub. A task never gets a replacement pull request.`;
 	if (p.pushed === null) {
 		return (
 			`Why: branch ${p.branch} exists on GitHub (at ${sha7(p.github)}), but the Coordinator has not pushed it yet: ` +
@@ -426,6 +433,14 @@ function holdWhy(p: HoldFacts): string {
 
 /** How to put the branch back where the Coordinator can push again without force. */
 function holdRestore(p: HoldFacts): string[] {
+	if (p.cause === "branch_deleted" || p.cause === "pr_closed") {
+		const original =
+			p.prNumber === undefined ? "the original pull request" : `the original pull request #${p.prNumber}`;
+		return [
+			`What to do: restore branch ${p.branch} at ${sha7(p.pushed ?? p.local)} and reopen ${original}, if it can be reopened.`,
+			`The Coordinator will use that same pull request only. Otherwise /cancel ${p.taskId} and send a new /task for further work.`,
+		];
+	}
 	if (p.pushed === null) {
 		return [
 			`What to do: delete ${p.branch} on GitHub, for example from a clone:`,
@@ -461,6 +476,16 @@ function heldReviewLead(p: HoldFacts & { runNo: number; interrupted: boolean }):
  * branch is restored, the Coordinator pushes the checkpoint and posts it for review.
  */
 export function reviewHeld(p: HoldFacts & { runNo: number; tests: string; interrupted: boolean }): string {
+	if (p.cause === "branch_deleted" || p.cause === "pr_closed") {
+		return [
+			`${taskRef(p.taskId)} is held for review. Nothing was merged.`,
+			holdWhy(p),
+			`Kept: its worktree and checkpoint ${sha7(p.local)}. No replacement pull request will be opened.`,
+			...holdRestore(p),
+			`After restoration the bot posts the result for review again; approve that head then with /approve ${p.taskId}.`,
+			`Until then follow-ups and /approve ${p.taskId} are rejected. The other tasks and the group carry on.`,
+		].join("\n");
+	}
 	const head = sha7(p.local);
 	const pushedIt = p.local === p.pushed;
 	const kept = pushedIt
@@ -505,7 +530,12 @@ function restoredWord(p: HoldFacts): string {
 /** /approve of a task held in review (the reason of the rejection). */
 export function heldApproval(p: HoldFacts): string {
 	const task = taskRef(p.taskId);
-	const seen = `it was at ${sha7(p.github)} when the Coordinator last looked`;
+	if (p.cause === "branch_deleted" || p.cause === "pr_closed")
+		return `${task} is held: ${holdWhy(p).replace(/^Why: /, "")} ${holdRestore(p).join(" ")}`;
+	const seen =
+		p.github === null
+			? "it was missing when the Coordinator last looked"
+			: `it was at ${sha7(p.github)} when the Coordinator last looked`;
 	if (p.local === p.pushed) {
 		return (
 			`branch ${p.branch} of ${task} changed on GitHub outside the Coordinator after ${sha7(p.local)} was pushed ` +
@@ -521,6 +551,8 @@ export function heldApproval(p: HoldFacts): string {
 
 /** For /status <task> and the review reminder of a held task: what it waits for. */
 export function holdNote(p: HoldFacts & { kind: "review" | "archive" }): string {
+	if (p.cause === "branch_deleted" || p.cause === "pr_closed")
+		return `Its worktree is retained and review is held: ${holdWhy(p).replace(/^Why: /, "")} ${holdRestore(p).join(" ")}`;
 	if (p.kind === "archive") {
 		return (
 			`Its worktree is kept until branch ${p.branch} on GitHub is ${restoredWord(p)}: the branch changed outside ` +

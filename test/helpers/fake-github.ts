@@ -136,6 +136,8 @@ export class FakeGitHub {
 	readonly calls: FakeCall[] = [];
 	/** Runs inside the merge handler before GitHub's checks: e.g. move main between the Coordinator's check and merge. */
 	beforeMerge: (() => Promise<void>) | undefined;
+	/** Test-only: close/delete a newly-created PR's branch before its response is delivered or lost. */
+	afterCreate: ((pull: FakePull) => Promise<void>) | undefined;
 	readonly #bare: string;
 	readonly #repo: string;
 	readonly #owner: string;
@@ -323,6 +325,7 @@ export class FakeGitHub {
 			createdAt: new Date().toISOString(),
 		};
 		this.pulls.set(pull.number, pull);
+		await this.afterCreate?.(pull);
 		return { status: 201, body: await this.#json(pull) };
 	}
 

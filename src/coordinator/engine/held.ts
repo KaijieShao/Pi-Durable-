@@ -1,7 +1,8 @@
 /**
  * Tasks held because their branch changed on GitHub outside the Coordinator (branch-hold.ts): look at each held
  * task's branch again every branchRecheckMs, and once GitHub's branch is back where the Coordinator can push without
- * force (it is gone, at the kept commit, or an ancestor of it), redo what waited:
+ * force (at the kept commit or an ancestor; missing is allowed only before first publication or for terminal
+ * preservation), and its original PR is open, redo what waited:
  *   "review":  the run's review step (tests, push, pull request, review message), holding a check slot like a
  *              merge's tests; the task can then be approved at its new head;
  *   "archive": the archive (final push, pull request closed, folder deleted, branch kept).
@@ -10,12 +11,19 @@
  * Nothing is ever force-pushed. Reading the branch is a GitHub read, not a change: a failed read is tried again at the
  * next look, never a freeze. A change whose outcome stays unknown freezes the group as everywhere else.
  */
-import { BRANCH_HOLD_PREFIX, type BranchHold, parseBranchHold } from "../branch-hold.ts";
+import {
+	BRANCH_HOLD_PREFIX,
+	type BranchHold,
+	blocksTaskRuns,
+	parseBranchHold,
+	readBranchHold,
+} from "../branch-hold.ts";
 import { INTERRUPTED_KEPT_REASON } from "../messages.ts";
 import {
 	type Ctx,
 	describeError,
 	groupHeld,
+	loadTask,
 	releaseSlot,
 	reserveCheckSlot,
 	type TaskRow,
@@ -23,9 +31,9 @@ import {
 	taskRef,
 	tx,
 } from "./context.ts";
-import { archiveEnded, clearHold, effectFailed } from "./effects.ts";
+import { archiveEnded, clearHold, effectFailed, findTaskPullRequest } from "./effects.ts";
 import { effectsOpen } from "./intents.ts";
-import { reviewStep } from "./review.ts";
+import { holdPublishedReview, reviewStep } from "./review.ts";
 
 type Held = { readonly taskId: number; readonly hold: BranchHold };
 
@@ -76,6 +84,13 @@ function lookNow(ctx: Ctx, task: TaskRow, hold: BranchHold): boolean {
 	// An interrupted run's changes wait in the worktree for a reply or /cancel: redoing an earlier run's review would
 	// commit and push them.
 	if (task.reason === INTERRUPTED_KEPT_REASON || effectsOpen(ctx.store, task.id)) return false;
+	if (blocksTaskRuns(hold)) {
+		const active = ctx.store.get(
+			"SELECT 1 FROM runs WHERE task_id = ? AND state IN ('starting', 'running', 'finalizing')",
+			task.id,
+		);
+		return ["review", "queued"].includes(task.state) && task.cancel_requested === 0 && active === undefined;
+	}
 	return task.state === "review" && task.cancel_requested === 0 && !hasRunInProgress(ctx, task.id);
 }
 
@@ -83,7 +98,30 @@ function lookNow(ctx: Ctx, task: TaskRow, hold: BranchHold): boolean {
  * Can the Coordinator push `local` without force? GitHub's branch is gone, at `local`, or an ancestor of it (a
  * foreign commit is not in the Coordinator's repository, so it is never an ancestor). undefined: unreadable.
  */
-async function pushable(ctx: Ctx, hold: BranchHold): Promise<{ ok: boolean; github: string | undefined } | undefined> {
+type BranchState = { ok: boolean; github: string | null; cause?: BranchHold["cause"] };
+async function branchReady(ctx: Ctx, task: TaskRow, hold: BranchHold, remote: string | undefined): Promise<boolean> {
+	if (remote === undefined)
+		return hold.kind === "archive" || (hold.pushed === null && task.pr_number === null && !blocksTaskRuns(hold));
+	return remote === hold.local || ctx.git.isAncestor(remote, hold.local).catch(() => false);
+}
+
+async function originalPrReady(ctx: Ctx, task: TaskRow): Promise<boolean | undefined> {
+	const pr = await findTaskPullRequest(ctx, task).catch(() => null);
+	if (pr === null) return undefined;
+	return pr === undefined || (pr.state === "open" && !pr.merged);
+}
+
+async function reviewBranchState(
+	ctx: Ctx,
+	task: TaskRow,
+	remote: string | undefined,
+): Promise<BranchState | undefined> {
+	const ready = await originalPrReady(ctx, task);
+	if (ready === undefined) return undefined;
+	return ready ? { ok: true, github: remote ?? null } : { ok: false, github: remote ?? null, cause: "pr_closed" };
+}
+
+async function pushable(ctx: Ctx, task: TaskRow, hold: BranchHold): Promise<BranchState | undefined> {
 	let remote: string | undefined;
 	try {
 		remote = await ctx.git.remoteBranchSha(hold.branch);
@@ -91,24 +129,29 @@ async function pushable(ctx: Ctx, hold: BranchHold): Promise<{ ok: boolean; gith
 		ctx.log.warn("held_branch_read_failed", { branch: hold.branch, error: describeError(error) });
 		return undefined;
 	}
-	if (remote === undefined || remote === hold.local) return { ok: true, github: remote };
-	return { ok: await ctx.git.isAncestor(remote, hold.local).catch(() => false), github: remote };
+	if (!(await branchReady(ctx, task, hold, remote)))
+		return { ok: false, github: remote ?? null, ...(remote === undefined ? { cause: "branch_deleted" } : {}) };
+	return hold.kind === "review" ? reviewBranchState(ctx, task, remote) : { ok: true, github: remote ?? null };
 }
 
 /** Still changed: keep GitHub's latest head in the hold (shown by /approve and /status); no new message. */
-function stillHeld(ctx: Ctx, taskId: number, hold: BranchHold, github: string | undefined): void {
-	if (github === undefined || github === hold.github) return;
-	tx(ctx, () => ctx.store.setMeta(`${BRANCH_HOLD_PREFIX}${taskId}`, JSON.stringify({ ...hold, github })));
+function stillHeld(ctx: Ctx, taskId: number, hold: BranchHold, state: BranchState): void {
+	const cause = state.cause ?? hold.cause;
+	if (state.github === hold.github && cause === hold.cause) return;
+	tx(ctx, () =>
+		ctx.store.setMeta(`${BRANCH_HOLD_PREFIX}${taskId}`, JSON.stringify({ ...hold, github: state.github, cause })),
+	);
 }
 
 /** Look at the held branch (a read, no slot). Restored: an archive is redone now; a review waits for a check slot. */
 async function lookAgain(ctx: Ctx, taskId: number, hold: BranchHold): Promise<void> {
-	const state = await pushable(ctx, hold);
+	const state = await pushable(ctx, loadTask(ctx, taskId), hold);
 	if (state === undefined) return;
-	if (!state.ok) return stillHeld(ctx, taskId, hold, state.github);
+	if (!state.ok) return stillHeld(ctx, taskId, hold, state);
 	ctx.log.info("held_branch_restored", { task: taskId, kind: hold.kind });
 	// A freeze (or a stop) during the read: nothing more happens now; the next look after the unfreeze decides.
 	if (groupHeld(ctx) || ctx.stopped) return;
+	if (stale(ctx, loadTask(ctx, taskId), hold) || !lookNow(ctx, loadTask(ctx, taskId), hold)) return;
 	if (hold.kind === "review") {
 		ctx.heldRestored.add(taskId);
 		return;
@@ -166,5 +209,45 @@ export function retryHeldTasks(ctx: Ctx, watchdogReady: boolean): boolean {
 	const now = ctx.now();
 	let started = false;
 	for (const held of heldTasks(ctx)) if (startLook(ctx, held, watchdogReady, now)) started = true;
+	for (const task of publishedReviews(ctx)) if (startMonitor(ctx, task, now)) started = true;
 	return started;
+}
+
+/** Normal reviews otherwise perform no GitHub I/O until a command; detect deletion even with no new input. */
+function publishedReviews(ctx: Ctx): TaskRow[] {
+	return ctx.store.all<TaskRow>(
+		`SELECT * FROM tasks WHERE chat_id = ? AND state = 'review' AND cancel_requested = 0
+		 AND branch IS NOT NULL AND worktree_path IS NOT NULL AND head_commit IS NOT NULL
+		 AND NOT EXISTS (SELECT 1 FROM meta WHERE key = 'branch_hold:' || tasks.id)
+		 AND EXISTS (SELECT 1 FROM runs WHERE task_id = tasks.id AND checkpoint_commit IS NOT NULL) ORDER BY id`,
+		ctx.chatId,
+	);
+}
+
+async function monitor(ctx: Ctx, task: TaskRow): Promise<void> {
+	let github: string | undefined;
+	try {
+		github = await ctx.git.remoteBranchSha(task.branch as string);
+	} catch (error) {
+		ctx.log.warn("review_branch_read_failed", { task: task.id, error: describeError(error) });
+		return;
+	}
+	const pr = await findTaskPullRequest(ctx, task).catch(() => undefined);
+	// GitHub may have closed the original PR because its branch disappeared while the first read was in flight.
+	// Re-read the branch before reporting the definite cause; a failed read leaves only the known PR closure.
+	if (pr !== undefined && (pr.state !== "open" || pr.merged))
+		github = await ctx.git.remoteBranchSha(task.branch as string).catch(() => github);
+	if (ctx.stopped || groupHeld(ctx)) return;
+	if (github === undefined || (pr !== undefined && (pr.state !== "open" || pr.merged)))
+		holdPublishedReview(ctx, task, github, pr);
+}
+
+function startMonitor(ctx: Ctx, task: TaskRow, now: number): boolean {
+	if (ctx.busy.has(task.id) || readBranchHold(ctx.store, task.id) !== undefined || hasRunInProgress(ctx, task.id))
+		return false;
+	if (task.reason === INTERRUPTED_KEPT_REASON || effectsOpen(ctx.store, task.id)) return false;
+	if ((ctx.heldDue.get(task.id) ?? 0) > now) return false;
+	ctx.heldDue.set(task.id, now + ctx.branchRecheckMs);
+	ctx.track("branch-watch", task.id, () => monitor(ctx, task));
+	return true;
 }

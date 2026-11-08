@@ -44,6 +44,13 @@ and generated code.
   interrupted run's changes are never committed or pushed at recovery. A push GitHub refuses because a task branch
   was changed outside the Coordinator is a known outcome (nothing was pushed): the Coordinator never force-pushes, and
   only that task waits, with its worktree kept, until the branch is restored.
+  A deleted published branch or closed original PR likewise holds only its active task: periodic review reads take
+  no execution slot, new runs/approvals wait, and restoring requires the original PR. Its number is bound as soon
+  as it is observed, including closed history after a lost response; no replacement PR is opened. An active push
+  uses a private, fixed Coordinator-owned pre-push guard to reject an absent remote OID advertised by that push;
+  receive-pack's old-OID check rejects deletion after advertisement. It is still an ordinary fast-forward push,
+  with no force option, and no repository/project hook runs. Terminal final-checkpoint preservation and archive
+  behavior are unchanged; completed tasks are never monitored as active reviews.
 - **The isolated evaluator** ([the evaluator](#the-isolated-evaluator)) grades a read-only snapshot of main with the
   hidden tests in its own trusted container (no network, no credentials, 2 vCPU / 2 GiB), started only by the
   Coordinator after the owner seals the group, while dispatch is held deployment-wide. The hidden tests are never

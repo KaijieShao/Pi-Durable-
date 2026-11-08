@@ -116,6 +116,8 @@ export type PushTarget = {
 	readonly path: string;
 	readonly head: string;
 	readonly expected: string | null;
+	/** Active tasks already published must not silently recreate a deleted branch. Terminal archives may. */
+	readonly mustExist?: boolean;
 };
 
 /** One push attempt: GitHub holds `head`; not yet (try again); or refused although the branch had not moved. */
@@ -129,6 +131,7 @@ type PushAttempt = "pushed" | "again" | "refused";
  */
 async function classifyRefusal(ctx: Ctx, p: PushTarget, attempt: number): Promise<PushAttempt> {
 	const remote = await ctx.git.remoteBranchSha(p.branch).catch(() => null);
+	if (remote === undefined && p.mustExist) throw new BranchMoved(p.branch, null, p.head, "branch_deleted");
 	if (remote === null || remote === undefined || remote === p.head) return "again";
 	if (remote === p.expected) {
 		ctx.log.warn("push_refused_unexplained", { branch: p.branch, attempt });
@@ -148,8 +151,9 @@ async function pushOnce(ctx: Ctx, p: PushTarget, attempt: number): Promise<PushA
 		return "again";
 	}
 	if (remote === p.head) return "pushed";
+	if (remote === undefined && p.mustExist) throw new BranchMoved(p.branch, null, p.head, "branch_deleted");
 	try {
-		await ctx.git.push(p.path, p.branch);
+		await ctx.git.push(p.path, p.branch, { requireExisting: p.mustExist === true });
 	} catch (error) {
 		if (error instanceof GitError && error.code === "rejected") return classifyRefusal(ctx, p, attempt);
 		ctx.log.warn("push_failed", { branch: p.branch, attempt, error: describeError(error) });
@@ -170,8 +174,9 @@ export async function pushBranch(ctx: Ctx, p: PushTarget): Promise<void> {
 		last = await pushOnce(ctx, p, attempt);
 		if (last === "pushed") return;
 	}
-	const confirmed = await ctx.git.remoteBranchSha(p.branch).catch(() => undefined);
+	const confirmed = await ctx.git.remoteBranchSha(p.branch).catch(() => null);
 	if (confirmed === p.head) return;
+	if (confirmed === undefined && p.mustExist) throw new BranchMoved(p.branch, null, p.head, "branch_deleted");
 	if (last === "refused") throw new UnknownEffect(`GitHub refused the push of ${p.branch}`);
 	throw new UnknownEffect(`the push of ${p.branch} could not be confirmed`);
 }
@@ -209,7 +214,12 @@ export function saveHold(ctx: Ctx, taskId: number, hold: BranchHold): boolean {
 	ctx.heldDue.set(taskId, ctx.now() + ctx.branchRecheckMs);
 	ctx.heldRestored.delete(taskId);
 	return (
-		before === undefined || before.kind !== hold.kind || before.local !== hold.local || before.github !== hold.github
+		before === undefined ||
+		before.kind !== hold.kind ||
+		before.local !== hold.local ||
+		before.github !== hold.github ||
+		before.cause !== hold.cause ||
+		before.prNumber !== hold.prNumber
 	);
 }
 
@@ -228,7 +238,11 @@ export async function findTaskPullRequest(ctx: Ctx, task: TaskRow): Promise<Pull
 	}
 	if (task.branch === null) return undefined;
 	const branch = task.branch;
-	return ghRead(ctx, "pull request lookup", () => ctx.github.findPullRequest(branch, ctx.config.github.baseBranch));
+	const found = await ghRead(ctx, "pull request lookup", () =>
+		ctx.github.findPullRequest(branch, ctx.config.github.baseBranch),
+	);
+	if (found !== undefined) bindPullRequest(ctx, task.id, found);
+	return found;
 }
 
 /** Close an open pull request; a retry first reads it back. */
@@ -267,26 +281,57 @@ export async function ensurePullRequest(
 				return current.state === "open" ? undefined : current;
 			},
 		);
-	let existing = await findTaskPullRequest(ctx, task);
-	if (existing !== undefined && existing.state !== "open" && task.pr_number !== null) {
-		// The recorded PR was closed outside the Coordinator: look for an open one for the same head/base.
-		existing = await ghRead(ctx, "pull request lookup", () => ctx.github.findPullRequest(branch, base));
+	const existing = await findTaskPullRequest(ctx, loadTask(ctx, task.id));
+	if (existing !== undefined) {
+		bindPullRequest(ctx, task.id, existing);
+		return existing.state === "open" && !existing.merged ? update(existing) : existing;
 	}
-	if (existing !== undefined && existing.state === "open") return update(existing);
+	return createTaskPullRequest(ctx, task.id, branch, base, params);
+}
+
+async function createTaskPullRequest(
+	ctx: Ctx,
+	taskId: number,
+	branch: string,
+	base: string,
+	params: { title: string; body: string },
+): Promise<PullRequest | undefined> {
 	try {
-		return await ghChange(
+		const created = await ghChange(
 			ctx,
 			"opening the pull request",
 			() => ctx.github.createPullRequest({ head: branch, base, title: params.title, body: params.body }),
 			async () => {
 				const found = await ctx.github.findPullRequest(branch, base);
-				return found !== undefined && found.state === "open" ? found : undefined;
+				// A closed/merged PR still proves creation happened. Never retry creation in that case.
+				return found;
 			},
 		);
+		bindPullRequest(ctx, taskId, created);
+		return created;
 	} catch (error) {
-		if (error instanceof GitHubError && error.status === 422) return undefined;
+		if (error instanceof GitHubError && error.status === 422) {
+			const found = await ghRead(ctx, "pull request lookup", () => ctx.github.findPullRequest(branch, base));
+			if (found !== undefined) bindPullRequest(ctx, taskId, found);
+			return found;
+		}
 		throw error;
 	}
+}
+
+/** Bind the first observed PR immediately, before later I/O can lose it. The mapping never changes. */
+function bindPullRequest(ctx: Ctx, taskId: number, pr: PullRequest): void {
+	tx(ctx, () => {
+		const current = loadTask(ctx, taskId);
+		if (current.pr_number !== null && current.pr_number !== pr.number)
+			throw new UnknownEffect(`the original pull request of ${taskRef(taskId)} does not match GitHub`);
+		ctx.store.run(
+			"UPDATE tasks SET pr_number = COALESCE(pr_number, ?), pr_url = COALESCE(pr_url, ?) WHERE id = ?",
+			pr.number,
+			pr.url,
+			taskId,
+		);
+	});
 }
 
 export type ArchiveResult = { readonly prClosed: boolean; readonly branchKept: boolean; readonly head: string | null };

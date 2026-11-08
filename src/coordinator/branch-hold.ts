@@ -18,9 +18,12 @@
 import type { Store } from "./store.ts";
 
 export type BranchHoldKind = "review" | "archive";
+export type BranchHoldCause = "branch_moved" | "branch_deleted" | "pr_closed";
 
 export type BranchHold = {
 	readonly kind: BranchHoldKind;
+	/** Older persisted holds have no cause and mean branch_moved. */
+	readonly cause?: BranchHoldCause;
 	/** "review": the run whose review step waits for the push. */
 	readonly runId: number | null;
 	/** "review": that run was interrupted by a restart (its review message says so). */
@@ -31,7 +34,9 @@ export type BranchHold = {
 	/** The commit the Coordinator last pushed to the branch: GitHub must be back there. null: it never pushed it. */
 	readonly pushed: string | null;
 	/** GitHub's branch head when the Coordinator last looked (full sha). */
-	readonly github: string;
+	readonly github: string | null;
+	/** The original PR, including one recovered after a lost creation response. Never replaced. */
+	readonly prNumber?: number;
 	readonly since: number;
 };
 
@@ -58,26 +63,52 @@ function parseJson(value: string): Record<string, unknown> | undefined {
 
 /** The commits of a hold are full shas; `pushed` may be null (never pushed). */
 function validCommits(raw: Record<string, unknown>): boolean {
-	return isSha(raw.local) && isSha(raw.github) && (raw.pushed === null || isSha(raw.pushed));
+	return isSha(raw.local) && (raw.github === null || isSha(raw.github)) && (raw.pushed === null || isSha(raw.pushed));
+}
+
+function validCause(raw: Record<string, unknown>): boolean {
+	return raw.cause === undefined || ["branch_moved", "branch_deleted", "pr_closed"].includes(String(raw.cause));
+}
+
+function validRow(raw: Record<string, unknown>): boolean {
+	return typeof raw.branch === "string" && validCommits(raw);
+}
+
+function optionalFields(raw: Record<string, unknown>): Pick<BranchHold, "cause" | "prNumber"> {
+	return {
+		...(raw.cause === undefined ? {} : { cause: raw.cause as BranchHoldCause }),
+		...(Number.isSafeInteger(raw.prNumber) && Number(raw.prNumber) > 0 ? { prNumber: Number(raw.prNumber) } : {}),
+	};
+}
+
+function holdKind(value: unknown): BranchHoldKind | undefined {
+	return value === "review" || value === "archive" ? value : undefined;
 }
 
 /** The parsed hold, or undefined for a value that is not one (never throws). */
 export function parseBranchHold(value: string | undefined): BranchHold | undefined {
 	const raw = value === undefined ? undefined : parseJson(value);
-	if (raw === undefined || typeof raw.branch !== "string" || !validCommits(raw)) return undefined;
-	const kind = raw.kind === "review" || raw.kind === "archive" ? raw.kind : undefined;
+	if (raw === undefined || !validRow(raw)) return undefined;
+	const kind = holdKind(raw.kind);
 	const runId = typeof raw.runId === "number" ? raw.runId : null;
 	if (kind === undefined || (kind === "review" && runId === null)) return undefined;
+	if (!validCause(raw)) return undefined;
 	return {
 		kind,
+		...optionalFields(raw),
 		runId,
 		interrupted: raw.interrupted === true,
-		branch: raw.branch,
+		branch: raw.branch as string,
 		local: raw.local as string,
 		pushed: raw.pushed as string | null,
-		github: raw.github as string,
+		github: raw.github as string | null,
 		since: typeof raw.since === "number" ? raw.since : 0,
 	};
+}
+
+/** Definite deletion/closed PR: new runs wait too; a moved-but-existing branch keeps the Phase 2b behavior. */
+export function blocksTaskRuns(hold: BranchHold | undefined): boolean {
+	return hold?.kind === "review" && (hold.cause === "branch_deleted" || hold.cause === "pr_closed");
 }
 
 export function readBranchHold(store: Store, taskId: number): BranchHold | undefined {

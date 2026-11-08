@@ -8,7 +8,7 @@
 import { statSync } from "node:fs";
 import { redact } from "../../runtime/redact.ts";
 import { type SweepRow, WATCHDOG_PID_KEY } from "../../watchdog/protocol.ts";
-import { readBranchHold } from "../branch-hold.ts";
+import { type BranchHold, readBranchHold } from "../branch-hold.ts";
 import { evaluationLines } from "../evaluation.ts";
 import { DEMO_LIMITS } from "../limits.ts";
 import { formatBytes } from "../messages.ts";
@@ -114,14 +114,23 @@ function heldLines(store: Store, chatId: number): string[] {
 	for (const { id } of ids) {
 		const hold = readBranchHold(store, id);
 		if (hold === undefined) continue;
-		const target = hold.pushed === null ? "deleted" : `back at ${hold.pushed.slice(0, 7)}`;
-		lines.push(
-			`  #${id} ${hold.kind}: ${hold.branch} on GitHub at ${hold.github.slice(0, 7)}; ${hold.local.slice(0, 7)} waits ` +
-				`in the worktree until the branch is ${target}`,
-		);
+		lines.push(heldLine(id, hold));
 	}
 	if (lines.length === 0) return [];
 	return ["Held tasks (their branch changed on GitHub outside the Coordinator):", ...lines];
+}
+
+function heldLine(id: number, hold: BranchHold): string {
+	if (hold.cause === "branch_deleted" || hold.cause === "pr_closed")
+		return (
+			`  #${id} review: ${hold.branch} ${hold.github === null ? "deleted" : `at ${hold.github.slice(0, 7)}`}; ` +
+			`${hold.local.slice(0, 7)} retained; restore branch and reopen original PR${hold.prNumber === undefined ? "" : ` #${hold.prNumber}`}; no replacement PR`
+		);
+	const target = hold.pushed === null ? "deleted" : `back at ${hold.pushed.slice(0, 7)}`;
+	return (
+		`  #${id} ${hold.kind}: ${hold.branch} on GitHub at ${hold.github?.slice(0, 7) ?? "missing"}; ${hold.local.slice(0, 7)} waits ` +
+		`in the worktree until the branch is ${target}`
+	);
 }
 
 function groupLine(store: Store, chatId: number): string {

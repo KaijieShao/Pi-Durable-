@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **One PR per task after branch deletion:** published active branches cannot be recreated by a racing push;
+  original PR identity survives lost responses, closure and restart. Idle reviews detect deletion/closure without
+  an execution slot, hold only that task, and require restoring the same PR. Final preservation/archive of ended
+  tasks is unchanged.
+
 - **Sealing and the isolated evaluator** (the trial harness): `owner seal [<group>] [--trial <id>] [--tasks <id,...>]`
   seals the group once the trial's tasks (named, or every task since the last evaluation) have merged. Dispatch,
   merges and follow-up delivery are then held deployment-wide (new `/task` requests and replies are saved and queued),

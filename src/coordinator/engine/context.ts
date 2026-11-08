@@ -6,6 +6,7 @@
 import { join } from "node:path";
 import type { FromRunner } from "../../runner/protocol.ts";
 import type { Logger } from "../../runtime/log.ts";
+import type { BranchHoldCause } from "../branch-hold.ts";
 import type { CoordinatorConfig } from "../config.ts";
 import type { DiskProbe, DiskSettings } from "../disk.ts";
 import { deploymentHeld } from "../evaluation.ts";
@@ -317,15 +318,17 @@ export class UnknownEffect extends Error {
 export class BranchMoved extends Error {
 	readonly branch: string;
 	/** GitHub's branch head (full sha). */
-	readonly github: string;
+	readonly github: string | null;
 	/** The commit the Coordinator was pushing or had just pushed (full sha). */
 	readonly local: string;
-	constructor(branch: string, github: string, local: string) {
+	override readonly cause: BranchHoldCause;
+	constructor(branch: string, github: string | null, local: string, cause: BranchHoldCause = "branch_moved") {
 		super(`branch ${branch} changed on GitHub outside the Coordinator`);
 		this.name = "BranchMoved";
 		this.branch = branch;
 		this.github = github;
 		this.local = local;
+		this.cause = cause;
 	}
 }
 

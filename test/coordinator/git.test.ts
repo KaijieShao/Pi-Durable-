@@ -169,6 +169,35 @@ test("push of a non-fast-forward is rejected with code 'rejected' and leaves the
 	assert.equal(pushRejection("=\tHEAD:refs/heads/t\t[up to date]\n"), undefined);
 });
 
+test("an existing-only normal push cannot recreate a ref deleted after its pre-read; trusted guard is cleaned", async () => {
+	const s = await setup(),
+		{ path, branch } = await withWorktree(s);
+	writeFileSync(join(path, "b.txt"), "one\n");
+	await s.git.checkpoint(path, "first");
+	await assert.rejects(
+		s.git.push(path, branch, { requireExisting: true }),
+		(error: unknown) => error instanceof GitError && error.code === "rejected",
+	);
+	assert.equal(await s.git.remoteBranchSha(branch), undefined);
+	await s.git.push(path, branch);
+	writeFileSync(join(path, "b.txt"), "two\n");
+	const next = await s.git.checkpoint(path, "next");
+	await s.git.push(path, branch, { requireExisting: true });
+	assert.equal(await s.git.remoteBranchSha(branch), next.commit, "existing refs still fast-forward normally");
+	// The engine already read a published head, but it disappears before the actual push connection advertises refs.
+	assert.equal(await s.git.remoteBranchSha(branch), next.commit);
+	await originGit(s.bare, ["update-ref", "-d", `refs/heads/${branch}`]);
+	await assert.rejects(
+		s.git.push(path, branch, { requireExisting: true }),
+		(error: unknown) => error instanceof GitError && error.code === "rejected",
+	);
+	assert.equal(await s.git.remoteBranchSha(branch), undefined, "the guard rejects creation, with no force flag");
+	assert.deepEqual(
+		readdirSync(s.repoDir).filter((name) => name.startsWith("pi-push-guard-")),
+		[],
+	);
+});
+
 test("mergeBase: branch already contains main → no commit, moved false", async () => {
 	const s = await setup();
 	const { path } = await withWorktree(s);
@@ -416,7 +445,7 @@ test("repository hooks, outside config, inherited git env and .gitattributes fil
 		await s.git.diffSummary(path, base, 10_000);
 		writeFileSync(join(path, "a.txt"), "one\nresolved\n");
 		await s.git.checkpoint(path, "fix");
-		await s.git.push(path, branch);
+		await s.git.push(path, branch, { requireExisting: true });
 		await s.git.removeWorktree(path);
 	} finally {
 		for (const name of Object.keys(process.env)) if (!(name in saved)) delete process.env[name];

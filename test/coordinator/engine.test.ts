@@ -192,10 +192,11 @@ function createWorld() {
 			entry.mergeParent = undefined;
 			return { commit: entry.head, created: true };
 		},
-		async push(path, branch) {
+		async push(path, branch, options) {
 			calls.push("push");
 			const entry = wt(path);
 			const current = remote.get(branch);
+			if (current === undefined && options?.requireExisting) throw new GitError("rejected", "branch was deleted");
 			if (current !== undefined && !isAncestor(current, entry.head)) throw new GitError("rejected", "non-fast-forward");
 			remote.set(branch, entry.head);
 		},
@@ -1945,6 +1946,8 @@ test("branch changed outside the Coordinator, then a follow-up run: its checkpoi
 	assert.deepEqual([run2.state, run2.review_done, run2.checkpoint_commit], ["finished", 0, null]);
 	assert.deepEqual(holdOf(h, taskId), {
 		kind: "review",
+		cause: "branch_moved",
+		prNumber: 1,
 		runId: run2.id,
 		interrupted: false,
 		branch,
@@ -3188,4 +3191,263 @@ test("two new worktrees checked at the same time with room for one: one is let t
 	await h.engine.idle();
 	assert.deepEqual([taskRow(h, a).state, taskRow(h, b).state], ["review", "review"]);
 	assert.equal(diskWaits(h, held as number).length, 1);
+});
+
+// Phase 2c: one PR for the lifetime of a task, including deletion and closed-history recovery.
+function deletePublishedBranch(h: Harness, taskId: number): string {
+	const task = taskRow(h, taskId);
+	const head = h.world.remote.get(task.branch as string) as string;
+	const pr = h.world.pulls.get(task.pr_number as number);
+	assert.ok(pr);
+	pr.frozenHead = head;
+	pr.state = "closed";
+	h.world.remote.delete(task.branch as string);
+	return head;
+}
+
+test("a deleted idle published branch is held without a slot or second PR; only the original reopened PR restores it", async (t) => {
+	const clock = { later: 0 },
+		counts = { checks: 0 };
+	const h = await harness(t, {
+		now: () => Date.now() + clock.later,
+		sandbox: (local) => ({
+			...local,
+			async runCheck(spec) {
+				counts.checks++;
+				return local.runCheck(spec);
+			},
+		}),
+	});
+	const id = await runToReview(h);
+	const before = taskRow(h, id),
+		head = deletePublishedBranch(h, id);
+	await nextHeldLook(h, clock);
+	assert.equal(holdOf(h, id)?.cause, "branch_deleted");
+	assert.equal(holdOf(h, id)?.github, null);
+	assert.equal(holdOf(h, id)?.prNumber, before.pr_number);
+	assert.equal(taskRow(h, id).worktree_path, before.worktree_path);
+	assert.equal(h.world.remote.get(before.branch as string), undefined);
+	assert.equal(count(h.world.calls, "createPullRequest"), 1);
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+	assert.equal(slotCount(h), 0);
+	assert.match(messages(h, "task_held")[0]?.text ?? "", /deleted on GitHub/);
+	const checks = counts.checks;
+	await nextHeldLook(h, clock);
+	h.world.remote.set(before.branch as string, head);
+	await nextHeldLook(h, clock);
+	assert.equal(counts.checks, checks, "a closed original PR never starts another review/check slot");
+	assert.equal(messages(h, "task_held").length, 1, "one hold notification, no spin");
+	const other = await runToReview(h, "beta", "other task proceeds");
+	assert.equal(taskRow(h, other).state, "review");
+	const original = h.world.pulls.get(before.pr_number as number);
+	assert.ok(original);
+	original.state = "open";
+	original.frozenHead = undefined;
+	await nextHeldLook(h, clock);
+	assert.equal(holdOf(h, id), undefined);
+	assert.equal(taskRow(h, id).pr_number, before.pr_number);
+	assert.equal(count(h.world.calls, "createPullRequest"), 2, "one PR for each of two tasks");
+	assert.equal(taskRow(h, id).posted_head, head);
+	approve(h, id);
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(taskRow(h, id).state, "merged");
+	h.world.remote.delete(before.branch as string);
+	await nextHeldLook(h, clock);
+	assert.equal(holdOf(h, id), undefined, "completed merged tasks are never monitored or recreated");
+	assert.equal(h.world.remote.get(before.branch as string), undefined);
+});
+
+test("deleted branch hold survives restart without republishing or another PR", async (t) => {
+	const clock = { later: 0 };
+	const h1 = await harness(t, { now: () => Date.now() + clock.later });
+	const id = await runToReview(h1);
+	deletePublishedBranch(h1, id);
+	await nextHeldLook(h1, clock);
+	const pushes = count(h1.world.calls, "push");
+	await h1.engine.stop();
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world, now: () => Date.now() + clock.later });
+	await h2.engine.recover();
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(holdOf(h2, id)?.cause, "branch_deleted");
+	assert.equal(h2.world.remote.get(`task/${id}`), undefined);
+	assert.equal(count(h2.world.calls, "push"), pushes);
+	assert.equal(count(h2.world.calls, "createPullRequest"), 1);
+	assert.equal(messages(h2, "task_held").length, 1);
+	assert.equal(h2.fake.runs.length, 0, "the interrupted/reviewed task never starts a model run");
+});
+
+test("lost PR creation response followed by closure/deletion confirms the original PR instead of creating or pushing again", async (t) => {
+	const h = await harness(t);
+	const create = h.world.github.createPullRequest;
+	h.world.github.createPullRequest = async (params) => {
+		const pr = await create(params);
+		const original = h.world.pulls.get(pr.number);
+		assert.ok(original);
+		original.frozenHead = pr.headSha;
+		original.state = "closed";
+		h.world.remote.delete(params.head);
+		throw new GitHubError("lost creation response", undefined, true);
+	};
+	const id = await runToReview(h);
+	assert.equal(taskRow(h, id).pr_number, 1);
+	assert.equal(holdOf(h, id)?.cause, "branch_deleted");
+	assert.equal(h.world.remote.get(`task/${id}`), undefined);
+	assert.equal(count(h.world.calls, "createPullRequest"), 1);
+	assert.equal(count(h.world.calls, "push"), 1, "no push after the original branch disappeared");
+	assert.equal(h.store.groupState(CHAT).state, "normal");
+});
+
+test("restart with an unsaved original PR and push confirmation recovers closed history before any push", async (t) => {
+	const h1 = await harness(t),
+		id = await runToReview(h1);
+	deletePublishedBranch(h1, id);
+	h1.store.tx(() => {
+		h1.store.run(
+			"UPDATE tasks SET pr_number = NULL, pr_url = NULL, head_commit = base_commit, posted_head = NULL WHERE id = ?",
+			id,
+		);
+		h1.store.run("UPDATE runs SET checkpoint_commit = NULL, review_done = 0 WHERE task_id = ?", id);
+	});
+	const pushes = count(h1.world.calls, "push");
+	await h1.engine.stop();
+	const h2 = await harness(t, { store: h1.store, dir: h1.dir, world: h1.world });
+	await h2.engine.recover();
+	h2.engine.kick();
+	await h2.engine.idle();
+	assert.equal(taskRow(h2, id).pr_number, 1);
+	assert.equal(holdOf(h2, id)?.cause, "branch_deleted");
+	assert.equal(h2.world.remote.get(`task/${id}`), undefined, "history prevents recreating the deleted branch");
+	assert.equal(count(h2.world.calls, "push"), pushes);
+	assert.equal(count(h2.world.calls, "createPullRequest"), 1);
+});
+
+test("deletion between a follow-up push and its confirmation never retries a branch creation", async (t) => {
+	const h = await harness(t),
+		id = await runToReview(h);
+	const push = h.world.git.push;
+	let deleted = false;
+	h.world.git.push = async (path, branch) => {
+		await push(path, branch);
+		if (!deleted && branch === `task/${id}`) {
+			deleted = true;
+			deletePublishedBranch(h, id);
+		}
+	};
+	h.fake.control.script = workScript("more.js", "exports.more=1;\n");
+	followupRun(h, id, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(holdOf(h, id)?.cause, "branch_deleted");
+	assert.equal(h.world.remote.get(`task/${id}`), undefined);
+	assert.equal(count(h.world.calls, "push"), 2, "only the initial push and the now-deleted follow-up push");
+	assert.equal(count(h.world.calls, "createPullRequest"), 1);
+	assert.equal(await readFile(join(taskRow(h, id).worktree_path as string, "more.js"), "utf8"), "exports.more=1;\n");
+});
+
+test("a branch deleted during PR update is held and the known PR is never replaced by another open PR", async (t) => {
+	const clock = { later: 0 },
+		h = await harness(t, { now: () => Date.now() + clock.later }),
+		id = await runToReview(h);
+	const update = h.world.github.updatePullRequest;
+	h.world.github.updatePullRequest = async (number, params) => {
+		const result = await update(number, params);
+		deletePublishedBranch(h, id);
+		return result;
+	};
+	h.fake.control.script = workScript("more.js", "exports.more=1;\n");
+	followupRun(h, id, "more");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(holdOf(h, id)?.cause, "branch_deleted");
+	assert.equal(h.world.remote.get(`task/${id}`), undefined);
+	const original = h.world.pulls.get(1);
+	assert.ok(original);
+	h.world.pulls.set(99, { ...original, number: 99, state: "open", frozenHead: undefined });
+	// An owner-created alternative never changes the task's recorded original identity.
+	h.world.remote.set(`task/${id}`, original.frozenHead as string);
+	const before = count(h.world.calls, "createPullRequest");
+	await nextHeldLook(h, clock);
+	assert.equal(taskRow(h, id).pr_number, 1);
+	assert.equal(count(h.world.calls, "createPullRequest"), before);
+	assert.equal(holdOf(h, id)?.cause, "pr_closed");
+});
+
+for (const outcome of ["cancelled", "failed"] as const) {
+	test(`a ${outcome} task still saves its final work and archives when its formerly published branch was deleted`, async (t) => {
+		const h = await harness(t),
+			id = await runToReview(h);
+		h.fake.control.script = holdScript();
+		const run = followupRun(h, id, "work before ending");
+		h.engine.kick();
+		await waitFor(() => h.fake.runs[1]?.received.some((m) => m.type === "tool_result"), { what: "follow-up write" });
+		deletePublishedBranch(h, id);
+		if (outcome === "cancelled") requestCancel(h, id);
+		else h.engine.onRunLimit(run, "context_limit");
+		h.engine.kick();
+		await h.engine.idle();
+		assert.equal(taskRow(h, id).state, outcome);
+		assert.equal(taskRow(h, id).worktree_path, null);
+		const head = h.world.remote.get(`task/${id}`);
+		assert.ok(head);
+		assert.equal(h.world.files(head).get("wip.txt"), "work in progress\n");
+		assert.equal(count(h.world.calls, "createPullRequest"), 1);
+		assert.equal(taskRow(h, id).pr_number, 1);
+	});
+}
+
+for (const change of ["followup", "cancel"] as const) {
+	test(`idle monitor rereads task state after remote I/O and never overwrites a concurrent ${change}`, async (t) => {
+		const clock = { later: 0 },
+			h = await harness(t, { now: () => Date.now() + clock.later });
+		const id = await runToReview(h),
+			read = h.world.git.remoteBranchSha;
+		let reached = false,
+			release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let once = true;
+		h.world.git.remoteBranchSha = async (branch) => {
+			if (once && branch === `task/${id}`) {
+				once = false;
+				reached = true;
+				await gate;
+				return undefined;
+			}
+			return read(branch);
+		};
+		clock.later += 31_000;
+		h.engine.kick();
+		await waitFor(() => reached, { what: "monitor read" });
+		if (change === "followup") followupRun(h, id, "follow-up during read");
+		else requestCancel(h, id);
+		release();
+		await h.engine.idle();
+		assert.equal(holdOf(h, id), undefined, "the stale missing-branch observation is discarded");
+		assert.equal(taskRow(h, id).state, change === "followup" ? "review" : "cancelled");
+		assert.equal(count(h.world.calls, "createPullRequest"), 1);
+		assert.equal(messages(h, "task_held").length, 0);
+	});
+}
+
+test("idle monitoring never republishes an interrupted task's uncommitted work or open effect evidence", async (t) => {
+	const clock = { later: 0 },
+		h = await harness(t, { now: () => Date.now() + clock.later });
+	const id = await runToReview(h),
+		path = taskRow(h, id).worktree_path as string;
+	await writeFile(join(path, "uncertain.txt"), "kept, not a checkpoint\n");
+	deletePublishedBranch(h, id);
+	const pushes = count(h.world.calls, "push"),
+		checkpoints = count(h.world.calls, "checkpoint");
+	h.store.run("UPDATE tasks SET reason = ? WHERE id = ?", INTERRUPTED_KEPT_REASON, id);
+	await nextHeldLook(h, clock);
+	h.store.run("UPDATE tasks SET reason = NULL WHERE id = ?", id);
+	h.store.setMeta(`restart_interrupted:${id}`, String(runsOf(h, id)[0]?.id));
+	await nextHeldLook(h, clock);
+	assert.equal(holdOf(h, id), undefined);
+	assert.equal(count(h.world.calls, "push"), pushes);
+	assert.equal(count(h.world.calls, "checkpoint"), checkpoints);
+	assert.equal(await readFile(join(path, "uncertain.txt"), "utf8"), "kept, not a checkpoint\n");
 });

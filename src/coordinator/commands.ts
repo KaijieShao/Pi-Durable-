@@ -19,7 +19,7 @@
 import type { Update } from "grammy/types";
 import type { Logger } from "../runtime/log.ts";
 import { admitRun, agentQueuePosition, openTaskCount, waitingCapReason, waitingCounts } from "./admission.ts";
-import { type BranchHold, readBranchHold } from "./branch-hold.ts";
+import { type BranchHold, blocksTaskRuns, readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import {
 	type BootDiskCheck,
@@ -360,6 +360,8 @@ function followupBlocker(store: Store, ctx: CommandContext, task: TaskRow, reply
 	if (group.state === "frozen") return ["frozen", frozenNotice(group.reason)];
 	const state = followupStateBlocker(task);
 	if (state !== undefined) return state;
+	const hold = readBranchHold(store, task.id);
+	if (blocksTaskRuns(hold) && hold !== undefined) return ["branch_held", heldApproval(holdFacts(task.id, hold))];
 	const text = reply.text.trim();
 	if (text === "") return ["empty", emptyText("follow-up")];
 	if (text.length > limits.followUpChars) return ["too_long", tooLong("follow-up", text.length, limits.followUpChars)];
@@ -633,7 +635,15 @@ function reviewBlocker(store: Store, task: TaskRow): Blocker | undefined {
 }
 
 function holdFacts(taskId: number, hold: BranchHold) {
-	return { taskId, branch: hold.branch, github: hold.github, local: hold.local, pushed: hold.pushed };
+	return {
+		taskId,
+		branch: hold.branch,
+		github: hold.github,
+		local: hold.local,
+		pushed: hold.pushed,
+		cause: hold.cause,
+		prNumber: hold.prNumber,
+	};
 }
 
 function staleHeadBlocker(task: TaskRow): Blocker {

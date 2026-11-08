@@ -34,6 +34,7 @@
 
 import { UNVERIFIED_SWEEP } from "../../watchdog/protocol.ts";
 import { agentQueuePosition } from "../admission.ts";
+import { blocksTaskRuns, readBranchHold } from "../branch-hold.ts";
 import { INTERRUPTED_KEPT_REASON, interruptedKept, requeuedAfterRestart, sha7 } from "../messages.ts";
 import type { RunnerRef } from "../ports.ts";
 import {
@@ -602,6 +603,9 @@ async function reportInterrupted(ctx: Ctx, job: Extract<RecoveryJob, { kind: "in
 export async function runRecoveryJob(ctx: Ctx, job: RecoveryJob): Promise<void> {
 	if (job.kind === "worktree") return reconcileFirstWorktree(ctx, job.taskId);
 	await settleTaskEffects(ctx, job.taskId);
+	// Deleted published branches and closed original PRs wait for a read-only restoration check. Do not reserve a
+	// recovery test slot or republish them at every restart; held.ts owns the retry after the original PR reopens.
+	if (job.kind === "review" && blocksTaskRuns(readBranchHold(ctx.store, job.taskId))) return;
 	if (job.kind === "effects") return;
 	if (job.kind === "interrupted") return reportInterrupted(ctx, job);
 	if (job.kind === "archive") {

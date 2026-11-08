@@ -464,13 +464,16 @@ function combinePushRefused(
 		intentState: "failed",
 		reason: BRANCH_CHANGED_REASON,
 		kind: "merge_rejected",
-		text: approvalBranchChanged({
-			taskId: task.id,
-			branch: p.moved.branch,
-			approvedHead: p.approval.head_commit,
-			githubHead: p.moved.github,
-			combined: p.combined,
-		}),
+		text:
+			p.moved.github === null
+				? `Approval of ${taskRef(task.id)} rejected; nothing was merged. Branch ${p.moved.branch} was deleted on GitHub; restore it and reopen the original pull request before approving again. No replacement pull request will be opened.`
+				: approvalBranchChanged({
+						taskId: task.id,
+						branch: p.moved.branch,
+						approvedHead: p.approval.head_commit,
+						githubHead: p.moved.github,
+						combined: p.combined,
+					}),
 	});
 }
 
@@ -482,7 +485,7 @@ async function combineWithMain(ctx: Ctx, task: TaskRow, approval: ApprovalRow, i
 	const head = result.commit;
 	const tests = await runTests(ctx, task, path);
 	const branch = task.branch as string;
-	const moved = await pushOrMoved(ctx, { branch, path, head, expected: task.head_commit });
+	const moved = await pushOrMoved(ctx, { branch, path, head, expected: task.head_commit, mustExist: true });
 	if (moved !== undefined) return combinePushRefused(ctx, task, { approval, intentId, moved, combined: head });
 	const passedHead = tests.passed ? head : null;
 	tx(ctx, () => {

@@ -1,16 +1,16 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { errorSummary, type Logger } from "../runtime/log.ts";
 import { redact } from "../runtime/redact.ts";
 
 /**
  * The only place that runs git (Architecture § Git repository and GitHub). The project code is untrusted, so every
- * invocation disables hooks, fsmonitor, system/global config and in-tree attributes (no clean/smudge filters, diff
+ * invocation disables project hooks, fsmonitor, system/global config and in-tree attributes (no clean/smudge filters, diff
  * or merge drivers), never discovers a repository on its own (explicit --git-dir everywhere) and starts from an empty
- * environment. The GitHub token reaches git only through GIT_CONFIG_COUNT environment variables of network
+ * environment. Existing-only pushes enable only the Coordinator's fixed private ref-existence guard. The GitHub token reaches git only through GIT_CONFIG_COUNT environment variables of network
  * operations: never argv, a URL, the repository config or a log line.
  *
  * Layout: a bare repository at `<taskDir>/repo.git` (main fetched into `refs/remotes/origin/<base>`), one linked
@@ -66,7 +66,7 @@ export type Git = {
 	/** Stage everything (untracked included, .gitignore respected) and commit if anything changed or a merge is open. */
 	checkpoint(path: string, message: string): Promise<{ commit: string; created: boolean }>;
 	/** Push HEAD to refs/heads/<branch>; never forced. Non-fast-forward → GitError "rejected". */
-	push(path: string, branch: string): Promise<void>;
+	push(path: string, branch: string, options?: { readonly requireExisting?: boolean }): Promise<void>;
 	/** Merge the fetched base (`baseRef`) into the worktree's branch with a merge commit. */
 	mergeBase(path: string): Promise<MergeBaseResult>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
@@ -124,6 +124,21 @@ const CHECKOUT_BLOCK_BYTES = 4096;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const TRUNCATED = "\n[truncated]";
+
+/** The only enabled hook is Coordinator-owned, private and fixed; it never reads its remote/token arguments.
+ * Git supplies the remote OID advertised for this very push. Missing at advertisement → reject; deleted after the
+ * advertisement → receive-pack's old-OID comparison rejects. No force option or project hook is involved.
+ */
+const REQUIRE_EXISTING_REF = [
+	"#!/bin/sh",
+	`blocked() { : > "\${0%/*}/rejected"; exit 1; }`,
+	"while read -r local_ref local_oid remote_ref remote_oid; do",
+	"  case \"$remote_oid\" in ''|*[!0-9a-fA-F]*) blocked ;; esac",
+	'  case "$remote_oid" in *[!0]*) ;; *) blocked ;; esac',
+	"done",
+	"exit 0",
+	"",
+].join("\n");
 
 export function isLocalRemote(remoteUrl: string): boolean {
 	return remoteUrl.startsWith("file://") || isAbsolute(remoteUrl);
@@ -625,13 +640,41 @@ export function createGit(options: GitOptions): Git {
 		return { commit: await revParse(wt, "HEAD"), created: true };
 	}
 
-	async function pushHead(path: string, branch: string): Promise<void> {
+	async function pushHead(path: string, branch: string, requireExisting: boolean): Promise<void> {
 		assertBranch(branch);
 		const wt = await worktreeArgs(path);
+		if (!requireExisting) return pushUsing(wt, branch);
+		const guard = await mkdtemp(join(repoDir, "pi-push-guard-"));
+		try {
+			await writeFile(join(guard, "pre-push"), REQUIRE_EXISTING_REF, { mode: 0o700, flag: "wx" });
+			await pushUsing(wt, branch, guard);
+		} finally {
+			await rm(guard, { recursive: true, force: true });
+		}
+	}
+
+	async function pushUsing(wt: readonly string[], branch: string, guard?: string): Promise<void> {
+		const hook = guard === undefined ? [] : ["-c", `core.hooksPath=${guard}`];
+		const verify = guard === undefined ? ["--no-verify"] : [];
 		const result = await exec(
-			[...wt, "push", "--porcelain", "--no-verify", "--recurse-submodules=no", remoteUrl, `HEAD:refs/heads/${branch}`],
+			[
+				...wt,
+				...hook,
+				"push",
+				"--porcelain",
+				...verify,
+				"--recurse-submodules=no",
+				remoteUrl,
+				`HEAD:refs/heads/${branch}`,
+			],
 			{ op: "push", network: true, okCodes: [0, 1] },
 		);
+		if (guard !== undefined && existsSync(join(guard, "rejected")))
+			throw new GitError("rejected", "push rejected: the published branch no longer exists", { exitCode: result.code });
+		checkPush(result);
+	}
+
+	function checkPush(result: ExecResult): void {
 		if (result.code === 0) return;
 		const reason = pushRejection(result.stdout);
 		if (reason === undefined)
@@ -778,7 +821,8 @@ export function createGit(options: GitOptions): Git {
 		deleteBranch: (branch, createdAt) => serialized("repo", () => dropBranch(branch, createdAt)),
 		head: (path) => serialized(wtKey(path), async () => revParse(await worktreeArgs(path), "HEAD")),
 		checkpoint: (path, message) => serialized(wtKey(path), () => commitAll(path, message)),
-		push: (path, branch) => serialized(wtKey(path), () => pushHead(path, branch)),
+		push: (path, branch, pushOptions = {}) =>
+			serialized(wtKey(path), () => pushHead(path, branch, pushOptions.requireExisting === true)),
 		mergeBase: (path) => serialized(wtKey(path), () => merge(path)),
 		isAncestor: async (ancestorRev, descendant) => {
 			assertRev(ancestorRev);

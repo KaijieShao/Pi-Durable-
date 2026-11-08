@@ -232,6 +232,14 @@ from the bot quote the command or message they answer.
      refused its final push."); once the branch is restored the bot pushes the final checkpoint and archives it
      ("Task 3 cancelled. Pull request closed; branch task/3 kept."). The Coordinator looks at such a branch again
      every 30 seconds; `/status@smule_code_bot 3` and `owner status` show what it waits for.
+   - **Deleted published branch or closed original PR:** normal reviews are also checked every 30 seconds, without
+     taking an execution slot. Only that task is held and the group is told. Its worktree stays; new follow-ups and
+     approvals are rejected until you restore the branch and reopen **the same original PR**. A closed PR found
+     after a lost creation response still counts as the task's one PR. The Coordinator never creates a replacement
+     or automatically adopts another PR. If the original PR cannot reopen, cancel the task and use a new `/task`.
+     Active-task pushes use an existing-ref guard against deletion during the push connection, without force or
+     project hooks. Cancellation or failure still saves its final checkpoint before archiving (a terminal task's
+     preservation push may recreate its branch); already archived/merged tasks are not monitored or republished.
 
 ## Privacy mode
 
