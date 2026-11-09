@@ -2,7 +2,12 @@
   "apply": false,
   "policy": {
     "roots": ["/mnt/pi-durable-tasks/formal-acceptance", "/var/lib/pi-durable-completed-trials"],
-    "protectedPaths": ["/var/lib/pi-durable", "/mnt/pi-durable-tasks/repo", "/mnt/pi-durable-tasks/worktrees"],
+    "protectedPaths": [
+      "/var/lib/pi-durable",
+      "/mnt/pi-durable-tasks/repo",
+      "/mnt/pi-durable-tasks/repo.git",
+      "/mnt/pi-durable-tasks/worktrees"
+    ],
     "retentionMs": {
       "trial": 604800000,
       "test-artifact": 604800000,
