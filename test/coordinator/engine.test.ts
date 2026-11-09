@@ -3039,8 +3039,8 @@ const GiB = 1024 ** 3;
 function taskDiskProbe(initialFree: number): { probe: DiskProbe; state: { free: number; fail: boolean } } {
 	const state = { free: initialFree, fail: false };
 	const probe: DiskProbe = {
-		space: () => {
-			if (state.fail) throw new Error("EIO");
+		space: (path) => {
+			if (state.fail && path.endsWith("/tasks")) throw new Error("EIO");
 			return { free: state.free, size: 2e12, used: 2e12 - state.free };
 		},
 		isMountPoint: async () => true,
@@ -3132,9 +3132,9 @@ test("task disk too full for a new worktree: the run stays queued and is told on
 	);
 });
 
-test("task disk unreadable: fail closed (the task waits, told once); an archived worktree has it measured again at once", async (t) => {
+test("task disk unreadable: runtime floor fails closed before reserving a slot, announces once and rechecks every tick", async (t) => {
 	const disk = taskDiskProbe(1e12);
-	// The production interval (30 s): within this test only an archive can trigger the next measurement.
+	// The worktree-budget retry interval is 30 s, but an unreadable filesystem safety floor is checked every tick.
 	const h = await harness(t, { limits: { minFreeDiskBytes: GiB }, diskProbe: disk.probe });
 	const first = await runToReview(h, "alpha", "first");
 	disk.state.fail = true;
@@ -3144,24 +3144,26 @@ test("task disk unreadable: fail closed (the task waits, told once); an archived
 	assert.equal(taskRow(h, second).state, "queued");
 	assert.equal(taskRow(h, second).worktree_path, null);
 	assert.equal(slotCount(h), 0);
-	const told = diskWaits(h, second);
+	const told = messages(h, "disk_pressure");
 	assert.equal(told.length, 1);
-	assert.match(
-		told[0]?.text ?? "",
-		/^Task 2 stays queued: the free space of the task disk or the size of its new worktree cannot be measured\./,
-	);
-	// Readable again, but not measured again yet (nothing changed, 30 s not over): still waiting.
+	assert.match(told[0]?.text ?? "", /^Execution paused: the task disk free space cannot be measured\./);
+	assert.equal(runsOf(h, second)[0]?.dispatched_at, null, "the safety hold reserves no slot");
+	h.engine.kick();
+	await h.engine.idle();
+	assert.equal(messages(h, "disk_pressure").length, 1, "no alert flood");
+	// A healthy next measurement lifts the floor immediately, without waiting for the worktree-budget interval.
 	disk.state.fail = false;
 	h.engine.kick();
 	await h.engine.idle();
-	assert.equal(taskRow(h, second).state, "queued");
-	// Cancelling the first task archives its worktree: measured again at once, and the second task starts.
+	assert.equal(taskRow(h, first).state, "review", "an idle review task is unchanged");
+	assert.equal(taskRow(h, second).state, "review");
 	requestCancel(h, first);
 	h.engine.kick();
 	await h.engine.idle();
 	assert.equal(taskRow(h, first).state, "cancelled");
 	assert.equal(taskRow(h, second).state, "review");
-	assert.equal(diskWaits(h, second).length, 1);
+	assert.equal(messages(h, "disk_pressure").length, 1);
+	assert.equal(messages(h, "disk_recovered").length, 1);
 });
 
 test("task disk without room: a first run is held before main is fetched, so a fetch failing on the full disk does not fail the task", async (t) => {
