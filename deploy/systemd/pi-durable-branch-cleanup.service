@@ -1,0 +1,25 @@
+[Unit]
+Description=Post-acceptance Pi Durable merged-branch housekeeping
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pi-coordinator
+Group=pi-coordinator
+Environment=NODE_NO_WARNINGS=1
+Environment=GOOGLE_CLOUD_PROJECT=REPLACE_WITH_PROJECT_ID
+WorkingDirectory=/opt/pi-durable-branch-cleanup
+StateDirectory=pi-durable-branch-cleanup
+StateDirectoryMode=0700
+ExecStart=/usr/bin/flock -n /var/lib/pi-durable-branch-cleanup/worker.lock /usr/bin/node /opt/pi-durable-branch-cleanup/proposals/branch-cleanup/worker.ts --config /etc/pi-durable/branch-cleanup.json
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pi-durable-branch-cleanup
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

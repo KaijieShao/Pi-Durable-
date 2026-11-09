@@ -1,0 +1,15 @@
+{
+  "stateDir": "/var/lib/pi-durable-branch-cleanup",
+  "policy": {
+    "mode": "disabled",
+    "acceptanceComplete": false,
+    "activationApproved": false,
+    "notBeforeMs": null,
+    "repository": "",
+    "baseBranch": "main",
+    "taskPrefix": "task/",
+    "keepBranches": ["main", "master", "develop", "development", "staging", "production", "stable", "gh-pages"],
+    "keepPrefixes": ["release/", "hotfix/", "support/"]
+  },
+  "sources": []
+}

@@ -130,3 +130,9 @@ The bottleneck is named from the measurements, not assumed.
 On this page
 
 [What's Graded](#7-1-what-s-graded "What's Graded")[Frozen Trial Build](#7-2-frozen-before-trial-1 "Frozen Before Trial 1")[Quality Track](#7-3-quality-track-3-clean-trials-2-of-3-must-pass "Quality Track (3 clean trials, 2 of 3 must pass)")[Fault Track](#7-4-fault-track-same-build-100-every-time "Fault Track (same build, 100% every time)")[Stress Test](#7-5-stress-test "Stress Test")[Failures and Bottlenecks](#7-6-spof-and-bottleneck-report "SPOF and Bottleneck Report")
+
+## Post-acceptance cleanup closeout
+
+Branch cleanup stays disabled for all frozen quality, fault and stress runs. Only after those runs finish and their PASS/FAIL/NOT TESTED evidence is saved may the owner-approved cleanup policy be activated. This does not convert a failed or incomplete formal acceptance into a pass.
+
+A separate disposable task must demonstrate Telegram approval, actual GitHub merge, task completion and worktree archival before the independent worker deletes its remote feature branch. Confirm the PR page shows deletion and PR/head/merge records remain intact. Verify the exact authorized historical task/1 through task/5 PR pages separately. All open, unmerged, failed and cancelled task branches stay. Cleanup failure is a housekeeping result and cannot change a successful merge/task to failed. See [the operational policy](../docs/branch-cleanup.md).

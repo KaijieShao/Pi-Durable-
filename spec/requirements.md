@@ -70,7 +70,19 @@ Each Telegram group has one shared project, a git repository with a main branch.
 
 When the run finishes, the bot sends a link to a GitHub pull request with the task’s changes. The task’s creator or the group’s configured owner reviews it and approves with `/approve` in Telegram. While a task waits for review, its agent is free to start its next task.
 
-Before merging, the Coordinator combines the change with the latest main branch and runs the tests on the combined result; the main branch changes only if they pass. If the main branch moved since approval, the updated result is approved again. If git can’t merge it cleanly, the agent resolves the conflict in a new admitted run, and the user reviews again. Merges happen one at a time. After the merge, the task’s worktree is archived: its folder is deleted and its branch is kept. Cancelling a task in review closes its pull request and archives its worktree the same way.
+Before merging, the Coordinator combines the change with the latest main branch and runs the tests on the combined result; the main branch changes only if they pass. If the main branch moved since approval, the updated result is approved again. If git can’t merge it cleanly, the agent resolves the conflict in a new admitted run, and the user reviews again. Merges happen one at a time. After the merge, the task’s worktree is archived: its folder is deleted and its branch is kept during the current acceptance and rehearsal. Cancelling a task in review closes its pull request and archives its worktree, keeping its branch.
+
+### Post-acceptance remote branch cleanup — owner-approved policy
+
+After the formal test phase finishes, its results are preserved, and the owner approves activation, independent housekeeping deletes an exact remote task feature branch **only after** GitHub confirms the matching PR merged, the Coordinator durably records the successful task/merge, and the task's worktree is confirmed archived and absent. There must be no active/admitted run, execution/check slot, unresolved file effect, pending merge reconciliation, or open PR using that branch.
+
+* Never delete main, the repository default/base branch, protected or long-lived branches, or any open, cancelled, failed or unmerged task branch. Unknown protection or remote state retains the branch.
+* Require repository, task ID, exact branch name, PR number, reviewed head and actual merge commit to agree. The merge must remain reachable from the base branch. A branch pushed/reused after merging is kept; deletion must use an atomic expected-head lease.
+* Activation is off throughout frozen acceptance/rehearsal. Post-acceptance activation records a cutoff and repository scope. Historical backfill remains off except for separately approved exact tuples; this closeout explicitly authorizes only workshop task/1 through task/5. Original Tasks 8/9 and all cancelled/unmerged branches remain untouched.
+* Cleanup has its own durable, idempotent journal. A deletion timeout is read back before any retry. Transient failures retry with bounded backoff; permission/protection/head-change problems retain the branch and request attention. **A successful merge/task never becomes failed because branch cleanup failed.**
+* Keep task, conversation, approval, PR and immutable commit records. Deleting a remote ref never erases or rewrites acceptance evidence, opens a replacement PR, replays a merge or resumes an ended task.
+
+The independent worker and its tests are in [`proposals/branch-cleanup`](../proposals/branch-cleanup/README.md); operational gates and recovery are in [`docs/branch-cleanup.md`](../docs/branch-cleanup.md). It reads Coordinator metadata without modifying task records. Finishing the formal phase is not a claim that every acceptance criterion passed. GitHub's immediate `delete_branch_on_merge` setting remains disabled because it cannot enforce the archive-completed gate.
 
 ### Permissions
 

@@ -98,6 +98,14 @@ On GitHub, a rule on the main branch requires pull requests to be up to date bef
 
 **No backup of the VM disk is claimed**, since local durability covers a process crash only. Merged work and pushed checkpoints also live on GitHub.
 
+### Post-acceptance remote branch cleanup (independent worker)
+
+Keep GitHub `delete_branch_on_merge=false` throughout current acceptance and rehearsal. It deletes too early to enforce the worktree-archived gate. The later closeout explicitly authorizes the exact already-merged workshop task/1 through task/5 tuples; no other historical branch is backfilled.
+
+An explicitly approved housekeeping worker deletes only exact task refs whose matching PR is confirmed merged, successful merge/task records are durable, worktree archival and absence are confirmed, and no task run/slot/effect/merge reconciliation remains. Main/default/base, protected/long-lived branches, open PR heads and cancelled/failed/unmerged tasks are retained. Unknown protection/remote state, moved heads and pre-activation branches are retained. Deletion uses an expected-head lease, never an unconditional remote ref delete.
+
+Track cleanup separately with a durable idempotency key, bounded retries, read-back on uncertainty and operator attention on denial/protection/head change. A cleanup failure never changes a successful task or merge to failed. Preserve task IDs, branch names, PR links, conversations, approved heads and actual merge SHAs; recovery must not recreate an intentionally removed ended-task ref. See the [worker and operational runbook](../docs/branch-cleanup.md). The independent service is activated only after the formal phase finishes, results are preserved and the owner approves activation; it does not require a Coordinator restart. Completion of that phase does not assert a full-project pass.
+
 ## Logs
 
 ### Metadata only, with allowlisted fields

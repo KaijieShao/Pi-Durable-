@@ -134,3 +134,5 @@ npm test          # node --test; Telegram, GitHub and the model are local fakes 
 ## License
 
 [MIT](LICENSE) © smixs
+
+Post-acceptance merged-branch housekeeping is an independent, default-disabled worker. It deletes only confirmed merged, completed and archived task branches; cancelled/open/unmerged branches remain. See [branch cleanup operations](docs/branch-cleanup.md).
