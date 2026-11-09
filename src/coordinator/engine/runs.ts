@@ -43,6 +43,7 @@ import {
 import type { Reservation } from "./dispatch.ts";
 import { applyDelivered, decide, deliverFollowup, expireFollowup, finalizeRun } from "./finalize.ts";
 import { closeRunKeys, newRunKey, openRunKey } from "./keys.ts";
+import { refreshExecutionDisk } from "./runtime-disk.ts";
 import { holdNewWorktrees, measureNewWorktree, roomForNewWorktree } from "./task-disk.ts";
 import { executeTool } from "./tools.ts";
 
@@ -109,6 +110,11 @@ const START_FAILED = "the run could not be started";
 /** Prepare the run; a failure (not a stop) decides it as failed with the user-facing reason. */
 async function prepareOrFail(ctx: Ctx, active: ActiveRun): Promise<Prepared | "requeued" | undefined> {
 	try {
+		const pressure = refreshExecutionDisk(ctx);
+		if (pressure !== undefined) {
+			requeue(ctx, active, pressure.reason, `wait_noted:free_space:${active.runId}`);
+			return "requeued";
+		}
 		return await prepare(ctx, active);
 	} catch (error) {
 		if (error instanceof Stopped || active.decision !== undefined) return undefined;
@@ -279,9 +285,6 @@ async function step<T>(ctx: Ctx, active: ActiveRun, event: string, reason: strin
  * released, nothing created, told once) and new worktrees are held. True if requeued.
  */
 async function newWorktreeHeld(ctx: Ctx, active: ActiveRun, base: string): Promise<boolean> {
-	// STUB(spec: evaluation.md § Fault Track "Task disk full"): only this check before a worktree is created; a task
-	// disk that fills up during a run is not detected separately (writes fail in the container and the run ends on its
-	// own terms).
 	const measured = await measureNewWorktree(ctx, () => ctx.git.checkoutBytes(base));
 	// Decided and let through in one synchronous step: a check running at the same time counts this one as pending.
 	const room = roomForNewWorktree(ctx, measured);

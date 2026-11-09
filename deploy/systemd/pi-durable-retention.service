@@ -1,0 +1,18 @@
+[Unit]
+Description=Bounded Pi Durable disposable artifact retention
+After=docker.service
+RequiresMountsFor=/mnt/pi-durable-tasks
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/pi-durable
+ExecStart=/usr/bin/flock -n /run/pi-durable-retention.lock /usr/bin/node /opt/pi-durable/dist/maintenance/worker.js --config /etc/pi-durable/retention.json
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

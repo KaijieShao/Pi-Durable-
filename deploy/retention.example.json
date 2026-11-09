@@ -1,0 +1,18 @@
+{
+  "apply": false,
+  "policy": {
+    "roots": ["/mnt/pi-durable-tasks/formal-acceptance", "/var/lib/pi-durable-completed-trials"],
+    "protectedPaths": ["/var/lib/pi-durable", "/mnt/pi-durable-tasks/repo", "/mnt/pi-durable-tasks/worktrees"],
+    "retentionMs": {
+      "trial": 604800000,
+      "test-artifact": 604800000,
+      "archive": 1209600000,
+      "raw-trial-store": 86400000
+    },
+    "bundles": []
+  },
+  "docker": {
+    "protectedRefs": ["pi-durable-agent:demo", "pi-durable-check:demo", "pi-durable-evaluator:demo"],
+    "pruneBuildCache": true
+  }
+}

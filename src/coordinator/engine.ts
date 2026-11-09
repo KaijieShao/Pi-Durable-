@@ -47,6 +47,7 @@ import {
 	runLifecycle,
 	sendPendingSteers,
 } from "./engine/runs.ts";
+import { refreshExecutionDisk } from "./engine/runtime-disk.ts";
 import { NO_EVALUATOR, requestSeal, type SealOutcome, type SealRequest, sealTick } from "./engine/seal.ts";
 import { liftTaskDiskHold, recheckTaskDisk, TASK_DISK_RECHECK_MS } from "./engine/task-disk.ts";
 import { UNFREEZE_QUIET_MS, type UnfreezeOutcome, unfreezeGroup } from "./engine/unfreeze.ts";
@@ -260,6 +261,7 @@ function plural(n: number, one: string): string {
  * or reconciliation in flight, and the watchdog ready.
  */
 function sealWaitingFor(ctx: Ctx, state: EngineState, group: GroupState): string | undefined {
+	if (ctx.executionDiskHold !== undefined) return `disk safety: ${ctx.executionDiskHold.reason}`;
 	if (ctx.active.size > 0) return `${plural(ctx.active.size, "active run")} to finish`;
 	if (state.merging) return "the merge in progress";
 	const slots = slotsInUse(ctx);
@@ -302,6 +304,7 @@ function addRecoveryJobs(ctx: Ctx, state: EngineState, jobs: readonly RecoveryJo
 }
 
 function maybeRecoveryJobs(ctx: Ctx, state: EngineState, group: GroupState): boolean {
+	if (ctx.executionDiskHold !== undefined) return false;
 	if (state.recoveryJobs.length === 0 || state.recoveryRunning || state.recheckRunning) return false;
 	// Capacity § Exclusive phases: nothing starts a container while the evaluator runs or its cleanup (which removes
 	// every container) is due; a restart during an evaluation runs its recovery jobs only after that (engine/seal.ts).
@@ -380,6 +383,7 @@ function checkEnforcement(ctx: Ctx, state: EngineState): void {
  * from sealing until the evaluator exits and cleanup is verified"; engine/seal.ts).
  */
 function dispatchOpen(ctx: Ctx, state: EngineState): boolean {
+	if (ctx.executionDiskHold !== undefined) return false;
 	const group = ctx.store.groupState(ctx.chatId);
 	if (group.state !== "normal" || group.recheck || state.recheckRunning || deploymentHeld(ctx.store)) return false;
 	// Agent Execution § Uncertain Effects: "Dispatch stays blocked until reconciliation finishes".
@@ -456,9 +460,20 @@ function remind(ctx: Ctx, task: TaskRow): void {
 	});
 }
 
+/** Revoke before termination; finalization preserves checkpoints or retains an unarchivable worktree. */
+function enforceExecutionDisk(ctx: Ctx): void {
+	const pressure = refreshExecutionDisk(ctx);
+	if (pressure === undefined) return;
+	for (const active of ctx.active.values()) {
+		if (active.decision === undefined)
+			decide(ctx, active, { kind: "failed", reason: pressure.reason, cause: "disk safety floor" });
+	}
+}
+
 /** One pass; returns true if it started any work. Synchronous: work runs in tracked promises. */
 function tickOnce(ctx: Ctx, state: EngineState): boolean {
 	if (ctx.stopped) return false;
+	enforceExecutionDisk(ctx);
 	checkEnforcement(ctx, state);
 	const group = ctx.store.groupState(ctx.chatId);
 	const did = [
@@ -577,6 +592,7 @@ export function createEngine(options: EngineOptions): Engine {
 		diskRecheckMs: options.diskRecheckMs ?? TASK_DISK_RECHECK_MS,
 		taskDiskHold: undefined,
 		taskDiskChecking: false,
+		executionDiskHold: undefined,
 		creatingWorktrees: new Set<number>(),
 		onOutbox: options.onOutbox ?? (() => {}),
 		watchdog: options.watchdog,

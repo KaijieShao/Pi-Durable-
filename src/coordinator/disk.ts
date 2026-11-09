@@ -4,7 +4,8 @@
  * - The boot disk holds PI_DATA_DIR: the Coordinator database, the outbox, Pi's conversation stores (and, on the VM,
  *   the logs). "When its free space runs low, new tasks are rejected with a reason": a /task is refused while the
  *   filesystem of PI_DATA_DIR has less than `bootMinFreeBytes` free (commands.ts). Follow-ups, /status, /cancel and
- *   /approve are not affected.
+ *   /approve are still accepted; the runtime floor additionally holds all new execution and stops active runs
+ *   (engine/runtime-disk.ts).
  * - The task disk holds PI_TASK_DIR: the git repository, one worktree per open task, check scratch space (and, on the
  *   VM, Docker's data). "If a new worktree would exceed it, the task stays queued and the bot says why": before a new
  *   worktree is created, its size is estimated (the checkout's files, each rounded up to 4 KiB blocks, plus
@@ -73,6 +74,47 @@ export function diskSettings(config: Pick<CoordinatorConfig, "disk">, limits: Li
  * /task acknowledgement (commands.ts). Cleared when the hold is lifted and at every Coordinator start.
  */
 export const TASK_DISK_WAIT_KEY = "task_disk_wait";
+
+/** A free-space floor holds every new execution, including follow-ups and merge checks. */
+export const EXECUTION_DISK_WAIT_KEY = "execution_disk_wait";
+
+export type ExecutionDiskPressure = {
+	readonly disk: "boot" | "task";
+	readonly free: number | undefined;
+	readonly floor: number;
+	readonly reason: string;
+};
+
+function measuredFree(probe: DiskProbe, path: string): number | undefined {
+	try {
+		const space = probe.space(path);
+		return finite(space) ? space.free : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Cheap statfs-only check. A checkout budget is separate; an existing worktree still needs writable free space. */
+export function executionDiskPressure(
+	probe: DiskProbe,
+	paths: { readonly dataDir: string; readonly taskDir: string },
+	settings: DiskSettings,
+): ExecutionDiskPressure | undefined {
+	for (const [disk, path, floor] of [
+		["boot", paths.dataDir, settings.bootMinFreeBytes],
+		["task", paths.taskDir, settings.taskMinFreeBytes],
+	] as const) {
+		const free = measuredFree(probe, path);
+		if (free === undefined || free < floor) {
+			const reason =
+				free === undefined
+					? `the ${disk} disk free space cannot be measured`
+					: `the ${disk} disk has ${free} bytes free, below its safety floor of ${floor} bytes`;
+			return { disk, free, floor, reason };
+		}
+	}
+	return undefined;
+}
 
 /** Meta key set once a first run was told why it waits for the task disk: the bot says it once per task. */
 export function taskDiskToldKey(runId: number): string {

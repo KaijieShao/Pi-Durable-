@@ -26,6 +26,7 @@ import {
 	checkBootDisk,
 	type DiskProbe,
 	diskSettings,
+	EXECUTION_DISK_WAIT_KEY,
 	systemDiskProbe,
 	TASK_DISK_WAIT_KEY,
 	taskDiskToldKey,
@@ -693,13 +694,15 @@ function groupStatus(store: Store, limits: Limits, chatId: number): string {
 			chatId,
 		)
 		.map((task) => statusLineOf(store, limits, task));
-	return statusSummary({
+	const summary = statusSummary({
 		group: store.groupState(chatId),
 		slotsInUse: slotsInUse(store),
 		maxSlots: limits.maxConcurrentRuns,
 		active,
 		recent,
 	});
+	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
+	return pressure === undefined ? summary : `${summary}\nExecution paused: ${pressure}.`;
 }
 
 function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
@@ -780,6 +783,8 @@ function waitNote(
 	p: { chatId: number; agent: string; initial: boolean },
 ): string | undefined {
 	if (deploymentHeld(store)) return sealingWait();
+	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
+	if (pressure !== undefined) return `waiting for disk safety: ${pressure}`;
 	if (p.initial) {
 		const open = openTaskCount(store, p.chatId);
 		if (open >= limits.openTasksPerGroup) return waitingForReviews(open);

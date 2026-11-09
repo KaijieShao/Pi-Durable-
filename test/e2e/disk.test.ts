@@ -15,12 +15,14 @@
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 import { type DiskProbe, systemDiskProbe } from "../../src/coordinator/disk.ts";
+import type { Sandbox } from "../../src/coordinator/ports.ts";
 import type { ServerMessage } from "../fixtures/fake-bot-api.ts";
 import { waitFor } from "../helpers/env.ts";
+import { originGit } from "../helpers/fake-github.ts";
 import type { FakeHandler } from "../helpers/fake-model.ts";
 import {
 	agentPosition,
@@ -37,7 +39,14 @@ const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
 
 type TaskRow = { id: number; state: string; worktree_path: string | null };
-type RunRow = { id: number; task_id: number; kind: string; state: string; dispatched_at: number | null };
+type RunRow = {
+	id: number;
+	task_id: number;
+	kind: string;
+	state: string;
+	dispatched_at: number | null;
+	started_at: number | null;
+};
 
 /** Every run writes `<job>.txt` (its input starts with the job name), then answers. */
 const jobAgent: FakeHandler = (request) => {
@@ -113,7 +122,7 @@ function probeFor(state: { boot?: number | "unreadable"; task?: number | "unread
 	};
 }
 
-test("boot disk low: a new /task is rejected naming the boot disk and both amounts; follow-ups, /status, /cancel and /approve still work; unreadable fails closed", {
+test("boot disk low: new tasks are refused, follow-ups wait without a slot, status/cancel work and execution recovers", {
 	timeout: 180_000,
 }, async (t) => {
 	const disk: { boot: number | "unreadable" } = { boot: 50 * GiB };
@@ -139,18 +148,25 @@ test("boot disk low: a new /task is rejected naming the boot disk and both amoun
 		"no task was created",
 	);
 
-	// Everything but a new task still works.
+	// Commands remain durable, but a follow-up cannot execute below the safety floor.
+	await settle(stack);
 	assert.match(await command(stack, USER2, "/status"), /^Group: normal\..*\nTask 1 · alpha · in review/s);
 	const followup = stack.reply(USER1, review1.id, "job-1b follow-up while the boot disk is low");
 	assert.match(
 		(await replyTo(stack, followup)).text,
 		/^Follow-up started another run of Task 1 on the same branch and pull request\./,
 	);
+	await settle(stack);
+	assert.equal(stack.runs<RunRow>().at(-1)?.state, "queued");
+	assert.equal(slots(stack), 0, "no execution slot below the safety floor");
+	assert.match(await command(stack, USER2, "/status"), /Execution paused: the boot disk/);
+	assert.match(await command(stack, USER2, "/cancel 2"), /^Cancelling Task 2…/);
+	await stack.waitForBotMessage(/^Task 2 cancelled\./);
+	disk.boot = 50 * GiB;
+	stack.coordinator.engine.kick();
 	await stack.waitForBotMessage(/^Task 1 is ready for review \(run 2\)/, { since: review1.id });
 	assert.match(await command(stack, USER1, "/approve 1"), /^Approved Task 1 at [0-9a-f]{7}/);
 	await stack.waitForBotMessage(/^Task 1 merged into main/);
-	assert.match(await command(stack, USER2, "/cancel 2"), /^Cancelling Task 2…/);
-	await stack.waitForBotMessage(/^Task 2 cancelled\./);
 
 	// The boot disk cannot be measured: new tasks are refused (fails closed).
 	disk.boot = "unreadable";
@@ -243,20 +259,14 @@ test("task disk unreadable or below its free-space floor: new worktrees wait (fa
 	const disk: { task: number | "unreadable" } = { task: "unreadable" };
 	const stack = await stackFor(t, { diskProbe: probeFor(disk) });
 	// The task disk does not reject a /task (Evaluation "Task disk full": commands are still saved and acknowledged).
-	assert.equal(
+	assert.match(
 		await command(stack, USER1, "/task alpha job-1 first task"),
-		"Task 1 accepted for agent alpha. Queue position 1.",
+		/^Task 1 accepted for agent alpha\. Queue position 1\./,
 	);
-	const told = await stack.waitForBotMessage(/^Task 1 stays queued: /);
-	assert.equal(
-		told.text,
-		"Task 1 stays queued: the free space of the task disk or the size of its new worktree cannot be measured. It " +
-			"starts by itself once there is room, for example when another task is merged or cancelled and its worktree " +
-			"is archived.",
-	);
+	await stack.waitForBotMessage(/^Execution paused: the task disk free space cannot be measured/);
 	assert.match(
 		await command(stack, USER2, "/task beta job-2 second task"),
-		/^Task 2 accepted for agent beta\. Queue position 1\. Waiting for room on the task disk: the free space of the task disk or the size of its new worktree cannot be measured\.$/,
+		/^Task 2 accepted for agent beta\. Queue position 1\. waiting for disk safety: the task disk free space cannot be measured\.$/i,
 	);
 	// Readable, but 1.5 GiB free: the worktree (its files + 1 GiB headroom) would leave less than the 1 GiB floor.
 	disk.task = 1.5 * GiB;
@@ -271,7 +281,11 @@ test("task disk unreadable or below its free-space floor: new worktrees wait (fa
 	);
 	await settle(stack);
 	assert.deepEqual([firstRun(stack, 1).state, firstRun(stack, 2).state], ["queued", "queued"]);
-	assert.equal(firstRun(stack, 2).dispatched_at, null);
+	assert.equal(
+		firstRun(stack, 2).started_at,
+		null,
+		"a worktree estimate may reserve and requeue, but no Pi execution starts",
+	);
 	assert.equal(slots(stack), 0);
 	assert.deepEqual(await stack.worktrees(), []);
 
@@ -279,5 +293,67 @@ test("task disk unreadable or below its free-space floor: new worktrees wait (fa
 	await stack.waitForBotMessage(/^Task 1 is ready for review \(run 1\)/);
 	await stack.waitForBotMessage(/^Task 2 is ready for review \(run 1\)/);
 	assert.deepEqual(await stack.worktrees(), ["task-1", "task-2"]);
-	assert.deepEqual([toldWaiting(stack, 1), toldWaiting(stack, 2)], [1, 0], "each told once, task 2 in its ack");
+	assert.deepEqual(
+		[toldWaiting(stack, 1), toldWaiting(stack, 2)],
+		[1, 1],
+		"each new-worktree estimate is told once after free-space recovery",
+	);
+});
+
+test("task disk falls below its floor during execution: revoke and verify stop, keep the final checkpoint, hold all queued runs and resume only queued work", {
+	timeout: 180_000,
+}, async (t) => {
+	const disk: { task: number | "unreadable" } = { task: 100 * GiB };
+	let sandbox: Sandbox | undefined;
+	const stack = await stackFor(t, {
+		diskProbe: probeFor(disk),
+		wrap: {
+			sandbox: (box) => {
+				sandbox = box;
+				return box;
+			},
+		},
+		model: (request) => {
+			const { input, round } = agentPosition(request);
+			if (!input.includes("job-1")) return jobAgent(request);
+			if (round === 0)
+				return { toolCalls: [{ name: "write", args: { path: "kept.txt", content: "unpublished work\n" } }] };
+			return { hang: true };
+		},
+	});
+	await command(stack, USER1, "/task alpha job-1 stop safely on disk pressure");
+	await waitFor(
+		async () => {
+			const path = task(stack, 1).worktree_path;
+			return path !== null && (await readFile(join(path, "kept.txt"), "utf8").catch(() => "")) === "unpublished work\n";
+		},
+		{ timeoutMs: 30_000, what: "unpublished task file" },
+	);
+	const running = stack.runs<RunRow & { pid: number | null; container: string | null }>().at(-1);
+	assert.ok(running?.pid !== null && running?.pid !== undefined, "real Pi runner started");
+	disk.task = GiB / 2;
+	stack.coordinator.engine.kick();
+	const notice = await stack.waitForBotMessage(/^Execution paused: the task disk has/);
+	await stack.waitForBotMessage(/^Task 1 failed: the task disk has/);
+	await settle(stack);
+	assert.equal(stack.coordinator.engine.activeRuns().length, 0);
+	assert.throws(() => process.kill(running.pid as number, 0), { code: "ESRCH" }, "runner is gone");
+	assert.equal((await sandbox?.live({ taskId: 1 }))?.length, 0, "sandbox verified gone");
+	assert.equal(slots(stack), 0);
+	assert.equal(task(stack, 1).state, "failed");
+	assert.ok(await stack.branchSha("task/1"), "checkpoint branch retained");
+	assert.equal((await originGit(stack.origin.bare, ["show", "task/1:kept.txt"])).stdout, "unpublished work\n");
+	assert.match(await command(stack, USER2, "/task beta job-2 queued while low"), /^Task 2 accepted/);
+	await settle(stack);
+	assert.equal(firstRun(stack, 2).dispatched_at, null);
+	assert.match(await command(stack, USER2, "/status"), /Execution paused: the task disk/);
+	assert.equal(
+		stack.lastBotMessages(1000).filter((m) => m.text.startsWith("Execution paused:")).length,
+		1,
+		"no alert flood",
+	);
+	disk.task = 100 * GiB;
+	stack.coordinator.engine.kick();
+	await stack.waitForBotMessage(/^Task 2 is ready for review/, { since: notice.id });
+	assert.equal(stack.runs<RunRow>().filter((run) => run.task_id === 1).length, 1, "stopped run was never resubmitted");
 });
