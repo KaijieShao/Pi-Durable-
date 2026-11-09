@@ -10,7 +10,7 @@ import { parseCoordinatorConfig } from "../../src/coordinator/config.ts";
 import { type DiskProbe, TASK_DISK_WAIT_KEY } from "../../src/coordinator/disk.ts";
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
 import { Store } from "../../src/coordinator/store.ts";
-import { silentLogger } from "../../src/runtime/log.ts";
+import { type LogFields, silentLogger } from "../../src/runtime/log.ts";
 
 const GROUP = -1001234567;
 const OTHER_CHAT = -1009999999;
@@ -212,6 +212,28 @@ function dispatch(f: Fixture, taskId: number, agent: string): void {
 }
 
 describe("handleUpdate: /task", () => {
+	test("timing metadata joins Telegram's seconds timestamp to the durable receive time without message text", () => {
+		const f = fixture();
+		const logs: { event: string; fields?: LogFields }[] = [];
+		f.ctx.log = { ...silentLogger, info: (event, fields) => logs.push({ event, fields }) };
+		const sent = f.send(ANA, `/task@${BOT} alpha private task content`);
+		const command = f.store.get<Row>("SELECT received_at FROM commands WHERE update_id = ?", sent.updateId);
+		assert.equal(logs.length, 1);
+		assert.deepEqual(logs[0], {
+			event: "command",
+			fields: {
+				update_id: sent.updateId,
+				telegram_date_s: 1_790_000_000,
+				received_at_ms: command?.received_at,
+				kind: "task",
+				outcome: "accepted",
+				code: undefined,
+				task_id: 1,
+			},
+		});
+		assert.ok(!JSON.stringify(logs).includes("private task content"));
+	});
+
 	test("accepts a task: task row, initial queued run, ack replying to the command with id and position", () => {
 		const f = fixture();
 		const sent = f.send(ANA, `/task@${BOT} alpha add email validation\nand tests`);
