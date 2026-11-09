@@ -90,7 +90,7 @@ All of these allocations are starting budgets, to be validated by the stress tes
 
 ### Disk
 
-The 20 GiB boot disk gets separate budgets for retained trials, metadata-only logs, Pi’s raw-content store and the database, each with a retention rule. When its free space runs low, new tasks are rejected with a reason.
+The 20 GiB boot disk gets separate budgets for retained trials, metadata-only logs, Pi’s raw-content store and the database, each with a retention rule. When its free space runs low, new tasks are rejected with a reason. The runtime safety floor additionally holds every new execution (including follow-ups, merge/recovery checks and evaluation) and revokes active runs on either filesystem. Commands remain durable while the boot reserve is available. Stopped runs are verified gone and unpushed work is kept; a failed final checkpoint retains the worktree for recovery. See [disk safety and retention](../docs/disk-retention.md) for explicit disposable-bundle expiry, image/cache retention, protected paths and log limits.
 
 Each open task keeps one worktree until it is archived. The limit of 4 open tasks per group bounds their number. A separate task disk holds the git repository, worktrees, build output, check scratch space and Docker’s images, writable layers and caches. Its size is set by the stress test, so task writes can’t fill the boot disk. If a new worktree would exceed it, the task stays queued and the bot says why.
 

@@ -8,7 +8,7 @@ import type { FromRunner } from "../../runner/protocol.ts";
 import type { Logger } from "../../runtime/log.ts";
 import type { BranchHoldCause } from "../branch-hold.ts";
 import type { CoordinatorConfig } from "../config.ts";
-import type { DiskProbe, DiskSettings } from "../disk.ts";
+import type { DiskProbe, DiskSettings, ExecutionDiskPressure } from "../disk.ts";
 import { deploymentHeld } from "../evaluation.ts";
 import type { Git } from "../git.ts";
 import type { Limits } from "../limits.ts";
@@ -267,6 +267,8 @@ export type Ctx = {
 	taskDiskHold: TaskDiskHold | undefined;
 	/** A measurement of the held task disk is in flight. */
 	taskDiskChecking: boolean;
+	/** The boot/task safety floor holds all execution, even when its worktree already exists. */
+	executionDiskHold: ExecutionDiskPressure | undefined;
 	/** Runs whose new worktree passed the task disk check and is being created (with its setup), by run id. */
 	readonly creatingWorktrees: Set<number>;
 	readonly onOutbox: () => void;

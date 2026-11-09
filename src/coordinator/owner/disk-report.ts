@@ -16,7 +16,15 @@ import { statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { CoordinatorConfig } from "../config.ts";
-import { type DiskSettings, diskSettings, isMountPoint, statfsSpace, TASK_DISK_WAIT_KEY, treeBytes } from "../disk.ts";
+import {
+	type DiskSettings,
+	diskSettings,
+	EXECUTION_DISK_WAIT_KEY,
+	isMountPoint,
+	statfsSpace,
+	TASK_DISK_WAIT_KEY,
+	treeBytes,
+} from "../disk.ts";
 import { SNAPSHOTS_DIR } from "../engine/snapshot.ts";
 import { DEMO_LIMITS } from "../limits.ts";
 import { formatBytes } from "../messages.ts";
@@ -143,5 +151,7 @@ export async function diskReport(store: Store, config: DiskReportConfig): Promis
 	];
 	const held = store.getMeta(TASK_DISK_WAIT_KEY);
 	if (held !== undefined) lines.push(`  New worktrees are held: ${held}`);
+	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
+	if (pressure !== undefined) lines.push(`  All execution is held: ${pressure}`);
 	return lines;
 }
