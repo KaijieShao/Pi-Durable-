@@ -98,6 +98,14 @@ On GitHub, a rule on the main branch requires pull requests to be up to date bef
 
 **No backup of the VM disk is claimed**, since local durability covers a process crash only. Merged work and pushed checkpoints also live on GitHub.
 
+### Post-acceptance remote branch cleanup (disabled proposal)
+
+Keep GitHub `delete_branch_on_merge=false` throughout current acceptance and rehearsal. It deletes too early to enforce the worktree-archived gate. No current branch is to be deleted by this documentation change.
+
+A later, explicitly approved housekeeping worker may delete only exact task refs whose matching PR is confirmed merged, successful merge/task records are durable, worktree archival and absence are confirmed, and no task run/slot/effect/merge reconciliation remains. Main/default/base, protected/long-lived branches, open PR heads and cancelled/failed/unmerged tasks are retained. Unknown protection/remote state, moved heads and pre-activation branches are retained. Deletion uses an expected-head lease, never an unconditional remote ref delete.
+
+Track cleanup separately with a durable idempotency key, bounded retries, read-back on uncertainty and operator attention on denial/protection/head change. A cleanup failure never changes a successful task or merge to failed. Preserve task IDs, branch names, PR links, conversations, approved heads and actual merge SHAs; recovery must not recreate an intentionally removed ended-task ref. See the [review-only core and integration gates](../proposals/branch-cleanup/README.md). It is not wired to production; activation requires separate owner approval after formal acceptance and a reviewed deployment, not just changing a JSON example.
+
 ## Logs
 
 ### Metadata only, with allowlisted fields

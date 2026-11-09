@@ -1,0 +1,11 @@
+{
+  "mode": "disabled",
+  "acceptanceComplete": false,
+  "activationApproved": false,
+  "notBeforeMs": null,
+  "repository": "REPLACE_WITH_EXACT_APPROVED_REPOSITORY",
+  "baseBranch": "main",
+  "taskPrefix": "task/",
+  "keepBranches": ["main", "master", "develop", "development", "staging", "production", "stable", "gh-pages"],
+  "keepPrefixes": ["release/", "hotfix/", "support/"]
+}
