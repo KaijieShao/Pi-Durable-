@@ -22,6 +22,8 @@ export type SendMessageParams = {
 };
 
 export interface TelegramApi {
+	/** Release client-owned connections after polling and outbound requests have stopped. */
+	close?(): Promise<void>;
 	getMe(signal?: AbortSignal): Promise<TelegramMe>;
 	/** Long polling: `timeout` seconds (30 in production). */
 	getUpdates(offset: number, timeoutSeconds: number, signal?: AbortSignal): Promise<Update[]>;

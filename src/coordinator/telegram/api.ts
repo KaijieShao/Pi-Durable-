@@ -1,4 +1,5 @@
 import type { Update } from "grammy/types";
+import { Agent, fetch as pooledFetch } from "undici";
 import { redact } from "../../runtime/redact.ts";
 import {
 	type SendMessageParams,
@@ -36,8 +37,22 @@ type Envelope = {
 };
 
 export function createTelegramApi(options: TelegramApiOptions): TelegramApi {
-	const doFetch = options.fetch ?? fetch;
+	// Node's default fetch pool expires idle connections after 4 s. Paced group traffic can sit just beyond that
+	// boundary, paying a fresh TCP/TLS handshake for every reply. Keep a small, client-owned pool; two or more
+	// connections are necessary so a held getUpdates request cannot block sendMessage. Do not change the global
+	// dispatcher (the relay and GitHub use it too), pipeline POSTs, or add transport-level retries of uncertain sends.
+	const dispatcher =
+		options.fetch === undefined
+			? new Agent({
+					connections: 4,
+					pipelining: 1,
+					keepAliveTimeout: 60_000,
+					keepAliveMaxTimeout: 60_000,
+					allowH2: false,
+				})
+			: undefined;
 	const root = options.apiRoot.replace(/\/+$/, "");
+	let closing: Promise<void> | undefined;
 	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	const scrub = (text: string): string => {
 		let out = text;
@@ -61,12 +76,15 @@ export function createTelegramApi(options: TelegramApiOptions): TelegramApi {
 		const onAbort = () => timer.abort();
 		signal?.addEventListener("abort", onAbort, { once: true });
 		try {
-			const response = await doFetch(`${root}/bot${options.token}/${method}`, {
+			const init = {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify(body),
 				signal: timer.signal,
-			});
+			};
+			const url = `${root}/bot${options.token}/${method}`;
+			const response =
+				options.fetch === undefined ? await pooledFetch(url, { ...init, dispatcher }) : await options.fetch(url, init);
 			return { status: response.status, text: await response.text() };
 		} catch (error) {
 			const reason = transportFailure(error, signal?.aborted === true, timer.signal.aborted, timeoutMs);
@@ -90,6 +108,11 @@ export function createTelegramApi(options: TelegramApiOptions): TelegramApi {
 	}
 
 	return {
+		async close(): Promise<void> {
+			closing ??= dispatcher?.close() ?? Promise.resolve();
+			await closing;
+		},
+
 		async getMe(signal?: AbortSignal): Promise<TelegramMe> {
 			const result = await call("getMe", {}, requestTimeoutMs, signal);
 			if (!isRecord(result) || typeof result.id !== "number" || typeof result.username !== "string")
