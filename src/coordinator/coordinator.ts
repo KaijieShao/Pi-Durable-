@@ -126,6 +126,7 @@ async function requireMountPoint(taskDir: string): Promise<void> {
 }
 
 type Parts = {
+	telegram?: TelegramApi;
 	owner?: OwnerSocket;
 	store?: Store;
 	engine?: Engine;
@@ -193,10 +194,11 @@ const ENFORCEMENT_NOTICE: Readonly<Record<Exclude<Enforcement, { ok: true }>["ki
 };
 
 /** getMe: the token must belong to the configured bot; log whether privacy mode hides plain group messages. */
-async function checkBot({ config, deps, log }: Setup): Promise<TelegramApi> {
+async function checkBot({ config, deps, log }: Setup, parts: Parts): Promise<TelegramApi> {
 	const telegram =
 		deps.telegram ??
 		createTelegramApi({ token: config.telegram.botToken, apiRoot: config.telegram.apiRoot, ...fetchOption(deps) });
+	parts.telegram = telegram;
 	const me = await telegram.getMe();
 	if (me.username.toLowerCase() !== config.telegram.botUsername.toLowerCase()) {
 		throw new ConfigError([
@@ -320,6 +322,7 @@ async function shutdown(parts: Parts, lock: DataDirLock, log: Logger): Promise<v
 	await step("engine", () => parts.engine?.stop());
 	await step("relay", () => parts.relay?.close());
 	await step("outbox", () => parts.outbox?.stop());
+	await step("telegram_transport", () => parts.telegram?.close?.());
 	await step("store", () => parts.store?.close());
 	await step("lock", () => lock.release());
 }
@@ -341,7 +344,7 @@ async function idleAll(store: Store, engine: Engine, outbox: OutboxSender, polle
 /** Everything after the lock and the store, in the startup order of the design. */
 async function boot(setup: Setup, parts: Parts, store: Store, now: () => number, launcher: RunLauncher) {
 	const { config, deps, log, limits } = setup;
-	const telegram = await checkBot(setup);
+	const telegram = await checkBot(setup, parts);
 	const sandbox = await checkSandbox(setup, store, now, launcher);
 	const git = await prepareGit(setup);
 	const github =
