@@ -96,7 +96,7 @@ SQLite transactions are serialized and never held open across a network wait.
 
 ## Recovery After a Restart
 
-**Proposed post-acceptance cleanup is a separate journal, not a merge state.** It stays disabled in this acceptance/rehearsal. After activation approval it may remove only a confirmed merged remote task ref after successful worktree archival. Preserve task/PR/conversation/approval/head/merge records. Reconcile pending merge intents first; retry incomplete archives before considering cleanup. A completed remote deletion must not trigger branch recreation, replacement PRs or a second merge for an ended task. Unknown deletion outcomes are read back in the cleanup worker; cleanup-only failures never downgrade a merged task. The journal migration, claim lease and live adapters remain review/integration work in the [proposal](../proposals/branch-cleanup/README.md).
+**Post-acceptance cleanup has a separate journal, not a merge state.** It stays disabled in this acceptance/rehearsal. After activation approval it may remove only a confirmed merged remote task ref after successful worktree archival. Preserve task/PR/conversation/approval/head/merge records. Reconcile pending merge intents first; retry incomplete archives before considering cleanup. A completed remote deletion must not trigger branch recreation, replacement PRs or a second merge for an ended task. Unknown deletion outcomes are read back in the cleanup worker; cleanup-only failures never downgrade a merged task. The implemented journal and atomic ref-lease adapter are documented in the [operational runbook](../docs/branch-cleanup.md); they never write the Coordinator database.
 
 Restart recovery
 

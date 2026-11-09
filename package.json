@@ -55,7 +55,7 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\" \"proposals/branch-cleanup/*.test.ts\"",
     "prepack": "npm run build"
   },
   "dependencies": {

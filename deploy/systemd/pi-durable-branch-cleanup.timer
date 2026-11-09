@@ -1,0 +1,11 @@
+[Unit]
+Description=Scan completed and archived task branches once per minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=pi-durable-branch-cleanup.service
+
+[Install]
+WantedBy=timers.target
