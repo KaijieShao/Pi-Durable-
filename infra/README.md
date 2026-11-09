@@ -19,10 +19,15 @@ does not change GitHub settings. The Coordinator source is outside this work.
 | VM addressing | Private IPv4 only, dedicated custom VPC and subnet |
 | SSH | IAP only, source `35.235.240.0/20`, TCP 22; OS Login |
 | Outbound | 1 Cloud Router, 1 Public Cloud NAT, 1 reserved regional IPv4 |
-| Boot disk | 20 GiB `pd-balanced`, Debian 12 |
+| Boot disk | 20 GiB `pd-balanced`, Debian 13 (systemd >= 257 for transient-unit polkit checks) |
 | Task disk | 50 GiB `pd-balanced`, separate zonal disk, deletion protected in Terraform |
 | VM identity | Dedicated service account, cloud-platform scope, no key file |
 | Secrets | 3 empty Secret Manager containers; per-secret accessor grants to VM identity |
+
+Debian 12's systemd 252 does not pass a transient unit's name to polkit. Debian 13 supplies systemd 257, which can
+enforce the narrow unit-name rule. Image-family updates are ignored for existing boot disks, so they cannot replace
+a VM automatically. OS changes need an explicit migration. The current migration retains the original 20 GiB boot
+disk for rollback; it adds approximately $2/month while retained.
 
 The [v64 Build Plan](https://pi-durable-agents-0rrc3e.artifactcafe.dev/v64/build-plan.html)
 explicitly identifies this project. It is also the only project listed for the
@@ -106,6 +111,18 @@ script. Merging this source does not run it: a later explicitly approved Terrafo
 host preparation and may start Docker/containerd, never the bot.
 
 ## Owner-managed secret values
+
+The production drop-in `deploy/systemd/pi-durable-coordinator.service.d/30-secret-manager.conf` starts
+`deploy/gcp/start-coordinator.mjs`. It obtains the VM identity and reads the three latest secret versions directly
+into the Coordinator's in-memory configuration on every start. Neither the values nor the VM token are written to
+disk, systemd properties, logs or child environments. Missing versions cause exit 2 before the Coordinator starts.
+Keep `/etc/pi-durable/coordinator.env` limited to non-secret settings; the watchdog has its own non-secret file.
+
+The entry point captures provider configuration before scrubbing the process environment. The scrubber removes
+all provider-prefixed variables, including non-secret `OPENAI_BASE_URL` and `OPENAI_CODEX_GATEWAY`; parsing a copy
+taken afterward would silently select the default API endpoint. `deploy/gcp/environment.ts` preserves those
+settings for configuration parsing while keeping them out of child environments. Gateway deployments must retain
+their configured base URL and gateway flag alongside the pinned model.
 
 After an approved infrastructure apply, the owner adds values directly in the
 Google Cloud Secret Manager console, under these IDs:

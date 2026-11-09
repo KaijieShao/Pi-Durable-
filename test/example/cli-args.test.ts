@@ -473,7 +473,7 @@ test("owner CLI without a running Coordinator: says so and exits 3; status falls
 		const fallback = out.join("");
 		assert.match(
 			fallback,
-			/^READ-ONLY STATUS FROM THE DATABASE: the Coordinator is not running, so nothing below is live and no command can change it\.\nGroup -1001234567890: frozen \(reason: stop unconfirmed\)/,
+			/^READ-ONLY STATUS FROM THE DATABASE: the Coordinator is not running, so nothing below is live and no command can change it\.\nRepository: acme\/signup-demo\nTelegram routing: group -1001234567890, topic 1 \(General\)\nDatabase: \/[^\n]+\/coordinator\.sqlite\nGroup -1001234567890: frozen \(reason: stop unconfirmed\)/,
 		);
 		const printed = out.join("") + err.join("");
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!printed.includes(secret));
@@ -520,6 +520,8 @@ test("the owner CLI reads no secret: only its own variables, even from the Coord
 		const config = loadOwnerConfig({ envFile, env });
 		assert.deepEqual(config, {
 			groupChatId: GROUP,
+			topicId: 1,
+			repository: "acme/signup-demo",
 			paths: { dataDir: dir, taskDir: join(dir, "t") },
 			disk: {
 				bootMinFreeBytes: undefined,
@@ -533,6 +535,20 @@ test("the owner CLI reads no secret: only its own variables, even from the Coord
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!serialized.includes(secret));
 		// Real variables win over the file.
 		assert.equal(loadOwnerConfig({ envFile, env: { TELEGRAM_GROUP_CHAT_ID: "-42" } }).groupChatId, -42);
+		const routed = loadOwnerConfig({ envFile, env: { TELEGRAM_GROUP_TOPIC_ID: "124", GITHUB_REPO: "acme/workshop" } });
+		assert.equal(routed.topicId, 124);
+		assert.equal(routed.repository, "acme/workshop");
+		assert.throws(
+			() =>
+				loadOwnerConfig({
+					env: {
+						PI_DATA_DIR: dir,
+						TELEGRAM_GROUP_CHAT_ID: String(GROUP),
+						GITHUB_REPO: "https://secret@example.com/repo",
+					},
+				}),
+			/GITHUB_REPO: must be owner\/name/,
+		);
 		assert.throws(() => loadOwnerConfig({ envFile: join(dir, "none.env"), env: {} }), /--env-file/);
 
 		// No secret in the environment at all: the CLI still works (here: the Coordinator is not running, exit 3).
@@ -546,6 +562,31 @@ test("the owner CLI reads no secret: only its own variables, even from the Coord
 			OWNER_EXIT.config,
 		);
 		assert.match(err.join(""), /TELEGRAM_GROUP_CHAT_ID: must be a negative integer/);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("offline owner status identifies its configured topic, repository and absolute database without changing the database", async () => {
+	const { dir, cleanup } = await tempDir();
+	try {
+		const store = new Store(join(dir, COORDINATOR_DB));
+		seed(store);
+		store.close();
+		const before = files(dir)[COORDINATOR_DB];
+		const output: string[] = [];
+		const env = { ...validEnv(dir), TELEGRAM_GROUP_TOPIC_ID: "124", GITHUB_REPO: "acme/workshop" };
+		const code = await runOwnerCommand(
+			{ action: "status" },
+			{ env, stdout: (text) => output.push(text), stderr: () => {} },
+		);
+		assert.equal(code, OWNER_EXIT.notRunning);
+		const status = output.join("");
+		assert.ok(status.startsWith("READ-ONLY STATUS FROM THE DATABASE:"));
+		assert.ok(status.includes("Repository: acme/workshop\nTelegram routing: group -1001234567890, topic 124\n"));
+		assert.ok(status.includes(`Database: ${join(dir, COORDINATOR_DB)}\n`));
+		assert.equal(files(dir)[COORDINATOR_DB], before);
+		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!status.includes(secret));
 	} finally {
 		await cleanup();
 	}

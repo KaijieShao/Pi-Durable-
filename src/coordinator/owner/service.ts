@@ -53,7 +53,11 @@ function coordinatorLine(deps: OwnerServiceDeps): string {
 async function status(deps: OwnerServiceDeps): Promise<OwnerResponse> {
 	const { store, config } = deps;
 	const disk = await diskReport(store, config);
-	const text = ownerStatus(store, config.telegram.groupChatId, disk);
+	const text = ownerStatus(store, config.telegram.groupChatId, disk, {
+		repository: config.github.repo,
+		topicId: config.telegram.topicId,
+		databasePath: join(config.paths.dataDir, "coordinator.sqlite"),
+	});
 	return { ok: true, text: `${coordinatorLine(deps)}\n${text}` };
 }
 

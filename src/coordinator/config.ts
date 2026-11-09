@@ -183,6 +183,9 @@ export function loadCoordinatorConfig(options: { envFile?: string; env?: NodeJS.
 export type OwnerConfig = {
 	/** TELEGRAM_GROUP_CHAT_ID: the group of `owner unfreeze` without an argument and of the read-only status. */
 	readonly groupChatId: number;
+	/** Non-secret routing identity for the offline status; live status uses the server's own configuration. */
+	readonly topicId: number;
+	readonly repository: string | undefined;
 	/** PI_DATA_DIR (the owner socket, the database) and PI_TASK_DIR, resolved exactly as for the Coordinator. */
 	readonly paths: { readonly dataDir: string; readonly taskDir: string };
 	/** The disk settings the read-only status reports (PI_BOOT_DISK_MIN_FREE, ...), parsed as for the Coordinator. */
@@ -194,6 +197,8 @@ export const OWNER_VARIABLES = [
 	"PI_DATA_DIR",
 	"PI_TASK_DIR",
 	"TELEGRAM_GROUP_CHAT_ID",
+	"TELEGRAM_GROUP_TOPIC_ID",
+	"GITHUB_REPO",
 	"PI_BOOT_DISK_MIN_FREE",
 	"PI_TASK_DISK_MIN_FREE",
 	"PI_TASK_DISK_BUDGET",
@@ -207,8 +212,13 @@ export function parseOwnerConfig(
 ): OwnerConfig {
 	const out = collector();
 	const dataDir = dataDirFrom(env.PI_DATA_DIR, defaults);
+	const repository = nonEmpty(env.GITHUB_REPO);
+	if (repository !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository))
+		out.add("GITHUB_REPO", "must be owner/name");
 	const config: OwnerConfig = {
 		groupChatId: parseInteger(env, "TELEGRAM_GROUP_CHAT_ID", out, { negative: true, required: true }),
+		topicId: parseInteger(env, "TELEGRAM_GROUP_TOPIC_ID", out, { fallback: 1 }),
+		repository,
 		paths: { dataDir, taskDir: taskDirFrom(env, dataDir, defaults.cwd) },
 		disk: parseDisk(env, out),
 	};

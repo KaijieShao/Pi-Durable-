@@ -6,6 +6,7 @@
  */
 
 import { statSync } from "node:fs";
+import { resolve } from "node:path";
 import { redact } from "../../runtime/redact.ts";
 import { type SweepRow, WATCHDOG_PID_KEY } from "../../watchdog/protocol.ts";
 import { type BranchHold, readBranchHold } from "../branch-hold.ts";
@@ -35,8 +36,27 @@ const RECENT_TERMINAL = 10;
  * outbox, the evaluation in progress (sealing) and the last one, then `disk` (diskReport(): free space and usage of
  * both disks). Metadata only: no task text.
  */
-export function ownerStatus(store: Store, chatId: number, disk: readonly string[] = []): string {
-	const lines = [groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
+export type StatusIdentity = {
+	readonly repository: string | undefined;
+	readonly topicId: number;
+	readonly databasePath: string;
+};
+
+export function ownerStatus(
+	store: Store,
+	chatId: number,
+	disk: readonly string[] = [],
+	identity?: StatusIdentity,
+): string {
+	const routing =
+		identity === undefined
+			? []
+			: [
+					`Repository: ${identity.repository ?? "not configured in the owner CLI environment"}`,
+					`Telegram routing: group ${chatId}, topic ${identity.topicId}${identity.topicId === 1 ? " (General)" : ""}`,
+					`Database: ${resolve(identity.databasePath)}`,
+				];
+	const lines = [...routing, groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
 	const queued = store.get<Count>("SELECT COUNT(*) AS n FROM runs WHERE state = 'queued'")?.n ?? 0;
 	lines.push(`Queued runs: ${queued}`);
 	const open = store.all<TaskRow>(

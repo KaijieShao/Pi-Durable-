@@ -7,7 +7,16 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/dist", "!**/node_modules", "!**/.notes", "!**/package-lock.json"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/.notes",
+      "!**/.ystack",
+      "!**/.claude",
+      "!spec/diagrams",
+      "!**/package-lock.json"
+    ]
   },
   "formatter": {
     "enabled": true,
