@@ -5,7 +5,7 @@
  * sees it gone knows the watchdog (or recovery) killed it.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { runnerArgv } from "../../src/runner/argv.ts";
@@ -14,6 +14,7 @@ import { waitFor } from "./env.ts";
 const DUMMY = [
 	"for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});",
 	"setInterval(() => {}, 1 << 30);",
+	"process.send('ready', () => process.disconnect());",
 	"",
 ].join("\n");
 
@@ -24,20 +25,23 @@ export type MarkedProcess = {
 	alive(): boolean;
 };
 
-/** Spawn it (detached: its own process group, like a Pi process) and wait until `ps` shows its markers. */
+/** Spawn an immutable entry (detached, like Pi), and wait for its signal handlers and `ps` markers. */
 export async function markedProcess(
 	t: TestContext,
 	dir: string,
 	deployment: string,
 	runId: number,
 ): Promise<MarkedProcess> {
-	const entry = join(dir, "dummy-pi", "runner", "main.js");
-	await mkdir(join(dir, "dummy-pi", "runner"), { recursive: true });
+	// Rewriting one shared main.js can truncate it while an earlier child is loading it. That child then
+	// exits normally, giving a false watchdog failure. Each stand-in owns an entry which is never rewritten.
+	const home = await mkdtemp(join(dir, "dummy-pi-"));
+	const entry = join(home, "runner", "main.js");
+	await mkdir(join(home, "runner"), { recursive: true });
 	await writeFile(entry, DUMMY);
 	const args = runnerArgv({ transport: "stdio", conversationAccess: "private", deployment, runId });
 	const child: ChildProcess = spawn(process.execPath, [entry, ...args], {
 		detached: true,
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", "ignore", "ipc"],
 		env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
 	});
 	const pid = child.pid ?? 0;
@@ -50,6 +54,14 @@ export async function markedProcess(
 	);
 	t.after(() => {
 		if (!gone) process.kill(pid, "SIGKILL");
+	});
+	await new Promise<void>((resolve, reject) => {
+		child.once("message", (message) => {
+			if (message === "ready") resolve();
+			else reject(new Error("unexpected marked-process readiness message"));
+		});
+		child.once("error", reject);
+		child.once("exit", (code, signal) => reject(new Error(`marked process exited before ready: ${code}/${signal}`)));
 	});
 	await waitFor(
 		() =>
