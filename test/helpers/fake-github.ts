@@ -69,6 +69,11 @@ export async function originGit(
 			if ((options.okCodes ?? [0]).includes(code ?? -1)) resolve({ code: code ?? -1, stdout });
 			else reject(new Error(`git ${args[0]} failed (${code}): ${Buffer.concat(err).toString("utf8").trim()}`));
 		});
+		// Git can reject its arguments and close stdin before a large fixture input has drained.
+		// Its exit status is authoritative; other input-stream errors still reject the operation.
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code !== "EPIPE") reject(error);
+		});
 		child.stdin.end(options.input ?? "");
 	});
 }
