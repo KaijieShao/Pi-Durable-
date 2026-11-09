@@ -604,6 +604,8 @@ export async function startStack(options: StackOptions = {}) {
 				// The owner CLI's own configuration (it reads no secret), from this stack's.
 				config: {
 					groupChatId: config.telegram.groupChatId,
+					topicId: config.telegram.topicId,
+					repository: config.github.repo,
 					paths: { dataDir: config.paths.dataDir, taskDir: config.paths.taskDir },
 					disk: config.disk,
 				},
