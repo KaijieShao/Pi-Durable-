@@ -20,7 +20,9 @@ if (
 )
 	throw new Error("invalid retention policy");
 const report: Record<string, unknown> = { at: Date.now(), apply: config.apply === true };
-report.bundles = await retainBundles(config.policy, Date.now(), config.apply === true);
+const bundles = await retainBundles(config.policy, Date.now(), config.apply === true);
+report.bundles = bundles;
+if (bundles.some((bundle) => bundle.outcome === "error")) process.exitCode = 1;
 
 async function docker(args: string[]): Promise<string> {
 	return (await exec("docker", args, { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })).stdout.trim();
