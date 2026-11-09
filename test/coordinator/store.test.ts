@@ -43,8 +43,8 @@ const columns = (store: Store, table: string): string[] =>
 test("a new database is created at the current schema version, with the watchdog's table and the effect ledger", async (t) => {
 	const store = new Store(await tempDb(t));
 	t.after(() => store.close());
-	assert.equal(SCHEMA_VERSION, 4);
-	assert.equal(store.getMeta("schema_version"), "4");
+	assert.equal(SCHEMA_VERSION, 5);
+	assert.equal(store.getMeta("schema_version"), String(SCHEMA_VERSION));
 	assert.ok(columns(store, "watchdog_sweeps").includes("verified"));
 	assert.ok(columns(store, "runs").includes("dispatched_at"));
 	assert.deepEqual(columns(store, "effect_intents"), [
@@ -70,7 +70,7 @@ test("an existing version-1 database upgrades to the current version in place an
 	const path = await tempDb(t);
 	createV1(path);
 	const store = new Store(path);
-	assert.equal(store.getMeta("schema_version"), "4");
+	assert.equal(store.getMeta("schema_version"), String(SCHEMA_VERSION));
 	assert.equal(store.getMeta("telegram_offset"), "42", "meta kept");
 	const run = store.get<{ state: string; pid: number; dispatched_at: number | null }>(
 		"SELECT state, pid, dispatched_at FROM runs WHERE id = 1",
@@ -92,7 +92,7 @@ test("an existing version-1 database upgrades to the current version in place an
 	// Opening it again changes nothing.
 	store.close();
 	const again = new Store(path);
-	assert.equal(again.getMeta("schema_version"), "4");
+	assert.equal(again.getMeta("schema_version"), String(SCHEMA_VERSION));
 	again.close();
 });
 
@@ -115,7 +115,7 @@ test("a version-2 database upgrades to the current version in place: the effect 
 	db.close();
 	const store = new Store(path);
 	t.after(() => store.close());
-	assert.equal(store.getMeta("schema_version"), "4");
+	assert.equal(store.getMeta("schema_version"), String(SCHEMA_VERSION));
 	const run = store.get<{ state: string; dispatched_at: number }>("SELECT state, dispatched_at FROM runs WHERE id = 1");
 	assert.deepEqual({ ...run }, { state: "running", dispatched_at: 5 }, "the running run is kept as it was");
 	assert.equal(store.get<{ n: number }>("SELECT COUNT(*) AS n FROM effect_intents")?.n, 0);
@@ -141,7 +141,7 @@ test("a version-2 database upgrades to the current version in place: the effect 
 	);
 });
 
-test("a version-3 database upgrades to version 4 in place: the evaluations table is added, every row kept", async (t) => {
+test("a version-3 database upgrades to the current version in place: evaluation and delivery metadata are added, every row kept", async (t) => {
 	const path = await tempDb(t);
 	// Version 3 exactly as it shipped: a fresh version-3 database is a version-4 one without the evaluations table.
 	const fresh = new Store(path);
@@ -155,7 +155,7 @@ test("a version-3 database upgrades to version 4 in place: the evaluations table
 	fresh.close();
 	const store = new Store(path);
 	t.after(() => store.close());
-	assert.equal(store.getMeta("schema_version"), "4");
+	assert.equal(store.getMeta("schema_version"), String(SCHEMA_VERSION));
 	assert.equal(store.groupState(-100).state, "frozen", "rows kept");
 	store.tx(() =>
 		store.run(
@@ -194,6 +194,41 @@ test("a database of a newer schema version is refused, and left untouched", asyn
 	assert.equal(tables.length, 0);
 });
 
+test("schema 4 to 5 adds only delivery metadata; original Tasks 8/9, pending replies and offsets are byte-for-byte preserved, including a later roll-forward", async (t) => {
+	const path = await tempDb(t);
+	const old = new Store(path);
+	old.tx(() => {
+		old.run("DROP TABLE outbox_delivery_attempts");
+		old.setMeta("schema_version", "4");
+		old.setMeta("telegram_offset", "12345");
+		for (const id of [8, 9])
+			old.run(
+				"INSERT INTO tasks(id,chat_id,creator_id,agent_id,text,update_id,state,branch,worktree_path,created_at,updated_at) VALUES (?, -100, 7, 'alpha', 'protected', ?, 'review', ?, ?, 1, 2)",
+				id,
+				1000 + id,
+				`task/${id}`,
+				`/protected/task-${id}`,
+			);
+		old.enqueue({ chatId: -100, priority: "required", kind: "status_answered", text: "pending" });
+	});
+	const before = JSON.stringify(old.all("SELECT * FROM tasks ORDER BY id"));
+	const outbox = JSON.stringify(old.all("SELECT * FROM outbox ORDER BY id"));
+	old.close();
+	const upgraded = new Store(path);
+	assert.equal(JSON.stringify(upgraded.all("SELECT * FROM tasks ORDER BY id")), before);
+	assert.equal(JSON.stringify(upgraded.all("SELECT * FROM outbox ORDER BY id")), outbox);
+	assert.equal(upgraded.getMeta("telegram_offset"), "12345");
+	assert.ok(columns(upgraded, "outbox_delivery_attempts").includes("telegram_message_id"));
+	// Additive rollback keeps the table; a later upgrade is idempotent and still preserves every original row.
+	upgraded.tx(() => upgraded.setMeta("schema_version", "4"));
+	upgraded.close();
+	const again = new Store(path);
+	t.after(() => again.close());
+	assert.equal(again.getMeta("schema_version"), "5");
+	assert.equal(JSON.stringify(again.all("SELECT * FROM tasks ORDER BY id")), before);
+	assert.equal(JSON.stringify(again.all("SELECT * FROM outbox ORDER BY id")), outbox);
+});
+
 test("two connections opening the same new file (Coordinator and watchdog) both get the current schema", async (t) => {
 	const path = await tempDb(t);
 	const first = new Store(path);
@@ -202,8 +237,8 @@ test("two connections opening the same new file (Coordinator and watchdog) both 
 		first.close();
 		second.close();
 	});
-	assert.equal(first.getMeta("schema_version"), "4");
-	assert.equal(second.getMeta("schema_version"), "4");
+	assert.equal(first.getMeta("schema_version"), String(SCHEMA_VERSION));
+	assert.equal(second.getMeta("schema_version"), String(SCHEMA_VERSION));
 	first.tx(() => first.setMeta("watchdog_heartbeat_at", "123"));
 	assert.equal(second.getMeta("watchdog_heartbeat_at"), "123", "one file, two connections (WAL)");
 });

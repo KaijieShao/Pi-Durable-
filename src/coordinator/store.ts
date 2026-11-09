@@ -16,7 +16,7 @@ import { splitTelegramText } from "./telegram/split.ts";
  * same. The Coordinator and the watchdog open this file each with their own connection; whichever comes first
  * migrates, inside one `BEGIN IMMEDIATE` transaction (the other waits, then finds the current version).
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** Version 1 of the schema, exactly as it shipped (exported for the upgrade test). */
 export const SCHEMA_V1 = `
@@ -308,6 +308,21 @@ CREATE TABLE evaluations (
   cleanup_verified INTEGER CHECK (cleanup_verified IN (0, 1))
 );
 CREATE INDEX evaluations_state ON evaluations(state);
+`,
+	// 4 → 5: delivery-attempt metadata. No task/run/approval row changes. IF NOT EXISTS supports the documented
+	// additive rollback (the old runtime ignores this table; its schema-version gate is reset only while stopped).
+	`
+CREATE TABLE IF NOT EXISTS outbox_delivery_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  outbox_id INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  state TEXT NOT NULL CHECK (state IN ('started','sent','retry','rate_limited','failed','uncertain')),
+  error_kind TEXT,
+  status INTEGER,
+  telegram_message_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS outbox_delivery_attempts_row ON outbox_delivery_attempts(outbox_id, id);
 `,
 ];
 

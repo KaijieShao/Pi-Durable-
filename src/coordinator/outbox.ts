@@ -1,5 +1,5 @@
 import { errorSummary, type Logger } from "../runtime/log.ts";
-import { type TelegramApi, TelegramError } from "./ports.ts";
+import { type TelegramApi, TelegramError, type TelegramErrorKind } from "./ports.ts";
 import type { Store } from "./store.ts";
 import { TELEGRAM_TEXT_LIMIT } from "./telegram/split.ts";
 
@@ -18,7 +18,11 @@ import { TELEGRAM_TEXT_LIMIT } from "./telegram/split.ts";
  *   end is saved in the store (meta `outbox_hold_until`) and read back at start, so a restart still honours it.
  * - Any other 4xx → state failed + a failed_events row (outbox kind and a metadata-only reason) for the owner CLI.
  * - Delivery is at-least-once: a crash (or a lost response) between Telegram accepting a message and the row being
- *   marked sent makes the row go out again after restart. Nothing is ever dropped.
+ *   marked sent makes the row go out again after restart. Permanent refusals remain explicitly failed. Telegram
+ *   has no sendMessage idempotency key: an accepted-but-unconfirmed send can duplicate on retry. Confirmed receipts
+ *   are kept in memory while SQLite is unavailable, so that particular persistence failure does not send twice.
+ * - Every HTTP attempt has durable metadata saved BEFORE sending. An unsettled attempt found on restart is marked
+ *   uncertain, never reported as a confirmed loss or exactly-once success. Message bodies/credentials are not logged.
  *
  * Texts are plain (no parse mode). `Store.enqueue` already split longer texts into ordered parts of at most 4096
  * characters (src/coordinator/telegram/split.ts); the send-time cut below is only a guard for rows written some other
@@ -69,7 +73,34 @@ type OutboxRow = {
 	reply_to: number | null;
 	attempts: number;
 	next_attempt_at: number;
+	created_at: number;
 };
+
+type ConfirmedReceipt = { readonly row: OutboxRow; readonly attemptId: number; readonly messageId: number };
+
+function failureState(kind: TelegramErrorKind): string {
+	return {
+		rate_limited: "rate_limited",
+		permanent: "failed",
+		network: "uncertain",
+		server: "uncertain",
+		unauthorized: "retry",
+	}[kind];
+}
+
+function recoverUncertainAttempts(store: Store, log: Logger): void {
+	try {
+		const changed = store.tx(() =>
+			store.run(
+				"UPDATE outbox_delivery_attempts SET state = 'uncertain', settled_at = ? WHERE state = 'started'",
+				store.now(),
+			),
+		).changes;
+		if (changed > 0) log.warn("outbox_delivery_uncertain", { count: changed });
+	} catch {
+		log.error("outbox_attempt_recovery_failed");
+	}
+}
 
 export function startOutbox(options: OutboxOptions): OutboxSender {
 	const { store, api, log } = options;
@@ -85,6 +116,8 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 	let holdUntil = savedHold(store, log);
 	let wake: (() => void) | undefined;
 	const idleWaiters: (() => void)[] = [];
+	const receipts = new Map<number, ConfirmedReceipt>();
+	recoverUncertainAttempts(store, log);
 
 	const flushIdle = () => {
 		for (const resolve of idleWaiters.splice(0)) resolve();
@@ -105,23 +138,31 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 			wake = done;
 		});
 
-	const head = (): OutboxRow | undefined =>
-		store.get<OutboxRow>(
-			`SELECT id, chat_id, task_id, priority, kind, text, reply_to, attempts, next_attempt_at
-			 FROM outbox WHERE state = 'pending' ORDER BY priority, id LIMIT 1`,
-		);
-
-	/** Record an outcome; if the store refuses, hold all sending briefly (the row stays pending, sent again). */
-	const record = (row: OutboxRow, what: string, fn: () => void): void => {
+	const head = (): OutboxRow | undefined => {
 		try {
-			store.tx(fn);
+			return store.get<OutboxRow>(
+				`SELECT id, chat_id, task_id, priority, kind, text, reply_to, attempts, next_attempt_at, created_at
+			 FROM outbox WHERE state = 'pending' ORDER BY priority, id LIMIT 1`,
+			);
 		} catch (error) {
-			holdUntil = Math.max(holdUntil, now() + backoffMs(1));
-			log.error("outbox_record_failed", { outbox_id: row.id, outcome: what, error: errorSummary(error) });
+			log.error("outbox_read_failed", { error: errorSummary(error) });
+			return undefined;
 		}
 	};
 
-	const markSent = (row: OutboxRow, messageId: number): void =>
+	/** Record an outcome; if the store refuses, hold all sending briefly (the row stays pending, sent again). */
+	const record = (row: OutboxRow, what: string, fn: () => void): boolean => {
+		try {
+			store.tx(fn);
+			return true;
+		} catch (error) {
+			holdUntil = Math.max(holdUntil, now() + backoffMs(1));
+			log.error("outbox_record_failed", { outbox_id: row.id, outcome: what, error: errorSummary(error) });
+			return false;
+		}
+	};
+
+	const markSent = ({ row, messageId, attemptId }: ConfirmedReceipt): boolean =>
 		record(row, "sent", () => {
 			// A pending progress row may have been replaced (deleted) while it was in flight: it was still sent.
 			store.run(
@@ -130,6 +171,12 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 				messageId,
 				now(),
 				row.id,
+			);
+			store.run(
+				"UPDATE outbox_delivery_attempts SET state = 'sent', settled_at = ?, telegram_message_id = ? WHERE id = ?",
+				now(),
+				messageId,
+				attemptId,
 			);
 			if (row.task_id !== null)
 				store.run(
@@ -146,7 +193,9 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 		holdUntil = Math.max(holdUntil, now() + Math.max(1, seconds) * 1000);
 		// Saved, so a Coordinator restarted during the hold does not send before Telegram allows it.
 		const until = holdUntil;
-		record(row, "rate_limited", () => store.setMeta(OUTBOX_HOLD_KEY, String(until)));
+		record(row, "rate_limited", () => {
+			store.setMeta(OUTBOX_HOLD_KEY, String(until));
+		});
 		log.warn("outbox_rate_limited", { outbox_id: row.id, retry_after_s: seconds });
 	};
 
@@ -195,7 +244,57 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 		else scheduleRetry(row, error);
 	};
 
+	const recordAttemptFailure = (row: OutboxRow, attemptId: number, error: unknown): void => {
+		const kind = error instanceof TelegramError ? error.kind : "network";
+		const status = error instanceof TelegramError ? error.status : undefined;
+		const state = failureState(kind);
+		record(row, "attempt_failed", () => {
+			store.run(
+				"UPDATE outbox_delivery_attempts SET state = ?, settled_at = ?, error_kind = ?, status = ? WHERE id = ?",
+				state,
+				now(),
+				kind,
+				status ?? null,
+				attemptId,
+			);
+		});
+	};
+
+	const commitReceipt = (receipt: ConfirmedReceipt): void => {
+		if (!markSent(receipt)) return;
+		receipts.delete(receipt.row.id);
+		log.info("outbox_sent", {
+			outbox_id: receipt.row.id,
+			kind: receipt.row.kind,
+			task_id: receipt.row.task_id,
+			message_id: receipt.messageId,
+			attempt_id: receipt.attemptId,
+			delivery_latency_ms: now() - receipt.row.created_at,
+		});
+	};
+
+	const beginAttempt = (row: OutboxRow): number | undefined => {
+		let id: number | undefined;
+		const recorded = record(row, "attempt_started", () => {
+			store.run(
+				"UPDATE outbox_delivery_attempts SET state = 'uncertain', settled_at = ? WHERE outbox_id = ? AND state = 'started'",
+				now(),
+				row.id,
+			);
+			id = store.run(
+				"INSERT INTO outbox_delivery_attempts(outbox_id, started_at, state) VALUES (?, ?, 'started')",
+				row.id,
+				now(),
+			).lastInsertRowid;
+		});
+		if (!recorded) return undefined;
+		if (id !== undefined) log.info("outbox_attempt", { outbox_id: row.id, attempt_id: id, kind: row.kind });
+		return id;
+	};
+
 	const send = async (row: OutboxRow): Promise<void> => {
+		const attemptId = beginAttempt(row);
+		if (attemptId === undefined) return; // No HTTP side effect without durable intent.
 		let messageId: number;
 		try {
 			const result = await api.sendMessage(
@@ -209,27 +308,27 @@ export function startOutbox(options: OutboxOptions): OutboxSender {
 			);
 			messageId = result.messageId;
 		} catch (error) {
+			recordAttemptFailure(row, attemptId, error);
 			// Aborted by stop(): the outcome is unknown; the row stays pending and goes out again after restart.
 			if (stopped && controller.signal.aborted) return;
 			onFailure(row, error);
 			return;
 		}
-		markSent(row, messageId);
-		log.debug("outbox_sent", { outbox_id: row.id, kind: row.kind, task_id: row.task_id, message_id: messageId });
+		const receipt = { row, messageId, attemptId };
+		receipts.set(row.id, receipt);
+		commitReceipt(receipt);
 	};
 
 	/** Send the head row if it is due; otherwise return how long to wait (0 = look again at once). */
 	const step = async (): Promise<number> => {
 		const t = now();
 		if (t < holdUntil) return holdUntil - t;
-		let row: OutboxRow | undefined;
-		try {
-			row = head();
-		} catch (error) {
-			log.error("outbox_read_failed", { error: errorSummary(error) });
-			flushIdle();
-			return pollMs;
+		const receipt = receipts.values().next().value;
+		if (receipt !== undefined) {
+			commitReceipt(receipt);
+			return 0;
 		}
+		const row = head();
 		if (row === undefined || row.next_attempt_at > t) {
 			flushIdle();
 			return row === undefined ? pollMs : Math.min(pollMs, row.next_attempt_at - t);

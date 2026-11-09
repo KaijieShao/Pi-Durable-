@@ -216,8 +216,10 @@ function housekeepingLines(store: Store): string[] {
 	const failed = count("SELECT COUNT(*) AS n FROM failed_events");
 	const merges = count("SELECT COUNT(*) AS n FROM merge_intents WHERE state = 'pending'");
 	const quarantined = count("SELECT COUNT(*) AS n FROM conversations WHERE quarantined = 1");
+	const uncertain = count("SELECT COUNT(*) AS n FROM outbox_delivery_attempts WHERE state = 'uncertain'");
 	return [
 		`Outbox: ${pending} pending; failed events: ${failed}${failed > 0 ? " (owner failed-events)" : ""}`,
+		`Unconfirmed delivery attempts: ${uncertain}${uncertain > 0 ? " (a retry can duplicate; compare Telegram receipts)" : ""}`,
 		`Pending merge intents: ${merges}`,
 		`Quarantined conversations: ${quarantined}${quarantined > 0 ? " (read-only: owner conversations, owner inspect <id>)" : ""}`,
 	];

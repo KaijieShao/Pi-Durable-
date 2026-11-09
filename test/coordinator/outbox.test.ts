@@ -394,6 +394,64 @@ describe("outbox: what is sent", () => {
 });
 
 describe("outbox: at-least-once", () => {
+	it("confirmed Telegram receipt plus temporary SQLite failure: only database commits retry, one HTTP send and one visible reply", async () => {
+		const store = openStore();
+		const id = enqueue(store, { text: "confirmed once", taskId: 4, replyTo: 88 });
+		const original = store.run.bind(store);
+		let failures = 2;
+		store.run = (sql, ...params) => {
+			if (sql.includes("UPDATE outbox SET state = 'sent'") && failures-- > 0) throw new Error("injected SQLITE_FULL");
+			return original(sql, ...params);
+		};
+		const sender = start(store);
+		await waitFor(() => row(store, id).state === "sent");
+		await sender.idle();
+		assert.equal(fake.count("sendMessage"), 1);
+		assert.deepEqual(
+			fake.sent().map((m) => m.text),
+			["confirmed once"],
+		);
+		assert.equal(store.get<{ n: number }>("SELECT count(*) AS n FROM task_messages WHERE task_id=4")?.n, 1);
+		assert.deepEqual(
+			store.all<{ state: string }>("SELECT state FROM outbox_delivery_attempts").map((a) => a.state),
+			["sent"],
+		);
+	});
+
+	it("no HTTP send occurs without a persisted delivery attempt; injected send refusals recover with every queued reply accepted exactly once", async () => {
+		const store = openStore();
+		for (let i = 0; i < 12; i++) enqueue(store, { text: `receipt-${i}`, replyTo: 100 + i });
+		const original = store.tx.bind(store);
+		let unavailable = true;
+		store.tx = (fn) =>
+			original(() => {
+				const result = fn();
+				if (unavailable && (store.get<{ n: number }>("SELECT COUNT(*) AS n FROM outbox_delivery_attempts")?.n ?? 0) > 0)
+					throw new Error("injected commit failure after INSERT");
+				return result;
+			});
+		const sender = start(store);
+		await sleep(65);
+		assert.equal(fake.count("sendMessage"), 0, "do not send while intent storage is unavailable");
+		fake.failNext("sendMessage", { status: 429, retryAfter: 1 });
+		fake.failNext("sendMessage", { status: 503 });
+		fake.failNext("sendMessage", { drop: "before" });
+		unavailable = false;
+		sender.kick();
+		await waitFor(() => store.get<{ n: number }>("SELECT count(*) AS n FROM outbox WHERE state='sent'")?.n === 12);
+		await sender.idle();
+		assert.deepEqual(
+			fake.sent().map((m) => m.text),
+			Array.from({ length: 12 }, (_, i) => `receipt-${i}`),
+		);
+		assert.equal(new Set(fake.sent().map((m) => m.replyTo)).size, 12);
+		assert.equal(
+			store.get<{ n: number }>("SELECT count(*) AS n FROM outbox_delivery_attempts WHERE state='rate_limited'")?.n,
+			1,
+		);
+		assert.equal(store.get<{ n: number }>("SELECT count(*) AS n FROM outbox WHERE state!='sent'")?.n, 0);
+	});
+
 	it("a lost response after Telegram accepted the message: sent again (duplicate), never lost", async () => {
 		const store = openStore();
 		fake.failNext("sendMessage", { drop: "after" });
@@ -408,6 +466,11 @@ describe("outbox: at-least-once", () => {
 		const sent = row(store, id);
 		assert.equal(sent.telegram_message_id, fake.sent()[1]?.id);
 		assert.equal(store.get<{ n: number }>("SELECT count(*) AS n FROM task_messages WHERE task_id = 9")?.n, 1);
+		assert.equal(
+			store.get<{ n: number }>("SELECT count(*) AS n FROM outbox_delivery_attempts WHERE state='uncertain'")?.n,
+			1,
+			"accepted-but-lost response is explicitly uncertain; strict exactly-once is not claimed",
+		);
 	});
 
 	it("a crash between send and mark: after restart the row is sent again", async () => {
