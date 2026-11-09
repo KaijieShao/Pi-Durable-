@@ -144,6 +144,7 @@ const TASK_COLUMNS = `id, chat_id, creator_id, agent_id, text, state, reason, br
 	head_commit, posted_head, tests_passed_head, pr_number, pr_url, followup_count, cancel_requested`;
 
 export function handleUpdate(store: Store, ctx: CommandContext, update: Update): { kick: boolean } {
+	const receivedAt = store.now();
 	const { telegram } = ctx.config;
 	const parsed = parseUpdate(update, {
 		groupChatId: telegram.groupChatId,
@@ -155,7 +156,7 @@ export function handleUpdate(store: Store, ctx: CommandContext, update: Update):
 
 	const result = store.tx((): Result | undefined => {
 		// Redelivered update: already handled (it has its row), so no second effect and no second reply.
-		if (!recordCommand(store, update, parsed)) return undefined;
+		if (!recordCommand(store, update, parsed, receivedAt)) return undefined;
 		const outcome = route(store, ctx, parsed, disk);
 		enqueueReplies(store, parsed, outcome);
 		store.run(
@@ -175,6 +176,8 @@ export function handleUpdate(store: Store, ctx: CommandContext, update: Update):
 	}
 	ctx.log.info("command", {
 		update_id: update.update_id,
+		telegram_date_s: update.message?.date,
+		received_at_ms: receivedAt,
 		kind: result.kind,
 		outcome: result.outcome,
 		code: result.code,
@@ -184,7 +187,7 @@ export function handleUpdate(store: Store, ctx: CommandContext, update: Update):
 }
 
 /** Insert the commands row keyed by the update id; false if the update was already saved. */
-function recordCommand(store: Store, update: Update, parsed: ParsedUpdate): boolean {
+function recordCommand(store: Store, update: Update, parsed: ParsedUpdate, receivedAt: number): boolean {
 	const meta = parsed.kind === "ignored" ? rawMeta(update) : parsed;
 	const kind: CommandKind = parsed.kind === "command" ? parsed.name : parsed.kind === "reply" ? "followup" : "ignored";
 	return (
@@ -196,7 +199,7 @@ function recordCommand(store: Store, update: Update, parsed: ParsedUpdate): bool
 			meta.userId,
 			meta.messageId,
 			kind,
-			store.now(),
+			receivedAt,
 		).changes === 1
 	);
 }
