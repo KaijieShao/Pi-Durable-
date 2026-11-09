@@ -8,7 +8,7 @@
  * When the Coordinator is not running the CLI says so and exits 3. `owner status` then also prints the status from a
  * read-only connection to the database, labelled as such (nothing in it is live); nothing else has a fallback.
  *
- * Its configuration is its own (loadOwnerConfig: PI_DATA_DIR, PI_TASK_DIR, TELEGRAM_GROUP_CHAT_ID and the disk sizes;
+ * Its configuration is its own (loadOwnerConfig: paths, group/topic, repository and the disk sizes;
  * Deployment § Secrets: "The secrets are held only in the Coordinator's memory"): given the Coordinator's env file, it
  * reads those lines only, so the bot token, the model key and the GitHub token never reach the CLI.
  *
@@ -89,7 +89,11 @@ async function fallbackStatus(config: OwnerConfig, io: Io): Promise<void> {
 	try {
 		store = new Store(path, Date.now, { readOnly: true });
 		const disk = await diskReport(store, config);
-		const status = ownerStatus(store, config.groupChatId, disk);
+		const status = ownerStatus(store, config.groupChatId, disk, {
+			repository: config.repository,
+			topicId: config.topicId,
+			databasePath: path,
+		});
 		io.stdout(
 			"READ-ONLY STATUS FROM THE DATABASE: the Coordinator is not running, so nothing below is live and no command " +
 				`can change it.\n${status}\n`,

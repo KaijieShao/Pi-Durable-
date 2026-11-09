@@ -67,6 +67,7 @@ let counter = 0;
  */
 async function launch(options: {
 	input: string;
+	codexGateway?: boolean;
 	steers?: RunnerInput[];
 	conversation?: string;
 	fresh?: boolean;
@@ -83,7 +84,12 @@ async function launch(options: {
 		taskId: 100 + id,
 		conversationPath: conversation,
 		fresh: options.fresh ?? true,
-		model: { modelId: "gpt-4.1-mini", thinkingLevel: "off", relayBaseUrl: fake.url, codexGateway: false },
+		model: {
+			modelId: "gpt-4.1-mini",
+			thinkingLevel: "off",
+			relayBaseUrl: fake.url,
+			codexGateway: options.codexGateway ?? false,
+		},
 		input: { content: options.input, requestId: `u${id}` },
 		steers: options.steers ?? [],
 		instructions: "You are agent alpha. Keep answers short.",
@@ -192,6 +198,24 @@ function statuses(run: Run, requestId: string): string[] {
 }
 
 describe("Pi runner process", { timeout: 120_000 }, () => {
+	it("adapts the real Harness request for a Codex gateway without losing its tools", async () => {
+		script(() => ({ text: "Gateway request accepted." }));
+		const run = await launch({ input: "Read package.json", codexGateway: true });
+		const { finished, exit } = await settle(run);
+		assert.equal(finished.outcome, "answered");
+		assert.equal(exit.code, 0);
+		assert.equal(fake.requests.length, 1);
+		const body = fake.requests[0]?.body;
+		assert.match(body.instructions, /You are agent alpha/);
+		assert.ok(!("max_output_tokens" in body));
+		assert.deepEqual(body.tools.map((tool: { name: string }) => tool.name).sort(), [
+			"edit",
+			"read",
+			"run_check",
+			"write",
+		]);
+	});
+
 	it("runs a tool call through the IPC executor and finishes answered", async () => {
 		script(({ index }) =>
 			index === 0

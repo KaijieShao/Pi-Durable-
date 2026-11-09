@@ -27,12 +27,13 @@ after(() => {
 	for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
-function config(dataDir: string): CoordinatorConfig {
+function config(dataDir: string, topicId = 1): CoordinatorConfig {
 	return parseCoordinatorConfig(
 		{
 			TELEGRAM_BOT_TOKEN: `123456789:${"A".repeat(35)}`,
 			TELEGRAM_BOT_USERNAME: "owner_test_bot",
 			TELEGRAM_GROUP_CHAT_ID: String(GROUP),
+			TELEGRAM_GROUP_TOPIC_ID: String(topicId),
 			TELEGRAM_OWNER_ID: "42",
 			PI_AGENTS: "alpha",
 			PI_MODEL: "gpt-test",
@@ -47,7 +48,7 @@ function config(dataDir: string): CoordinatorConfig {
 	);
 }
 
-function setup(engine?: Partial<Engine>) {
+function setup(engine?: Partial<Engine>, topicId = 1) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pd-owner-")));
 	roots.push(root);
 	const dataDir = join(root, "data");
@@ -59,7 +60,7 @@ function setup(engine?: Partial<Engine>) {
 	const log = createLogger({ level: "debug", sink: (_level, line) => lines.push(line) });
 	const handle = ownerService({
 		store,
-		config: config(dataDir),
+		config: config(dataDir, topicId),
 		log,
 		engine: () => (engine === undefined ? undefined : (engine as Engine)),
 		startedAt: Date.parse("2026-11-08T00:00:00Z"),
@@ -100,11 +101,23 @@ test("status: whether the Coordinator runs or still starts, then the group's met
 	assert.equal(status.ok, true);
 	assert.match(
 		status.text,
-		/^Coordinator: starting \(recovery in progress\), pid \d+, since 2026-11-08T00:00:00\.000Z\nGroup -1001234567890: normal\n/,
+		/^Coordinator: starting \(recovery in progress\), pid \d+, since 2026-11-08T00:00:00\.000Z\nRepository: acme\/demo\nTelegram routing: group -1001234567890, topic 1 \(General\)\nDatabase: \/[^\n]+\/coordinator\.sqlite\nGroup -1001234567890: normal\n/,
 	);
+	assert.ok(status.text.includes(`Database: ${join(starting.dataDir, "coordinator.sqlite")}\n`));
 	assert.ok(!status.text.includes("SECRET"));
 	const running = setup({ unfreeze: async () => ({ kind: "not_frozen", state: "normal" }) });
 	assert.match((await running.ask({ command: "status" })).text, /^Coordinator: running, pid \d+/);
+});
+
+test("live status reports the server's repository, forum topic and absolute database", async () => {
+	const s = setup({ unfreeze: async () => ({ kind: "not_frozen", state: "normal" }) }, 124);
+	const result = await s.ask({ command: "status" });
+	assert.equal(result.ok, true);
+	assert.ok(result.text.includes("Repository: acme/demo\nTelegram routing: group -1001234567890, topic 124\n"));
+	assert.ok(result.text.includes(`Database: ${join(s.dataDir, "coordinator.sqlite")}\n`));
+	assert.ok(!result.text.includes("(General)"));
+	assert.ok(!result.text.includes("sk-test-not-real"));
+	assert.ok(!result.text.includes("ghp_test_not_real"));
 });
 
 test("unfreeze: only this Coordinator's group, only once the engine runs; the outcome names every check and the failed one", async () => {

@@ -121,7 +121,8 @@ resource "google_compute_firewall" "iap_ssh" {
 
 data "google_compute_image" "debian" {
   project = "debian-cloud"
-  family  = "debian-12"
+  # systemd >= 257 supplies transient-unit names to the narrow polkit authorization rule.
+  family = "debian-13"
 }
 
 resource "google_compute_disk" "tasks" {
@@ -191,6 +192,11 @@ resource "google_compute_instance" "vm" {
     provisioning_model  = "STANDARD"
     automatic_restart   = true
     on_host_maintenance = "MIGRATE"
+  }
+
+  lifecycle {
+    # Image-family updates must not replace an existing VM or its boot disk.
+    ignore_changes = [boot_disk[0].initialize_params[0].image]
   }
 
   depends_on = [google_compute_router_nat.outbound]

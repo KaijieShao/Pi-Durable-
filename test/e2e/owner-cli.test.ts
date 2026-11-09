@@ -50,7 +50,7 @@ test("the running Coordinator's owner socket: owner-only, answers the CLI, gone 
 	assert.match(
 		status.stdout,
 		new RegExp(
-			`^Coordinator: running, pid ${process.pid}, since \\S+\\nGroup ${GROUP}: normal\\nExecution slots: 0/2 in use\\n`,
+			`^Coordinator: running, pid ${process.pid}, since \\S+\\nRepository: acme/demo\\nTelegram routing: group ${GROUP}, topic 1 \\(General\\)\\nDatabase: /[^\\n]+/coordinator\\.sqlite\\nGroup ${GROUP}: normal\\nExecution slots: 0/2 in use\\n`,
 		),
 	);
 	assert.match(status.stdout, /\nWatchdog: last heartbeat \d+ s ago/);
@@ -77,7 +77,12 @@ test("the running Coordinator's owner socket: owner-only, answers the CLI, gone 
 	const down = await stack.owner("status");
 	assert.equal(down.code, 3);
 	assert.match(down.stderr, /^The Coordinator is not running \(/);
-	assert.match(down.stdout, new RegExp(`^READ-ONLY STATUS FROM THE DATABASE: .*\\nGroup ${GROUP}: normal\\n`));
+	assert.match(
+		down.stdout,
+		new RegExp(
+			`^READ-ONLY STATUS FROM THE DATABASE: .*\\nRepository: acme/demo\\nTelegram routing: group ${GROUP}, topic 1 \\(General\\)\\nDatabase: /[^\\n]+/coordinator\\.sqlite\\nGroup ${GROUP}: normal\\n`,
+		),
+	);
 	const unfreeze = await stack.owner("unfreeze");
 	assert.equal(unfreeze.code, 3);
 	assert.match(unfreeze.stderr, /An unfreeze needs the running Coordinator/);
