@@ -166,10 +166,11 @@ describe("systemd isolation on this Linux host (real systemd)", { skip, timeout:
 	});
 
 	it("kill() stops the whole unit and exited resolves only once it is gone", async () => {
+		const requestsBefore = fake.requests.length;
 		fake.script(() => ({ hang: true }));
 		const start = startFor(++nextRun, "hang");
 		const { handle } = launch(launcher, start);
-		await fake.waitForRequests(1, 30_000);
+		await fake.waitForRequests(requestsBefore + 1, 30_000);
 		const unit = unitName(deploymentId(DATA_DIR), start.runId, 1);
 		assert.equal(unitActive(unit), "active");
 		// Restart cleanup's deployment-wide listing finds it by its name.

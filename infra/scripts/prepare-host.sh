@@ -9,7 +9,7 @@ task_mount=/mnt/pi-durable-tasks
 # Prevent package installation from starting Docker before storage is ready.
 systemctl mask containerd.service docker.service docker.socket
 apt-get -o Acquire::Retries=5 update
-apt-get -o Acquire::Retries=5 install -y --no-install-recommends docker.io nftables
+apt-get -o Acquire::Retries=5 install -y --no-install-recommends docker.io docker-cli nftables
 
 # Match the application units, runner policy and polkit rule exactly. These users have no login shell.
 getent group pi-durable >/dev/null || groupadd --system pi-durable
@@ -193,6 +193,14 @@ mountpoint -q "$task_mount"
 # Docker/containerd remain root-owned private children; the runner has no access to this tree.
 chown pi-coordinator:pi-coordinator "$task_mount"
 chmod 0750 "$task_mount"
+# A retained task disk can carry the previous OS's numeric application uid/gid.
+# Restore application-owned trees only; Docker/containerd remain root-owned.
+for application_dir in repo.git git-home worktrees repository check-scratch build scratch snapshots eval-scratch; do
+  application_path="$task_mount/$application_dir"
+  if [[ -d "$application_path" && ! -L "$application_path" ]]; then
+    chown -R --no-dereference pi-coordinator:pi-coordinator "$application_path"
+  fi
+done
 install -d -o root -g root -m 0700 "$task_mount/docker" "$task_mount/containerd"
 systemctl unmask containerd.service docker.service docker.socket
 systemctl enable --now containerd.service docker.service
