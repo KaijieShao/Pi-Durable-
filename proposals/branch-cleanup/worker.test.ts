@@ -158,6 +158,54 @@ test("unavailable GitHub preflight writes a retry only in the independent journa
 	assert.equal(await digest(f.database), before);
 	assert.equal(candidates(f.source).jobs[0]?.job.taskId, 1);
 });
+
+test("positive GitHub preflight uses the canonical repository URL and records only a dry-run candidate", async (t) => {
+	const f = await fixture();
+	t.after(() => rm(f.root, { recursive: true, force: true }));
+	const before = await digest(f.database);
+	const saved = globalThis.fetch;
+	const calls: string[] = [];
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: enumerate the complete read-only GitHub protocol fixture in one place.
+	globalThis.fetch = async (input) => {
+		const url = new URL(String(input));
+		calls.push(url.href);
+		const path = decodeURIComponent(url.pathname);
+		let body: unknown;
+		if (path === "/repos/owner/demo") body = { default_branch: "main" };
+		else if (path === "/repos/owner/demo/pulls" && url.search) body = [];
+		else if (path === "/repos/owner/demo/pulls/1")
+			body = {
+				number: 1,
+				merged: true,
+				merged_at: "2026-01-01T00:00:00Z",
+				merge_commit_sha: MERGE,
+				head: { ref: "task/1", sha: HEAD },
+				base: { ref: "main", repo: { full_name: "owner/demo" } },
+			};
+		else if (path.endsWith("/git/ref/heads/task/1")) body = { object: { sha: HEAD } };
+		else if (path.endsWith("/branches/task/1")) body = { protected: false };
+		else if (path.includes("/compare/")) body = { status: "ahead" };
+		else if (path.endsWith(`/git/commits/${HEAD}`)) body = { sha: HEAD };
+		else if (path.endsWith(`/git/commits/${MERGE}`)) body = { sha: MERGE };
+		else return new Response("{}", { status: 404 });
+		return new Response(JSON.stringify(body), { status: 200 });
+	};
+	t.after(() => {
+		globalThis.fetch = saved;
+	});
+	await runWorker(
+		f.config,
+		async () => "not-a-real-token",
+		() => {},
+	);
+	const db = new DatabaseSync(join(f.config.stateDir, "cleanup.sqlite"), { readOnly: true });
+	const row = db.prepare("SELECT result FROM cleanup_jobs").get() as { result: string };
+	assert.equal(JSON.parse(row.result).state, "would-delete");
+	db.close();
+	assert.ok(calls.includes("https://api.github.com/repos/owner/demo"));
+	assert.ok(!calls.includes("https://api.github.com/repos/owner/demo/"));
+	assert.equal(await digest(f.database), before);
+});
 test("configuration refuses relative DB paths and incomplete historical authorizations", async () => {
 	const base: WorkerConfig = { stateDir: "/tmp/cleanup-test", sources: [], policy: { ...DEFAULT_CONFIG } };
 	validateConfig(base);

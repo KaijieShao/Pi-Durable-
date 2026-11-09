@@ -160,7 +160,7 @@ export class GitHubReads {
 	async get<T>(path: string, allowAbsent = false): Promise<T> {
 		let r: Response;
 		try {
-			r = await this.fetcher(`https://api.github.com/repos/${this.repository}/${path}`, {
+			r = await this.fetcher(`https://api.github.com/repos/${this.repository}${path ? `/${path}` : ""}`, {
 				headers: {
 					Authorization: `Bearer ${this.token}`,
 					Accept: "application/vnd.github+json",
