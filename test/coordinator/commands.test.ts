@@ -898,6 +898,31 @@ describe("handleUpdate: /cancel", () => {
 });
 
 describe("handleUpdate: /status and /help", () => {
+	for (const state of ["cancelled", "failed", "merged"] as const) {
+		test(`a stopped ${state} task with a latched cancel request is not displayed as cancelling`, () => {
+			const f = fixture();
+			const id = f.submit(ANA, "alpha");
+			dispatch(f, id, "alpha");
+			f.send(ANA, `/cancel ${id}`);
+			assert.equal(f.task(id).cancel_requested, 1);
+			assert.match(f.reply(f.send(BOB, "/status").messageId), /running · cancelling/);
+			assert.match(f.reply(f.send(BOB, `/status ${id}`).messageId), /running \(cancelling\)/);
+
+			// Finalization has stopped the workload and archived its worktree. The durable cancellation flag stays set.
+			f.setRun(id, state === "merged" ? "finished" : state);
+			f.store.run("DELETE FROM slots WHERE task_id = ?", id);
+			f.store.run("UPDATE tasks SET state = ?, archived = 1, worktree_path = NULL WHERE id = ?", state, id);
+			const summary = f.reply(f.send(BOB, "/status").messageId);
+			const detail = f.reply(f.send(BOB, `/status ${id}`).messageId);
+			assert.match(summary, /Execution slots in use: 0\/2/);
+			assert.ok(summary.includes(`Task ${id} · alpha · ${state}`), summary);
+			assert.ok(detail.startsWith(`Task ${id} · agent alpha · ${state}\n`), detail);
+			assert.doesNotMatch(summary, /cancelling/);
+			assert.doesNotMatch(detail, /cancelling/);
+			assert.equal(f.task(id).cancel_requested, 1, "status reads do not rewrite cancellation history");
+		});
+	}
+
 	test("summary lists group state, slots, open tasks with positions and PR links, recent finished ones", () => {
 		const f = fixture();
 		const review = f.submit(ANA, "alpha");
