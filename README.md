@@ -22,7 +22,8 @@ plugins, OAuth login and a patched Pi Durable). That code is removed; Pi Durable
 
 | Send | What happens |
 |---|---|
-| `/task@smule_code_bot <agent> <text>` | A new task for that agent, acknowledged with its id and queue position, or refused with the reason (queue full, unknown agent, group frozen, boot disk low...) |
+| `/task@smule_code_bot <text>` | A new task, automatically assigned to a configured agent with the smallest queued/running workload and available queue capacity; acknowledged with the chosen agent, task id and queue position |
+| `/task@smule_code_bot <agent> <text>` | Explicitly choose a configured agent. Queue limits, membership, freeze, disk and approval rules remain enforced. |
 | a reply to one of the bot's messages about a task | A follow-up: steered into the task while it runs; while it is in review, another run on the same branch and pull request. Only the creator or the owner. |
 | `/status@smule_code_bot [task]` | Group state, execution slots in use, open and queued tasks with their pull requests; or one task's details |
 | `/cancel@smule_code_bot <task>` | Creator or owner: stops the task, pushes its work, closes its pull request, keeps the branch |
@@ -30,6 +31,7 @@ plugins, OAuth login and a patched Pi Durable). That code is removed; Pi Durable
 | `/help@smule_code_bot` | Commands and limits |
 
 With the bot's privacy mode on, address every command to the bot (`/task@smule_code_bot`); replies always arrive.
+The common `/task @smule_code_bot <text>` spelling is also accepted when Telegram delivers it. Agent selection is optional: a leading configured ID selects that agent; otherwise the complete text is the request. Commands for other bots and plain text without a command or a valid follow-up reply are ignored.
 
 ## How it works
 

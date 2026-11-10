@@ -83,7 +83,7 @@ export function frozenNotice(reason: string | null): string {
 }
 
 export function usageTask(agents: readonly string[]): string {
-	return `usage: /task <agent> <text>; agents: ${agents.join(", ")}`;
+	return `usage: /task <text> or /task <agent> <text>; agents: ${agents.join(", ")}`;
 }
 
 export function usageTaskId(command: "/cancel" | "/approve" | "/status"): string {
@@ -1024,6 +1024,9 @@ export function helpText(agents: readonly string[], bot: string, limits: Limits 
 			"Pi Durable coding agents for this group. Commands:",
 			`/task <agent> <text> - give a coding task to an agent (agents: ${agents.join(", ")}). ` +
 				`With privacy mode on, send /task${at} <agent> <text>.`,
+			`/task${at} <text> or /task ${at} <text> - omit the agent to use a configured agent with the smallest ` +
+				"queued/running workload and queue capacity. Equal workloads follow the configured agent order. " +
+				"A leading configured agent id selects that agent; otherwise the complete request is kept.",
 			"Reply to a task's bot message - follow-up: steered into the task while it runs, or another run on the " +
 				"same branch and pull request while it is in review.",
 			"/status - group state, execution slots and tasks; /status <task id> - details of one task.",

@@ -42,7 +42,7 @@ export type ParsedUpdate =
 			userId: number;
 			messageId: number;
 			updateId: number;
-			/** True when the command named this bot explicitly (`/task@bot`). */
+			/** True when the command named this bot explicitly (`/task@bot` or `/task @bot`). */
 			addressed: boolean;
 	  }
 	| {
@@ -125,11 +125,17 @@ function commandOf(
 	if (target !== undefined && target.toLowerCase() !== options.botUsername.toLowerCase()) return ignored("other_bot");
 	const name = command[1]?.toLowerCase() as CommandName;
 	if (!COMMAND_NAMES.includes(name)) return ignored("unknown_command");
+	let args = text.slice(command[0].length).trim();
+	// Telegram also delivers the common `/task @bot <request>` spelling. This is a bot address,
+	// never an agent id or part of the coding request. Leave every other command's grammar unchanged.
+	const mention = name === "task" ? /^@([A-Za-z0-9_]{1,64})(?=\s|$)/.exec(args) : null;
+	if (mention !== null && mention[1]?.toLowerCase() !== options.botUsername.toLowerCase()) return ignored("other_bot");
+	if (mention !== null) args = args.slice(mention[0].length).trim();
 	return {
 		kind: "command",
 		name,
-		args: text.slice(command[0].length).trim(),
-		addressed: target !== undefined,
+		args,
+		addressed: target !== undefined || mention !== null,
 		...base,
 	};
 }

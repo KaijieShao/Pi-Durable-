@@ -71,6 +71,29 @@ describe("parseUpdate: commands and bot address", () => {
 		assert.equal(ignored(parseUpdate(msg({ text: "/status@test_bot_2" }), GENERAL)), "other_bot");
 	});
 
+	it("accepts a standalone task bot mention without making it part of the request", () => {
+		for (const text of [
+			"/task @test_bot please use cooler colors\nand preserve the schedule",
+			"/task @TEST_BOT please use cooler colors\nand preserve the schedule",
+			"/task@test_bot @test_bot please use cooler colors\nand preserve the schedule",
+		]) {
+			const result = command(parseUpdate(msg({ text }), GENERAL));
+			assert.equal(result.name, "task");
+			assert.equal(result.args, "please use cooler colors\nand preserve the schedule");
+			assert.equal(result.addressed, true);
+		}
+		assert.equal(command(parseUpdate(msg({ text: "/task @test_bot beta fix it" }), GENERAL)).args, "beta fix it");
+		assert.equal(command(parseUpdate(msg({ text: "/task @test_bot" }), GENERAL)).args, "");
+	});
+
+	it("does not take tasks addressed by a standalone mention to another bot", () => {
+		for (const text of ["/task @other_bot please fix it", "/task@test_bot @other_bot alpha fix it"]) {
+			assert.equal(ignored(parseUpdate(msg({ text }), GENERAL)), "other_bot");
+		}
+		// Task shorthand must not loosen the numeric-id grammar of approvals or cancellation.
+		assert.equal(command(parseUpdate(msg({ text: "/approve @test_bot 2" }), GENERAL)).args, "@test_bot 2");
+	});
+
 	it("knows exactly the five commands; others are ignored", () => {
 		for (const name of ["task", "status", "cancel", "approve", "help"] as const) {
 			assert.equal(command(parseUpdate(msg({ text: `/${name}` }), GENERAL)).name, name);

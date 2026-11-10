@@ -43,7 +43,9 @@ Each task has its own conversation. A follow-up sent while Task A is running is 
 
 ### Tasks
 
-Members of the same Telegram group can submit a task to one of the group’s configured coding agents using `/task <agent> <text>`. Each agent has an ID; the design does not fix the number of agents or group members.
+Members of the same Telegram group can submit a task using `/task <text>` or choose one of the group’s configured coding agents using `/task <agent> <text>`. Each agent has an ID; the design does not fix the number of agents or group members. When the first argument is a configured agent ID (case-insensitive), it selects that agent. Otherwise the whole request is preserved and assigned to a configured agent with available queue capacity and the smallest total number of queued, starting, running and finalizing runs. Equal loads follow the configured agent order. Selection and queue reservation are one transaction; the existing per-agent, group and user caps still apply.
+
+Commands addressed as `/task@bot <text>` and the common `/task @bot <text>` spelling are supported. A standalone bot mention is removed only when it names this bot; a task addressed to another bot is ignored. This shorthand does not change membership, topic isolation, follow-up, cancellation or exact-commit approval rules. Plain text without a command remains ignored unless it is a valid follow-up reply. With Telegram privacy mode enabled, `/task@bot` remains the recommended spelling for reliable delivery.
 
 Several users can choose the same agent. It runs one task at a time, and later tasks share its queue rather than getting a separate agent. Different agents can work at the same time, up to a shared limit for the whole system (2 in the demo configuration). For example, if agents A and B are both running, a new task for agent C waits in its queue until one of them finishes, even though C is free.
 
