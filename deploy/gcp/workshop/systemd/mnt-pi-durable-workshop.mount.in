@@ -1,0 +1,12 @@
+[Unit]
+Description=Workshop Demo task storage on the existing task disk
+RequiresMountsFor=/mnt/pi-durable-tasks
+After=mnt-pi\x2ddurable\x2dtasks.mount
+BindsTo=mnt-pi\x2ddurable\x2dtasks.mount
+[Mount]
+What=/mnt/pi-durable-tasks/workshop-live
+Where=/mnt/pi-durable-workshop
+Type=none
+Options=bind
+[Install]
+WantedBy=multi-user.target

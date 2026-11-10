@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "runtime_source_sha": "f2c4b38250614a40e259f381e481a28bfbe64ed5",
+  "artifacts": {
+    "systemd/pi-durable-workshop-coordinator.service.in": {
+      "sha256": "7e17505238fcaffa31d511b06940250043302032a2c5624b991168134fdf1def"
+    },
+    "systemd/pi-durable-workshop-watchdog.service.in": {
+      "sha256": "bfd877eadec01f5a795ea9ae1b87e98fc46e7fb91753d47f400c58d0abe5bc1a"
+    },
+    "systemd/mnt-pi-durable-workshop.mount.in": {
+      "sha256": "0ea155a6453e6f849b1f7fbe8dc111b4ce6aba68502f19ed70ce6f3bdbb592ce"
+    },
+    "start-workshop.mjs.in": {
+      "sha256": "100d0d18fec5ca2d5acdb7b1cd4130a03ed8c785517608a846cab6d45dd111d1"
+    },
+    "require-exclusive.py": {
+      "sha256": "2b7132d172db9c1eeb64f9676dcba3e2b4246640f800ef3150cbcb3949bdcb7e"
+    },
+    "docker-scoped.in": {
+      "sha256": "894ce01578e324404e09fd48b8cc901426c995fd0360cc891ca188104afdc444"
+    }
+  },
+  "environment_files": {
+    "/opt/pi-durable-workshop/coordinator.env": {
+      "sha256": "b4c50011400828d8eb915371b50e7d90c414e9a867675b4f8bd417e79fb0b9cc",
+      "mode": "0o600"
+    },
+    "/opt/pi-durable-workshop/watchdog.env": {
+      "sha256": "980eba5a73c7dbd4dc399f276719e2f264754835aba9c5142466ee0df75c1aa3",
+      "mode": "0o640"
+    }
+  },
+  "vm_scheduling": {
+    "automaticRestart": true,
+    "onHostMaintenance": "MIGRATE",
+    "provisioningModel": "STANDARD"
+  }
+}

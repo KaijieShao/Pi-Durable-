@@ -1,0 +1,6 @@
+#!/bin/sh
+case "$1" in
+run) shift; exec /usr/bin/docker run --label pi-durable.e2e-scope={{word:CONTAINER_SCOPE}} "$@" ;;
+ps) shift; exec /usr/bin/docker ps --filter label=pi-durable.e2e-scope={{word:CONTAINER_SCOPE}} "$@" ;;
+*) exec /usr/bin/docker "$@" ;;
+esac

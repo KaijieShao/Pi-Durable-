@@ -1,0 +1,32 @@
+[Unit]
+Description=Always-on Workshop Demo Coordinator
+Wants=network-online.target docker.service pi-durable-workshop-watchdog.service
+After=network-online.target docker.service pi-durable-metadata.service pi-durable-workshop-watchdog.service
+Requires=pi-durable-metadata.service
+RequiresMountsFor=/mnt/pi-durable-workshop /var/lib/pi-durable-workshop
+BindsTo=mnt-pi\x2ddurable\x2dworkshop.mount
+After=mnt-pi\x2ddurable\x2dworkshop.mount
+ConditionPathIsMountPoint=/mnt/pi-durable-workshop
+Conflicts=pi-durable-coordinator.service pi-durable-acceptance-coordinator.service pi-durable-acceptance-s2-coordinator.service pi-durable-acceptance-s3-coordinator.service
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+User=pi-coordinator
+Group=pi-coordinator
+SupplementaryGroups=pi-durable pi-watchdog docker
+EnvironmentFile=/opt/pi-durable-workshop/coordinator.env
+Environment={{unit:COORDINATOR_ENV_1}}
+ExecStartPre=/usr/bin/python3 /opt/pi-durable-workshop/require-exclusive.py
+ExecStart=/usr/bin/node /opt/pi-durable-workshop/start-workshop.mjs
+Restart=always
+RestartSec=3
+RestartPreventExitStatus=2 3
+TimeoutStopSec=40
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+InaccessiblePaths=/var/lib/pi-durable /mnt/pi-durable-tasks/worktrees -/mnt/pi-durable-tasks/repo.git
+[Install]
+WantedBy=multi-user.target
