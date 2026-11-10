@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "template": "systemd/pi-durable-workshop-coordinator.service.in",
+      "target": "/etc/systemd/system/pi-durable-workshop-coordinator.service",
+      "kind": "systemd",
+      "mode": "0o644"
+    },
+    {
+      "template": "systemd/pi-durable-workshop-watchdog.service.in",
+      "target": "/etc/systemd/system/pi-durable-workshop-watchdog.service",
+      "kind": "systemd",
+      "mode": "0o644"
+    },
+    {
+      "template": "systemd/mnt-pi-durable-workshop.mount.in",
+      "target": "/etc/systemd/system/mnt-pi\\x2ddurable\\x2dworkshop.mount",
+      "kind": "systemd",
+      "mode": "0o644"
+    },
+    {
+      "template": "start-workshop.mjs.in",
+      "target": "/opt/pi-durable-workshop/start-workshop.mjs",
+      "kind": "script",
+      "mode": "0o644"
+    },
+    {
+      "template": "require-exclusive.py",
+      "target": "/opt/pi-durable-workshop/require-exclusive.py",
+      "kind": "script",
+      "mode": "0o644"
+    },
+    {
+      "template": "docker-scoped.in",
+      "target": "/opt/pi-durable-workshop/docker-scoped",
+      "kind": "script",
+      "mode": "0o755"
+    }
+  ],
+  "bindings": [
+    "CONTAINER_SCOPE",
+    "COORDINATOR_ENV_1",
+    "EXPECTED_GITHUB_REPO",
+    "EXPECTED_PI_DATA_DIR",
+    "EXPECTED_PI_RUNNER_ISOLATION",
+    "EXPECTED_PI_TASK_DIR",
+    "EXPECTED_TELEGRAM_GROUP_CHAT_ID",
+    "EXPECTED_TELEGRAM_GROUP_TOPIC_ID",
+    "GITHUB_SECRET",
+    "GITHUB_VERSION",
+    "MODEL_SECRET",
+    "MODEL_VERSION",
+    "PROJECT",
+    "SOURCE_SHA",
+    "TELEGRAM_SECRET",
+    "TELEGRAM_VERSION",
+    "WATCHDOG_ENV_1",
+    "WATCHDOG_ENV_2"
+  ]
+}

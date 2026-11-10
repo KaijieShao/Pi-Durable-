@@ -145,3 +145,10 @@ permissions remain unchanged.
 Provider details: [Google provider](https://registry.terraform.io/providers/hashicorp/google/latest/docs),
 [OS Login setup](https://docs.cloud.google.com/compute/docs/oslogin/set-up-oslogin),
 [GCE metadata endpoints](https://docs.cloud.google.com/compute/docs/metadata/overview#metadata_server_endpoints).
+
+## State preservation follow-up
+
+The backend is still local. Verified current/prior backup locations, the unresolved restored-state comparison,
+and an approval-gated GCS backend proposal are in [the state backup plan](../docs/terraform-state-backup.md).
+No bucket/backend/migration is created by that proposal. Workshop's existing always-on profile is separately
+preserved in [deploy/gcp/workshop](../deploy/gcp/workshop/README.md); its management tools do not run Terraform.
