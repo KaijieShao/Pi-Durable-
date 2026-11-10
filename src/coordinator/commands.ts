@@ -729,7 +729,7 @@ function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
 		followupLimit: limits.followUpsPerTask,
 		position: queue.position,
 		note: queue.note,
-		cancelling: task.cancel_requested === 1,
+		cancelling: task.cancel_requested === 1 && !isTerminal(task.state),
 		archived: task.archived === 1,
 		rejectedNote:
 			task.reason === INTERRUPTED_KEPT_REASON
@@ -752,7 +752,7 @@ function statusLineOf(store: Store, limits: Limits, task: TaskRow): StatusTaskLi
 		state: task.state,
 		position: queue.position,
 		note: queue.note,
-		cancelling: task.cancel_requested === 1,
+		cancelling: task.cancel_requested === 1 && !isTerminal(task.state),
 		prUrl: task.pr_url,
 		held: readBranchHold(store, task.id) !== undefined,
 	};
