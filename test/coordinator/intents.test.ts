@@ -195,7 +195,7 @@ test("unresolved freezes the group naming the task and file, tells its users onc
 	assert.equal(freezeOnUnresolved(s.ctx, s.taskId, []), group.reason ?? "");
 	assert.equal(outbox(s.store).filter((message) => message.kind === "effect_unresolved").length, 1);
 
-	const status = ownerStatus(s.store, CHAT);
+	const status = ownerStatus(s.store, CHAT, [], undefined, { all: true, verbose: true });
 	assert.match(
 		status,
 		/Uncertain file changes \(unresolved: review the file, then owner resolve <change> and owner unfreeze/,
@@ -226,7 +226,9 @@ test("unresolved freezes the group naming the task and file, tells its users onc
 		reconciledOf(s.store, s.runId).map((effect) => effect.outcome),
 		["resolved"],
 	);
-	assert.ok(!ownerStatus(s.store, CHAT).includes("Uncertain file changes"));
+	assert.ok(
+		!ownerStatus(s.store, CHAT, [], undefined, { all: true, verbose: true }).includes("Uncertain file changes"),
+	);
 });
 
 // ---------------------------------------------------------------------------------------------------------------

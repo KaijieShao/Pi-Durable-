@@ -251,6 +251,15 @@ test("bad requests get their reason: not JSON, not an object, another version, a
 		assert.match(response.text, reason, line);
 	}
 	assert.deepEqual(seen.requests, []);
+	assert.deepEqual(parseOwnerRequest(JSON.stringify({ v: 1, token, command: "status", all: true, verbose: true })), {
+		ok: true,
+		token,
+		request: { command: "status", all: true, verbose: true },
+	});
+	for (const bad of [{ all: "true" }, { verbose: 1 }]) {
+		const parsed = parseOwnerRequest(JSON.stringify({ v: 1, token, command: "status", ...bad }));
+		assert.equal(parsed.ok, false);
+	}
 	assert.deepEqual(parseOwnerRequest(JSON.stringify({ v: 1, token, command: "resolve", intents: [3, 3, 4] })), {
 		ok: true,
 		token,

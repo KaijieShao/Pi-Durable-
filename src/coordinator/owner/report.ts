@@ -2,7 +2,7 @@
  * What the owner CLI shows (Interfaces and Storage § Interfaces, Owner CLI: status, failed events, quarantined
  * conversations; Deployment § Measurements: freezes, watchdog health). Built from the Coordinator's SQLite store by the
  * running Coordinator (owner socket), or, labelled as such, by the CLI from a read-only connection while the
- * Coordinator is not running. Metadata only: no task, follow-up or message text, no conversation content.
+ * Coordinator is not running. Status includes redacted one-line task summaries; never follow-ups or conversations.
  */
 
 import { statSync } from "node:fs";
@@ -10,70 +10,45 @@ import { resolve } from "node:path";
 import { redact } from "../../runtime/redact.ts";
 import { type SweepRow, WATCHDOG_PID_KEY } from "../../watchdog/protocol.ts";
 import { type BranchHold, readBranchHold } from "../branch-hold.ts";
-import { evaluationLines } from "../evaluation.ts";
+import { activeEvaluation, type EvaluationRow, evaluationLines, lastEvaluation, trialTasks } from "../evaluation.ts";
 import { DEMO_LIMITS } from "../limits.ts";
 import { formatBytes } from "../messages.ts";
+import { readScopeIndex, type StatusIdentity } from "../status-scope.ts";
+import { type StatusContext, type StatusOptions, selectStatusTasks, statusView } from "../status-view.ts";
 import type { Store } from "../store.ts";
 import { createStoreWatchdogLink, WATCHDOG_HEARTBEAT_MAX_AGE_MS } from "../watchdog-link.ts";
 
-type TaskRow = {
-	id: number;
-	agent_id: string;
-	state: string;
-	reason: string | null;
-	pr_number: number | null;
-	pr_url: string | null;
-	cancel_requested: number;
-};
 type SlotRow = { kind: string; task_id: number; run_id: number | null; agent_id: string | null; acquired_at: number };
 type Count = { n: number };
 
-const TERMINAL = "('merged','failed','cancelled')";
-const RECENT_TERMINAL = 10;
-
 /**
- * Group state, execution slots, open tasks and the most recent finished ones, held tasks, uncertain changes, the
- * outbox, the evaluation in progress (sealing) and the last one, then `disk` (diskReport(): free space and usage of
- * both disks). Metadata only: no task text.
+ * Same scoped task view as Telegram. Operational alerts remain visible; --verbose adds full diagnostics/storage.
  */
-export type StatusIdentity = {
-	readonly repository: string | undefined;
-	readonly topicId: number;
-	readonly databasePath: string;
-};
+export type { StatusIdentity } from "../status-scope.ts";
 
 export function ownerStatus(
 	store: Store,
 	chatId: number,
 	disk: readonly string[] = [],
 	identity?: StatusIdentity,
+	options: StatusOptions = {},
+	context: StatusContext = {},
 ): string {
-	const routing =
-		identity === undefined
-			? []
-			: [
-					`Repository: ${identity.repository ?? "not configured in the owner CLI environment"}`,
-					`Telegram routing: group ${chatId}, topic ${identity.topicId}${identity.topicId === 1 ? " (General)" : ""}`,
-					`Database: ${resolve(identity.databasePath)}`,
-				];
-	const lines = [...routing, groupLine(store, chatId), ...slotLines(store), ...watchdogLines(store)];
+	const view = { ...context, scopeIndex: context.scopeIndex ?? readScopeIndex(identity) };
+	const selected = selectStatusTasks(store, chatId, identity, options, view);
+	const ids = new Set(selected.tasks.map((task) => task.id));
+	const lines = statusView(store, chatId, identity, options, view);
+	if (identity && !context.telegram) lines.push(`Database: ${resolve(identity.databasePath)}`);
+	lines.push(groupLine(store, chatId));
+	lines.push(
+		...(options.verbose ? [...slotLines(store, ids), ...watchdogLines(store)] : watchdogLines(store).slice(0, 1)),
+	);
 	const queued = store.get<Count>("SELECT COUNT(*) AS n FROM runs WHERE state = 'queued'")?.n ?? 0;
-	lines.push(`Queued runs: ${queued}`);
-	const open = store.all<TaskRow>(
-		`SELECT id, agent_id, state, reason, pr_number, pr_url, cancel_requested FROM tasks
-		 WHERE chat_id = ? AND state NOT IN ${TERMINAL} ORDER BY id`,
-		chatId,
-	);
-	lines.push(`Open tasks: ${open.length === 0 ? "none" : ""}`.trimEnd(), ...open.map(taskLine));
-	const recent = store.all<TaskRow>(
-		`SELECT id, agent_id, state, reason, pr_number, pr_url, cancel_requested FROM tasks
-		 WHERE chat_id = ? AND state IN ${TERMINAL} ORDER BY id DESC LIMIT ?`,
-		chatId,
-		RECENT_TERMINAL,
-	);
-	if (recent.length > 0) lines.push(`Recent finished tasks (last ${RECENT_TERMINAL}):`, ...recent.map(taskLine));
-	lines.push(...heldLines(store, chatId), ...effectLines(store, chatId), ...housekeepingLines(store));
-	lines.push(...evaluationLines(store, chatId), ...disk);
+	if (options.verbose) lines.push(`Queued runs: ${queued}`);
+	lines.push(...heldLines(store, chatId, ids), ...effectLines(store, chatId, ids), ...housekeepingLines(store));
+	if (options.verbose)
+		lines.push(...scopedEvaluationLines(store, chatId, ids, options.all === true && !context.telegram));
+	lines.push(...disk);
 	return lines.join("\n");
 }
 
@@ -110,8 +85,8 @@ export function intentLine(row: OpenIntentRow): string {
  * File changes whose outcome could not be reconciled (Agent Execution § Uncertain Effects: the group froze) and ones
  * still waiting for reconciliation (at the next start or unfreeze). Shown only if any. Names files, never content.
  */
-function effectLines(store: Store, chatId: number): string[] {
-	const rows = openIntents(store, chatId, ["unresolved", "pending"]);
+function effectLines(store: Store, chatId: number, ids: ReadonlySet<number>): string[] {
+	const rows = openIntents(store, chatId, ["unresolved", "pending"]).filter((row) => ids.has(row.task_id));
 	if (rows.length === 0) return [];
 	return [
 		"Uncertain file changes (unresolved: review the file, then owner resolve <change> and owner unfreeze; pending: " +
@@ -124,7 +99,7 @@ function effectLines(store: Store, chatId: number): string[] {
  * Tasks held because their branch changed on GitHub outside the Coordinator (src/coordinator/branch-hold.ts): which
  * commit waits in the worktree and where GitHub's branch must be for the Coordinator to push it. Shown only if any.
  */
-function heldLines(store: Store, chatId: number): string[] {
+function heldLines(store: Store, chatId: number, selected: ReadonlySet<number>): string[] {
 	const ids = store.all<{ id: number }>(
 		`SELECT id FROM tasks WHERE chat_id = ? AND EXISTS (SELECT 1 FROM meta WHERE key = 'branch_hold:' || tasks.id)
 		 ORDER BY id`,
@@ -132,6 +107,7 @@ function heldLines(store: Store, chatId: number): string[] {
 	);
 	const lines: string[] = [];
 	for (const { id } of ids) {
+		if (!selected.has(id)) continue;
 		const hold = readBranchHold(store, id);
 		if (hold === undefined) continue;
 		lines.push(heldLine(id, hold));
@@ -161,16 +137,32 @@ function groupLine(store: Store, chatId: number): string {
 	return `Group ${chatId}: ${group.state}${reason}${recheck}${resolve}`;
 }
 
-function slotLines(store: Store): string[] {
+function slotLines(store: Store, selected: ReadonlySet<number>): string[] {
 	const slots = store.all<SlotRow>("SELECT kind, task_id, run_id, agent_id, acquired_at FROM slots ORDER BY id");
 	return [
 		`Execution slots: ${slots.length}/${DEMO_LIMITS.maxConcurrentRuns} in use`,
-		...slots.map((slot) => {
-			const run = slot.run_id === null ? "" : ` run ${slot.run_id}`;
-			const agent = slot.agent_id === null ? "" : ` agent ${slot.agent_id}`;
-			return `  ${slot.kind} task ${slot.task_id}${run}${agent} since ${new Date(slot.acquired_at).toISOString()}`;
-		}),
+		...slots
+			.filter((slot) => selected.has(slot.task_id))
+			.map((slot) => {
+				const run = slot.run_id === null ? "" : ` run ${slot.run_id}`;
+				const agent = slot.agent_id === null ? "" : ` agent ${slot.agent_id}`;
+				return `  ${slot.kind} task ${slot.task_id}${run}${agent} since ${new Date(slot.acquired_at).toISOString()}`;
+			}),
 	];
+}
+
+/** A cross-scope evaluation can hold dispatch, but its task identities require --all (Telegram never crosses chats). */
+function scopedEvaluationLines(store: Store, chatId: number, ids: ReadonlySet<number>, all: boolean): string[] {
+	const lines = evaluationLines(store, chatId);
+	if (all) return lines;
+	const visible = (row: EvaluationRow) => row.chat_id === chatId && trialTasks(row).every((id) => ids.has(id));
+	const active = activeEvaluation(store);
+	const last = lastEvaluation(store, chatId);
+	if (active && !visible(active))
+		lines[0] = "Evaluation outside this status scope is holding dispatch; use --all for permitted details.";
+	if (last && !visible(last))
+		lines[lines.length - 1] = "Last evaluation is outside this status scope; use --all for permitted details.";
+	return lines;
 }
 
 /** The watchdog's heartbeat age and pid, its last sweep, and how many requests wait for it. */
@@ -200,14 +192,6 @@ function sweepLine(row: SweepRow): string {
 		`Last watchdog sweep: #${row.id} ${row.reason}${scope}: ${outcome}; killed ${row.processes_killed ?? 0} ` +
 		`Pi processes and ${row.containers_killed ?? 0} containers${at}`
 	);
-}
-
-function taskLine(task: TaskRow): string {
-	const pr =
-		task.pr_number === null ? "no PR" : `PR #${task.pr_number}${task.pr_url === null ? "" : ` ${task.pr_url}`}`;
-	const cancel = task.cancel_requested === 1 ? " (cancel requested)" : "";
-	const reason = task.reason === null ? "" : ` (${clean(task.reason)})`;
-	return `  #${task.id} ${task.agent_id} ${task.state}${cancel}${reason} ${pr}`;
 }
 
 function housekeepingLines(store: Store): string[] {

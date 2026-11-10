@@ -243,6 +243,7 @@ function stackConfig(
 			GITHUB_API_URL: urls.github,
 			PI_DATA_DIR: join(dir, "data"),
 			PI_TASK_DIR: join(dir, "tasks"),
+			PI_STATUS_SCOPE_FILE: join(dir, "status-scopes.json"),
 			// This fake stack exercises the Mac process policy on any host; Linux production rejects this mode.
 			PI_RUNNER_ISOLATION: "process",
 			...env,
@@ -403,6 +404,17 @@ export async function startStack(options: StackOptions = {}) {
 			...options.env,
 		},
 		platform,
+	);
+	// Bind the external history to the configured database, without modifying a task row.
+	await writeFile(
+		config.statusScopeFile as string,
+		JSON.stringify({
+			version: 1,
+			database: join(config.paths.dataDir, "coordinator.sqlite"),
+			periods: [
+				{ firstTask: 1, lastTask: null, repository: config.github.repo, group: GROUP, topic: config.telegram.topicId },
+			],
+		}),
 	);
 	if (shims !== undefined) await prepareSystemdLayout(config.paths.dataDir);
 	const log = stackLogger();
@@ -606,6 +618,7 @@ export async function startStack(options: StackOptions = {}) {
 					groupChatId: config.telegram.groupChatId,
 					topicId: config.telegram.topicId,
 					repository: config.github.repo,
+					statusScopeFile: config.statusScopeFile,
 					paths: { dataDir: config.paths.dataDir, taskDir: config.paths.taskDir },
 					disk: config.disk,
 				},

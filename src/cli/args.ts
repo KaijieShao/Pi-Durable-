@@ -1,6 +1,6 @@
 /** One owner command and its arguments (sent to the running Coordinator over its owner socket). */
 export type OwnerInvocation =
-	| { readonly action: "status" }
+	| { readonly action: "status"; readonly all?: boolean; readonly verbose?: boolean }
 	/** `group`: the group chat id; the configured TELEGRAM_GROUP_CHAT_ID when omitted. */
 	| { readonly action: "unfreeze"; readonly group?: number }
 	| { readonly action: "resolve"; readonly intents: readonly number[] }
@@ -47,10 +47,27 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 	if (envFile === null) return { command: "invalid", message: "--env-file needs a path" };
 	const seal = sealOptions(rest);
 	if (typeof seal === "string") return { command: "invalid", message: seal };
+	const all = takeSwitch(rest, "--all");
+	const verbose = takeSwitch(rest, "--verbose");
 	// A negative number is an argument (a group chat id), not an option.
 	const unknown = rest.find((arg) => arg.startsWith("-") && !/^-\d+$/.test(arg));
 	if (unknown !== undefined) return { command: "invalid", message: `unknown option: ${unknown}` };
-	return withSealOptions(parseCommand(rest, envFile === undefined ? {} : { envFile }), seal);
+	const parsed = withSealOptions(parseCommand(rest, envFile === undefined ? {} : { envFile }), seal);
+	return withStatusOptions(parsed, all, verbose);
+}
+
+function withStatusOptions(parsed: CliArgs, all: boolean, verbose: boolean): CliArgs {
+	if (!all && !verbose) return parsed;
+	if (parsed.command !== "owner" || parsed.action !== "status")
+		return { command: "invalid", message: "--all and --verbose go with owner status only" };
+	return { ...parsed, ...(all ? { all: true } : {}), ...(verbose ? { verbose: true } : {}) };
+}
+
+function takeSwitch(args: string[], flag: string): boolean {
+	const index = args.indexOf(flag);
+	if (index === -1) return false;
+	args.splice(index, 1);
+	return true;
 }
 
 /** The seal options belong to `owner seal` only. */
@@ -138,7 +155,7 @@ function parseOwner(positional: readonly string[]): OwnerInvocation | undefined 
 	return OWNER_PARSERS[action as OwnerAction](args);
 }
 
-export const OWNER_USAGE = `  pi-durable-telegram owner status                     group state, slots, the watchdog, tasks, uncertain changes, disks
+export const OWNER_USAGE = `  pi-durable-telegram owner status [--all] [--verbose] current repo/topic; --all includes other/unconfirmed routing; --verbose adds full diagnostics/storage
   pi-durable-telegram owner unfreeze [<group>]         repeat the recovery checks; unfreeze only if all pass
   pi-durable-telegram owner resolve <change>...        accept an unresolved file change as it is in the worktree
   pi-durable-telegram owner failed-events              Telegram messages that could not be delivered

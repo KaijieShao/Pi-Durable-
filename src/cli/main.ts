@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./warnings.ts";
 import { errorSummary } from "../runtime/log.ts";
 import { packageVersion } from "../runtime/version.ts";
 import { parseArgs, USAGE } from "./args.ts";

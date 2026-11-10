@@ -140,6 +140,8 @@ export type CoordinatorConfig = {
 	/** Repository path (relative to the worktree root) of the checked-in setup script; run if present. */
 	readonly setupScript: string;
 	readonly logLevel: "debug" | "info" | "warn" | "error";
+	/** Read-only task routing history for status display; never a database migration or backfill. */
+	readonly statusScopeFile?: string | undefined;
 };
 
 type Collector = { readonly problems: ConfigProblem[]; add(variable: string, message: string): void };
@@ -186,6 +188,7 @@ export type OwnerConfig = {
 	/** Non-secret routing identity for the offline status; live status uses the server's own configuration. */
 	readonly topicId: number;
 	readonly repository: string | undefined;
+	readonly statusScopeFile?: string | undefined;
 	/** PI_DATA_DIR (the owner socket, the database) and PI_TASK_DIR, resolved exactly as for the Coordinator. */
 	readonly paths: { readonly dataDir: string; readonly taskDir: string };
 	/** The disk settings the read-only status reports (PI_BOOT_DISK_MIN_FREE, ...), parsed as for the Coordinator. */
@@ -199,6 +202,7 @@ export const OWNER_VARIABLES = [
 	"TELEGRAM_GROUP_CHAT_ID",
 	"TELEGRAM_GROUP_TOPIC_ID",
 	"GITHUB_REPO",
+	"PI_STATUS_SCOPE_FILE",
 	"PI_BOOT_DISK_MIN_FREE",
 	"PI_TASK_DISK_MIN_FREE",
 	"PI_TASK_DISK_BUDGET",
@@ -219,6 +223,10 @@ export function parseOwnerConfig(
 		groupChatId: parseInteger(env, "TELEGRAM_GROUP_CHAT_ID", out, { negative: true, required: true }),
 		topicId: parseInteger(env, "TELEGRAM_GROUP_TOPIC_ID", out, { fallback: 1 }),
 		repository,
+		statusScopeFile:
+			nonEmpty(env.PI_STATUS_SCOPE_FILE) === undefined
+				? undefined
+				: resolve(defaults.cwd, env.PI_STATUS_SCOPE_FILE as string),
 		paths: { dataDir, taskDir: taskDirFrom(env, dataDir, defaults.cwd) },
 		disk: parseDisk(env, out),
 	};
@@ -264,7 +272,19 @@ export function parseCoordinatorConfig(
 	const runner = parseRunner(env, out, defaults);
 	const disk = parseDisk(env, out);
 	if (out.problems.length > 0) throw new ConfigError(out.problems);
-	return { telegram, agents, model, ...github, ...local, disk, runner };
+	return {
+		telegram,
+		agents,
+		model,
+		...github,
+		...local,
+		disk,
+		runner,
+		statusScopeFile:
+			nonEmpty(env.PI_STATUS_SCOPE_FILE) === undefined
+				? undefined
+				: resolve(defaults.cwd, env.PI_STATUS_SCOPE_FILE as string),
+	};
 }
 
 function parseTelegram(env: Env, out: Collector): CoordinatorConfig["telegram"] {

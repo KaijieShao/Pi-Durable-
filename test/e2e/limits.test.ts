@@ -595,6 +595,12 @@ const waitForModel = (stack: Stack, job: string): Promise<unknown> =>
 		timeoutMs: 30_000,
 	});
 
+/** Queue/admission tests keep checking the complete state prefix; status-view tests check the new summary/PR suffix. */
+function assertStatusPrefix(lines: ReadonlyMap<number, string>, id: number, expected: string): void {
+	const line = lines.get(id) ?? "";
+	assert.ok(line.startsWith(`${expected} · `), line);
+}
+
 test("demo queue limits: 2 runs at once and 1 per agent, waiting caps with 'queue full', positions, 4 open tasks", {
 	timeout: 240_000,
 }, async (t) => {
@@ -619,9 +625,9 @@ test("demo queue limits: 2 runs at once and 1 per agent, waiting caps with 'queu
 
 	// /status answers while 2 tasks run.
 	const busy = await statusLines(stack, USER2);
-	assert.equal(busy.get(0), "Group: normal. Execution slots in use: 2/2.");
-	assert.equal(busy.get(1), "Task 1 · alpha · running");
-	assert.equal(busy.get(2), "Task 2 · beta · running");
+	assert.match(busy.get(0) ?? "", /^Coordinator: live .*slots 2\/2/);
+	assertStatusPrefix(busy, 1, "Task 1 · alpha · running");
+	assertStatusPrefix(busy, 2, "Task 2 · beta · running");
 
 	// A third agent's task waits for a deployment-wide slot although gamma is idle.
 	assert.equal(
@@ -656,20 +662,24 @@ test("demo queue limits: 2 runs at once and 1 per agent, waiting caps with 'queu
 	assert.equal(stack.tasks().length, 6, "rejected submissions create no task");
 
 	const queued = await statusLines(stack, USER1);
-	assert.equal(
-		queued.get(3),
+	assertStatusPrefix(
+		queued,
+		3,
 		"Task 3 · gamma · queued · queue position 1 · waiting for an execution slot (2/2 in use)",
 	);
-	assert.equal(
-		queued.get(4),
+	assertStatusPrefix(
+		queued,
+		4,
 		"Task 4 · alpha · queued · queue position 1 · waiting for agent alpha to finish its current run",
 	);
-	assert.equal(
-		queued.get(5),
+	assertStatusPrefix(
+		queued,
+		5,
 		"Task 5 · alpha · queued · queue position 2 · waiting for agent alpha to finish its current run",
 	);
-	assert.equal(
-		queued.get(6),
+	assertStatusPrefix(
+		queued,
+		6,
 		"Task 6 · beta · queued · queue position 1 · waiting for agent beta to finish its current run",
 	);
 
@@ -715,14 +725,14 @@ test("demo queue limits: 2 runs at once and 1 per agent, waiting caps with 'queu
 		);
 	}
 	const reviews = await statusLines(stack, USER1);
-	assert.equal(reviews.get(0), "Group: normal. Execution slots in use: 0/2.");
+	assert.match(reviews.get(0) ?? "", /^Coordinator: live .*slots 0\/2/);
 	assert.match(
 		reviews.get(6) ?? "",
-		/^Task 6 · beta · queued · queue position 1 · waiting for open reviews to finish \(4 open tasks\)$/,
+		/^Task 6 · beta · queued · queue position 1 · waiting for open reviews to finish \(4 open tasks\) ·/,
 	);
 	assert.match(
 		reviews.get(7) ?? "",
-		/^Task 7 · alpha · queued · queue position 1 · waiting for open reviews to finish \(4 open tasks\)$/,
+		/^Task 7 · alpha · queued · queue position 1 · waiting for open reviews to finish \(4 open tasks\) ·/,
 	);
 	// A 5th first run submitted now is told at once that it waits for reviews.
 	assert.equal(
@@ -1027,11 +1037,12 @@ async function cancelRunning(t: TestContext, sandbox: "local" | "docker"): Promi
 
 	// /status works while 2 tasks run.
 	const status = await statusLines(stack, USER2);
-	assert.equal(status.get(0), "Group: normal. Execution slots in use: 2/2.");
-	assert.equal(status.get(1), `Task 1 · alpha · running · https://github.com/${REPO}/pull/1`);
-	assert.equal(status.get(2), "Task 2 · beta · running");
-	assert.equal(
-		status.get(3),
+	assert.match(status.get(0) ?? "", /^Coordinator: live .*slots 2\/2/);
+	assertStatusPrefix(status, 1, `Task 1 · alpha · running · https://github.com/${REPO}/pull/1`);
+	assertStatusPrefix(status, 2, "Task 2 · beta · running");
+	assertStatusPrefix(
+		status,
+		3,
 		"Task 3 · gamma · queued · queue position 1 · waiting for an execution slot (2/2 in use)",
 	);
 

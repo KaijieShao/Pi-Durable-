@@ -281,7 +281,7 @@ function seed(store: Store): void {
 		store.freeze(GROUP, "stop unconfirmed");
 		store.run(
 			`INSERT INTO tasks(id, chat_id, creator_id, agent_id, text, update_id, state, pr_number, pr_url, created_at,
-			 updated_at) VALUES (12, ?, 1, 'alpha', 'secret task text', 900, 'review', 4, 'https://github.com/acme/r/pull/4', ?, ?)`,
+			 updated_at) VALUES (12, ?, 1, 'alpha', 'Update profile title', 900, 'review', 4, 'https://github.com/acme/r/pull/4', ?, ?)`,
 			GROUP,
 			now,
 			now,
@@ -316,23 +316,23 @@ function seed(store: Store): void {
 	});
 }
 
-test("owner status and failed-events: built from the database, metadata only (no task, follow-up or message text)", async () => {
+test("owner status summaries and failed-events: no follow-up or message body; full diagnostics with --verbose", async () => {
 	const { dir, cleanup } = await tempDir();
 	const store = new Store(join(dir, COORDINATOR_DB));
 	try {
 		seed(store);
-		const status = ownerStatus(store, GROUP);
+		const status = ownerStatus(store, GROUP, [], undefined, { all: true, verbose: true });
 		assert.match(
 			status,
-			/^Group -1001234567890: frozen \(reason: stop unconfirmed\); owner unfreeze repeats the recovery checks, then reopens dispatch\n/,
+			/Group -1001234567890: frozen \(reason: stop unconfirmed\); owner unfreeze repeats the recovery checks, then reopens dispatch\n/,
 		);
 		assert.match(status, /Execution slots: 1\/2 in use\n {2}check task 12 since /);
 		assert.match(status, /Queued runs: 1/);
-		assert.match(status, /#12 alpha review PR #4 https:\/\/github.com\/acme\/r\/pull\/4/);
-		assert.match(status, /#13 beta cancelled \(group frozen\) no PR/);
+		assert.match(status, /Task 12 · alpha · in review .*https:\/\/github.com\/acme\/r\/pull\/4/);
+		assert.match(status, /Task 13 · beta · cancelled · other text · no PR/);
 		assert.match(status, /failed events: 1/);
 		assert.match(status, /Quarantined conversations: 1 \(read-only: owner conversations, owner inspect <id>\)/);
-		assert.ok(!status.includes("secret"), "status shows no task or follow-up text");
+		assert.ok(!status.includes("secret"), "status shows no follow-up text");
 		assert.ok(!status.includes("Held tasks"), "no held task, no section");
 		// A task held because its branch changed on GitHub outside the Coordinator (src/coordinator/branch-hold.ts).
 		store.tx(() =>
@@ -351,7 +351,7 @@ test("owner status and failed-events: built from the database, metadata only (no
 			),
 		);
 		assert.match(
-			ownerStatus(store, GROUP),
+			ownerStatus(store, GROUP, [], undefined, { all: true, verbose: true }),
 			/\nHeld tasks \(their branch changed on GitHub outside the Coordinator\):\n {2}#12 review: task\/12 on GitHub at 1a2b3c4; c0ffee0 waits in the worktree until the branch is back at 5d6e7f8\n/,
 		);
 
@@ -373,7 +373,7 @@ test("owner status shows the watchdog's heartbeat age and its last sweep", async
 	const { dir, cleanup } = await tempDir();
 	const store = new Store(join(dir, COORDINATOR_DB));
 	try {
-		const before = ownerStatus(store, GROUP);
+		const before = ownerStatus(store, GROUP, [], undefined, { all: true, verbose: true });
 		assert.match(before, /\nWatchdog: no heartbeat yet \(is it running\? no run is dispatched without it\)\n/);
 		assert.match(before, /\nLast watchdog sweep: none\nPending sweep requests: 0/);
 		const now = Date.now();
@@ -396,7 +396,7 @@ test("owner status shows the watchdog's heartbeat age and its last sweep", async
 			);
 			store.run("INSERT INTO watchdog_sweeps(reason, state, requested_at) VALUES ('recheck', 'pending', ?)", now);
 		});
-		const status = ownerStatus(store, GROUP);
+		const status = ownerStatus(store, GROUP, [], undefined, { all: true, verbose: true });
 		assert.match(status, /\nWatchdog: last heartbeat 2 s ago \(pid 4321\)\n/);
 		assert.match(
 			status,
@@ -405,7 +405,7 @@ test("owner status shows the watchdog's heartbeat age and its last sweep", async
 		assert.match(status, /\nPending sweep requests: 1/);
 		store.tx(() => store.setMeta("watchdog_heartbeat_at", String(now - 60_000)));
 		assert.match(
-			ownerStatus(store, GROUP),
+			ownerStatus(store, GROUP, [], undefined, { all: true, verbose: true }),
 			/last heartbeat 60 s ago \(pid 4321\); stale: no new run starts until it is back/,
 		);
 	} finally {
@@ -438,8 +438,7 @@ test("owner CLI without a running Coordinator: says so and exits 3; status falls
 		const err: string[] = [];
 		const io = { stdout: (text: string) => out.push(text), stderr: (text: string) => err.push(text) };
 		assert.equal(await runOwnerCommand({ action: "status" }, { env: validEnv(dir), ...io }), OWNER_EXIT.notRunning);
-		assert.match(err.join(""), /^The Coordinator is not running \(no owner socket at .*owner\/owner\.sock\)\./);
-		assert.match(err.join(""), /No Coordinator database at .*coordinator\.sqlite either/);
+		assert.match(err.join(""), /^Coordinator: not running; no read-only database at .*coordinator\.sqlite\.\n$/);
 		assert.equal(await runOwnerCommand({ action: "status" }, { env: { PI_DATA_DIR: dir }, ...io }), OWNER_EXIT.config);
 		assert.match(err.join(""), /Configuration error:/);
 
@@ -473,8 +472,9 @@ test("owner CLI without a running Coordinator: says so and exits 3; status falls
 		const fallback = out.join("");
 		assert.match(
 			fallback,
-			/^READ-ONLY STATUS FROM THE DATABASE: the Coordinator is not running, so nothing below is live and no command can change it\.\nRepository: acme\/signup-demo\nTelegram routing: group -1001234567890, topic 1 \(General\)\nDatabase: \/[^\n]+\/coordinator\.sqlite\nGroup -1001234567890: frozen \(reason: stop unconfirmed\)/,
+			/^Coordinator: not running \(read-only snapshot\) · acme\/signup-demo · group -1001234567890, topic 1/,
 		);
+		assert.match(fallback, /Database: \/[^\n]+\/coordinator\.sqlite/);
 		const printed = out.join("") + err.join("");
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!printed.includes(secret));
 	} finally {
@@ -499,7 +499,10 @@ test("the read-only fallback never migrates or writes: a database of another sch
 			{ env: validEnv(dir), stdout: () => {}, stderr: (t) => err.push(t) },
 		);
 		assert.equal(code, OWNER_EXIT.notRunning);
-		assert.match(err.join(""), /The database could not be read: Error: the database has schema 2/);
+		assert.match(
+			err.join(""),
+			/Coordinator: not running; read-only database unavailable: Error: the database has schema 2/,
+		);
 		const after = files(dir);
 		assert.equal(after["coordinator.sqlite"], before["coordinator.sqlite"], "not migrated, not written");
 	} finally {
@@ -522,6 +525,7 @@ test("the owner CLI reads no secret: only its own variables, even from the Coord
 			groupChatId: GROUP,
 			topicId: 1,
 			repository: "acme/signup-demo",
+			statusScopeFile: undefined,
 			paths: { dataDir: dir, taskDir: join(dir, "t") },
 			disk: {
 				bootMinFreeBytes: undefined,
@@ -556,7 +560,7 @@ test("the owner CLI reads no secret: only its own variables, even from the Coord
 		const io = { stdout: () => {}, stderr: (text: string) => err.push(text) };
 		const bare = { PI_DATA_DIR: dir, TELEGRAM_GROUP_CHAT_ID: String(GROUP) };
 		assert.equal(await runOwnerCommand({ action: "status" }, { env: bare, ...io }), OWNER_EXIT.notRunning);
-		assert.match(err.join(""), /^The Coordinator is not running/);
+		assert.match(err.join(""), /^Coordinator: not running/);
 		assert.equal(
 			await runOwnerCommand({ action: "status" }, { env: { ...bare, TELEGRAM_GROUP_CHAT_ID: "12" }, ...io }),
 			OWNER_EXIT.config,
@@ -582,8 +586,8 @@ test("offline owner status identifies its configured topic, repository and absol
 		);
 		assert.equal(code, OWNER_EXIT.notRunning);
 		const status = output.join("");
-		assert.ok(status.startsWith("READ-ONLY STATUS FROM THE DATABASE:"));
-		assert.ok(status.includes("Repository: acme/workshop\nTelegram routing: group -1001234567890, topic 124\n"));
+		assert.ok(status.startsWith("Coordinator: not running (read-only snapshot)"));
+		assert.ok(status.includes("acme/workshop · group -1001234567890, topic 124"));
 		assert.ok(status.includes(`Database: ${join(dir, COORDINATOR_DB)}\n`));
 		assert.equal(files(dir)[COORDINATOR_DB], before);
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!status.includes(secret));
@@ -603,7 +607,10 @@ test("owner status reports both disks: free space, the limits applied, and what 
 		mkdirSync(join(dir, "conversations"));
 		writeFileSync(join(dir, "conversations", "c1.sqlite"), Buffer.alloc(64 * 1024));
 		// The Coordinator is not running: the labelled read-only status (exit 3) shows the disks too.
-		assert.equal(await runOwnerCommand({ action: "status" }, { env: validEnv(dir), ...io }), OWNER_EXIT.notRunning);
+		assert.equal(
+			await runOwnerCommand({ action: "status", verbose: true }, { env: validEnv(dir), ...io }),
+			OWNER_EXIT.notRunning,
+		);
 		const status = out.join("");
 		assert.match(
 			status,
@@ -636,7 +643,7 @@ test("owner status reports both disks: free space, the limits applied, and what 
 			PI_TASK_DISK_MIN_FREE: "2G",
 			PI_WORKTREE_HEADROOM: "256MiB",
 		};
-		assert.equal(await runOwnerCommand({ action: "status" }, { env, ...io }), OWNER_EXIT.notRunning);
+		assert.equal(await runOwnerCommand({ action: "status", verbose: true }, { env, ...io }), OWNER_EXIT.notRunning);
 		const configured = out.join("");
 		assert.match(configured, /new tasks are rejected below 3\.0 GiB free\n/);
 		assert.match(
@@ -645,7 +652,7 @@ test("owner status reports both disks: free space, the limits applied, and what 
 		);
 		assert.match(
 			configured,
-			/\n {2}New worktrees are held: its new worktree needs about 1\.0 GiB, but the task disk budget …$/m,
+			/\nNew worktrees are held: its new worktree needs about 1\.0 GiB, but the task disk budget …$/m,
 		);
 		for (const secret of [BOT_TOKEN, OPENAI_KEY, GITHUB]) assert.ok(!configured.includes(secret));
 	} finally {

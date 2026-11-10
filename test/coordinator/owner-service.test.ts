@@ -20,6 +20,7 @@ import type { OwnerRequest, OwnerResponse } from "../../src/coordinator/owner/pr
 import { ownerService } from "../../src/coordinator/owner/service.ts";
 import { Store } from "../../src/coordinator/store.ts";
 import { createLogger } from "../../src/runtime/log.ts";
+import { statusScopeFile } from "../helpers/status-scope.ts";
 
 const GROUP = -1001234567890;
 const roots: string[] = [];
@@ -42,6 +43,7 @@ function config(dataDir: string, topicId = 1): CoordinatorConfig {
 			GITHUB_TOKEN: "ghp_test_not_real",
 			GITHUB_REPO: "acme/demo",
 			PI_DATA_DIR: dataDir,
+			PI_STATUS_SCOPE_FILE: statusScopeFile(join(dataDir, "coordinator.sqlite"), "acme/demo", GROUP, topicId),
 			PI_TASK_DIR: join(dataDir, "tasks"),
 		},
 		{ cwd: dataDir, home: dataDir, uid: 1000, gid: 1000 },
@@ -73,7 +75,7 @@ function seedTask(store: Store, id: number, chatId = GROUP): void {
 	store.tx(() =>
 		store.run(
 			`INSERT INTO tasks(id, chat_id, creator_id, agent_id, text, update_id, state, created_at, updated_at)
-			 VALUES (?, ?, 1, 'alpha', 'SECRET TASK TEXT', ?, 'review', 1, 1)`,
+			 VALUES (?, ?, 1, 'alpha', 'Improve headline with OPENAI_API_KEY=sk-test-secret-value', ?, 'review', 1, 1)`,
 			id,
 			chatId,
 			9000 + id,
@@ -94,30 +96,27 @@ function seedConversation(store: Store, id: string, taskId: number, path: string
 	);
 }
 
-test("status: whether the Coordinator runs or still starts, then the group's metadata (no task text)", async () => {
+test("status: starting/live summary, configured route, absolute database and redacted one-line request", async () => {
 	const starting = setup();
 	seedTask(starting.store, 1);
 	const status = await starting.ask({ command: "status" });
 	assert.equal(status.ok, true);
 	assert.match(
 		status.text,
-		/^Coordinator: starting \(recovery in progress\), pid \d+, since 2026-11-08T00:00:00\.000Z\nRepository: acme\/demo\nTelegram routing: group -1001234567890, topic 1 \(General\)\nDatabase: \/[^\n]+\/coordinator\.sqlite\nGroup -1001234567890: normal\n/,
+		/^Coordinator: starting · acme\/demo · group -1001234567890, topic 1 · slots 0\/2 · succeeded 0 \/ failed 0 \/ open 1\nCompleted:/,
 	);
 	assert.ok(status.text.includes(`Database: ${join(starting.dataDir, "coordinator.sqlite")}\n`));
-	assert.ok(!status.text.includes("SECRET"));
-	const running = setup({ unfreeze: async () => ({ kind: "not_frozen", state: "normal" }) });
-	assert.match((await running.ask({ command: "status" })).text, /^Coordinator: running, pid \d+/);
-});
-
-test("live status reports the server's repository, forum topic and absolute database", async () => {
-	const s = setup({ unfreeze: async () => ({ kind: "not_frozen", state: "normal" }) }, 124);
-	const result = await s.ask({ command: "status" });
-	assert.equal(result.ok, true);
-	assert.ok(result.text.includes("Repository: acme/demo\nTelegram routing: group -1001234567890, topic 124\n"));
-	assert.ok(result.text.includes(`Database: ${join(s.dataDir, "coordinator.sqlite")}\n`));
-	assert.ok(!result.text.includes("(General)"));
-	assert.ok(!result.text.includes("sk-test-not-real"));
-	assert.ok(!result.text.includes("ghp_test_not_real"));
+	assert.ok(status.text.includes("Improve headline with"));
+	assert.ok(!status.text.includes("sk-test-secret-value"));
+	const running = setup({ unfreeze: async () => ({ kind: "not_frozen", state: "normal" }) }, 124);
+	const live = await running.ask({ command: "status" });
+	assert.match(live.text, /^Coordinator: live · acme\/demo · group -1001234567890, topic 124/);
+	assert.ok(!live.text.includes("Pi raw-content store"), "no recursive scans by default");
+	const verbose = await running.ask({ command: "status", verbose: true });
+	assert.ok(verbose.text.includes("Pi raw-content store"));
+	assert.ok(verbose.text.includes("Process: pid"));
+	assert.ok(!verbose.text.includes("sk-test-not-real"));
+	assert.ok(!verbose.text.includes("ghp_test_not_real"));
 });
 
 test("unfreeze: only this Coordinator's group, only once the engine runs; the outcome names every check and the failed one", async () => {

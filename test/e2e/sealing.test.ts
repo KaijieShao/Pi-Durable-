@@ -293,7 +293,7 @@ test("sealing: refused while a trial task is not merged; then dispatch, merges a
 	assert.match(approve.text, /^Approved Task 3 at [0-9a-f]{7}; .*Merges are held while the group is sealed/);
 	await sleep(1500);
 	assert.equal(seen.length, 0, "no evaluator while a run is active");
-	const status = await stack.owner("status");
+	const status = await stack.owner("status", "--all", "--verbose");
 	assert.match(status.stdout, /\nGroup -?\d+: sealing \(reason: trial t1\)/);
 	assert.match(
 		status.stdout,
@@ -385,7 +385,7 @@ test("sealing: refused while a trial task is not merged; then dispatch, merges a
 	await stack.waitForBotMessage(/^Task 4 is ready for review \(run 1\)/, { since: result.id });
 	await stack.waitForBotMessage(/^Task 2 is ready for review \(run 2\)/, { since: result.id });
 	await stack.waitForBotMessage(/^Task 3 merged into main/, { since: result.id });
-	const done = await stack.owner("status");
+	const done = await stack.owner("status", "--all", "--verbose");
 	assert.match(
 		done.stdout,
 		/\nLast evaluation: trial t1 PASSED at \S+; snapshot [0-9a-f]{7} at \S+; trial tasks: Task 1; suites: module:signup passed, integration passed, baseline passed; cleanup verified\n/,
@@ -422,7 +422,7 @@ test("dispatch is held deployment-wide: an evaluation of another group holds thi
 	const busy = await stack.owner("seal");
 	assert.equal(busy.code, 1);
 	assert.match(busy.stderr, /trial other is being sealed and evaluated; one evaluation at a time/);
-	const status = await stack.owner("status");
+	const status = await stack.owner("status", "--all", "--verbose");
 	assert.match(
 		status.stdout,
 		/\nEvaluation in progress: trial other \(group -42\), the evaluator is grading the snapshot/,

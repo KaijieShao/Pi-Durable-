@@ -43,6 +43,20 @@ How the parts talk, where every record lives, and how we recover from a restart.
 | Coordinator to GitHub          | Coordinator → GitHub   | A fine-grained token for this repository only, with access to contents and pull requests, held only by the Coordinator.Pushes task branches, opens and updates pull requests, closes them on cancel or a limit, and merges an approved head commit with a merge commit, so that commit appears on the main branch.A rule on the main branch requires the task branch to be up to date before merging, so GitHub refuses a merge if the main branch moved.Failed calls are retried with backoff.Before retrying any GitHub change (a push, opening, updating or closing a pull request, or a merge), the Coordinator reads GitHub’s current state. A pull request is matched by repository, base branch and head branch. If the outcome is still unknown, the group freezes.                                                                                                           |
 | Outbox to Telegram             | Outbox → Telegram      | Events have stable IDs and stay pending until Telegram confirms them.Network errors and 5xx responses are retried with backoff. A 429 waits for Telegram’s retry-after.Required messages (acknowledgements, rejections, cancellations, run outcomes and follow-up outcomes) go out before progress updates. For progress, only the latest update per task is kept.Permanent failures go to a failed-events table shown in the owner CLI.Delivery is at-least-once, so a duplicate Telegram message is possible.                                                                                                                                                                                                                                                                                                                                                                       |
 
+### Scoped status presentation
+
+`owner status` and Telegram `/status` default to the configured repository and group/topic. Both begin with
+liveness, route, slots and succeeded/failed/open counts, then Completed task summaries and PR links marked
+merged or open. Coding-finished open PRs remain awaiting approval and count as open. Old failures are
+aggregated, not erased. `--all` includes other/unconfirmed scopes in the selected database (Telegram: this
+group only); `--verbose` adds full diagnostics and, for the owner CLI, storage measurements. Offline status
+has one explicit read-only header and retains exit code 3. Other exit codes and read-only behavior are unchanged.
+
+Existing task rows lack repo/topic fields. An operator-verified external `PI_STATUS_SCOPE_FILE` maps known
+routing periods without database rewriting, migration or inferred historic topics. Unknown/conflicting
+routing is hidden by default, counted and available via `--all`. See [status operations](../docs/status-display.md).
+This presentation change does not change command authorization, execution routing, approval or merge gates.
+
 ## Where Each Record Lives
 
 | Record                                                                 | Store                                                                                                  | Survives what                                                                                                                   | Retention                                                                                                                                                                                   |

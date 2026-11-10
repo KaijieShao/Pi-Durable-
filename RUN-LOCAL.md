@@ -310,7 +310,8 @@ the same env file, as the same user as the Coordinator, in a second terminal (it
 `PI_TASK_DIR`, `TELEGRAM_GROUP_CHAT_ID` and the disk sizes from it, never a secret):
 
 ```sh
-node src/cli/main.ts owner status --env-file .env.local              # group state, slots, the watchdog, tasks, disks
+node src/cli/main.ts owner status --env-file .env.local              # current repo/topic, Completed first, compact storage
+node src/cli/main.ts owner status --all --verbose --env-file .env.local # every recorded scope + full diagnostics
 node src/cli/main.ts owner failed-events --env-file .env.local       # Telegram messages that could not be delivered
 node src/cli/main.ts owner unfreeze --env-file .env.local            # recovery checks again; unfrozen only if all pass
 node src/cli/main.ts owner resolve 7 --env-file .env.local           # accept uncertain file change 7 as it is now
@@ -321,11 +322,12 @@ node src/cli/main.ts owner seal --trial trial-1 --env-file .env.local     # tria
 
 Exit codes: 0 done, 1 refused or failed (for example a recovery check failed), 2 configuration error, 3 the
 Coordinator is not running. Without a running Coordinator the CLI says so; `owner status` then also prints the status
-read from the database, labelled `READ-ONLY STATUS FROM THE DATABASE` (nothing in it is live), and nothing else works:
+read from the database, with one `Coordinator: not running (read-only snapshot)` header (nothing in it is live), and nothing else works:
 in particular there is no unfreeze without the Coordinator's recovery checks.
 
 `owner status` also shows the watchdog: its last heartbeat ("stale" when older than 15 s: no new run starts), its
-last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it.
+last sweep (reason, verified or not, how many Pi processes and containers it killed) and the requests waiting for it
+with `owner status --verbose`. The compact view keeps the heartbeat and operational alerts.
 
 A group **freezes** when the Coordinator or the watchdog cannot confirm a stop, or the Coordinator the outcome of a
 GitHub change (for example a push whose answer was lost while GitHub could not be read back) or of a file change (the
@@ -451,7 +453,7 @@ Telegram starts it.
    accepted and queued ("Waiting: dispatch is held while the group is sealed…"), `/approve` is accepted and its merge
    waits, a reply to a running task is saved but not delivered (when that run completes it starts another run of the
    task, which also waits; if the run fails it expires). Runs and merge tests already in progress finish first.
-   `owner status` shows the progress: `Evaluation in progress: trial trial-1, sealing … waiting for 1 active run to
+   `owner status --verbose` shows the progress: `Evaluation in progress: trial trial-1, sealing … waiting for 1 active run to
    finish`.
 5. Then the Coordinator verifies nothing executes any more (its own kills and the watchdog's sweep), fetches `main`,
    checks it contains every trial task's merge, exports it read-only to `<PI_TASK_DIR>/snapshots/trial-1-<commit>`
@@ -460,7 +462,7 @@ Telegram starts it.
    directories under `<PI_TASK_DIR>/eval-scratch/`). The suites run one after another (30-minute deadline).
 6. **The result** is posted to the group, for example `Evaluation of trial trial-1: PASSED. Snapshot of main at
    1a2b3c4. Trial tasks: Task 3, Task 4. Suites (3 of 3 passed): module:signup passed, integration passed, baseline
-   passed. Dispatch has reopened.`, and recorded: `owner status` shows `Last evaluation: …` with the per-suite
+   passed. Dispatch has reopened.`, and recorded: `owner status --verbose` shows `Last evaluation: …` with the per-suite
    outcomes. The database (`evaluations`) also keeps what the trial records: the snapshot's commit and hashes, the
    Pi Durable, scaffold and Node versions (no patches), the image ids, the tool policy version, the container limits
    and the hidden tests' hash. Dispatch reopens only after the evaluator container is verified gone and its scratch
@@ -551,3 +553,7 @@ token: Telegram allows one poller per token.
   (its `.git` is masked), a read-only root filesystem, a non-root user and CPU, memory and process limits. There is no
   arbitrary shell: the model has `read`, `edit`, `write` and `run_check` with the fixed operations of the check image.
 - Logs are metadata only: ids, counts, outcomes and hashes.
+
+For scoped task views without changing existing records, configure the verified external routing history
+in [docs/status-display.md](docs/status-display.md). Missing history is explicitly unconfirmed and available
+with `--all`. The read-only fallback and its exit code 3 remain unchanged.

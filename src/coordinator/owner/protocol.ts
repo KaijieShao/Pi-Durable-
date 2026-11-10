@@ -48,7 +48,7 @@ export function ownerPaths(dataDir: string): OwnerPaths {
 }
 
 export type OwnerRequest =
-	| { readonly command: "status" }
+	| { readonly command: "status"; readonly all?: boolean; readonly verbose?: boolean }
 	| { readonly command: "unfreeze"; readonly group: number }
 	| { readonly command: "resolve"; readonly intents: readonly number[] }
 	| { readonly command: "failed-events" }
@@ -106,6 +106,7 @@ type Fields = Readonly<Record<string, unknown>>;
 function commandOf(fields: Fields): OwnerRequest | string {
 	switch (fields.command) {
 		case "status":
+			return statusOf(fields);
 		case "failed-events":
 			return { command: fields.command };
 		case "unfreeze":
@@ -124,6 +125,19 @@ function commandOf(fields: Fields): OwnerRequest | string {
 		default:
 			return "unknown command";
 	}
+}
+
+function statusOf(fields: Fields): OwnerRequest | string {
+	if (
+		(fields.all !== undefined && typeof fields.all !== "boolean") ||
+		(fields.verbose !== undefined && typeof fields.verbose !== "boolean")
+	)
+		return "status display options must be boolean";
+	return {
+		command: "status",
+		...(fields.all === true ? { all: true } : {}),
+		...(fields.verbose === true ? { verbose: true } : {}),
+	};
 }
 
 function sealOf(fields: Fields): OwnerRequest | string {

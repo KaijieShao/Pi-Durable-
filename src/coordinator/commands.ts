@@ -16,9 +16,11 @@
  * Every reply is a required outbox message replying to the user's message. Ignored updates are recorded (so
  * redelivery stays deduplicated) but get no reply. Logs carry metadata only (ids, kinds, outcomes, codes).
  */
+
+import { join } from "node:path";
 import type { Update } from "grammy/types";
 import type { Logger } from "../runtime/log.ts";
-import { admitRun, agentQueuePosition, openTaskCount, waitingCapReason, waitingCounts } from "./admission.ts";
+import { admitRun, agentQueuePosition, waitingCapReason, waitingCounts } from "./admission.ts";
 import { type BranchHold, blocksTaskRuns, readBranchHold } from "./branch-hold.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import {
@@ -28,7 +30,6 @@ import {
 	diskSettings,
 	EXECUTION_DISK_WAIT_KEY,
 	systemDiskProbe,
-	TASK_DISK_WAIT_KEY,
 	taskDiskToldKey,
 } from "./disk.ts";
 import { deploymentHeld } from "./evaluation.ts";
@@ -64,11 +65,8 @@ import {
 	rejectedApprovalNote,
 	runAdmitted,
 	runStopping,
-	type StatusTaskLine,
-	sealingWait,
 	staleHead,
 	statusDetail,
-	statusSummary,
 	type TaskState,
 	taskAccepted,
 	taskCancelled,
@@ -78,11 +76,11 @@ import {
 	tooLong,
 	usageTask,
 	usageTaskId,
-	waitingForAgent,
-	waitingForReviews,
-	waitingForSlot,
-	waitingForTaskDisk,
 } from "./messages.ts";
+import { ownerStatus } from "./owner/report.ts";
+import { queueInfo, taskDiskNote, waitNote } from "./status-queue.ts";
+import { readScopeIndex, type ScopeIndex, type StatusIdentity } from "./status-scope.ts";
+import { parseStatusOptions, type StatusOptions, selectStatusTasks } from "./status-view.ts";
 import type { OutboxMessage, Store } from "./store.ts";
 import { type ParsedUpdate, parseUpdate } from "./telegram/parse.ts";
 
@@ -152,11 +150,13 @@ export function handleUpdate(store: Store, ctx: CommandContext, update: Update):
 	});
 	// Read the boot disk's free space before the transaction: only SQLite work happens inside it.
 	const disk = parsed.kind === "command" && parsed.name === "task" ? bootDisk(ctx) : undefined;
+	// A routing file is read before tx as well: status rendering inside tx remains SELECT-only.
+	const scope = parsed.kind === "command" && parsed.name === "status" ? readScopeIndex(statusIdentity(ctx)) : undefined;
 
 	const result = store.tx((): Result | undefined => {
 		// Redelivered update: already handled (it has its row), so no second effect and no second reply.
 		if (!recordCommand(store, update, parsed, receivedAt)) return undefined;
-		const outcome = route(store, ctx, parsed, disk);
+		const outcome = route(store, ctx, parsed, disk, scope);
 		enqueueReplies(store, parsed, outcome);
 		store.run(
 			"UPDATE commands SET kind = ?, task_id = ?, outcome = ?, reason = ? WHERE update_id = ?",
@@ -216,14 +216,20 @@ function enqueueReplies(store: Store, parsed: ParsedUpdate, outcome: Result): vo
 	for (const message of outcome.extra ?? []) store.enqueue(message);
 }
 
-function route(store: Store, ctx: CommandContext, parsed: ParsedUpdate, disk: BootDiskCheck | undefined): Result {
+function route(
+	store: Store,
+	ctx: CommandContext,
+	parsed: ParsedUpdate,
+	disk: BootDiskCheck | undefined,
+	scope?: ScopeIndex,
+): Result {
 	if (parsed.kind === "ignored") return ignored(parsed.reason);
 	if (parsed.kind === "reply") return onReply(store, ctx, parsed);
 	switch (parsed.name) {
 		case "task":
 			return onTask(store, ctx, parsed, disk ?? { ok: true });
 		case "status":
-			return onStatus(store, ctx, parsed);
+			return onStatus(store, ctx, parsed, scope ?? { periods: [] });
 		case "cancel":
 			return onCancel(store, ctx, parsed);
 		case "approve":
@@ -696,12 +702,39 @@ function busyRunKind(store: Store, taskId: number): string | undefined {
 // ---------------------------------------------------------------------------------------------------------------
 // /status [task]: no state change.
 
-function onStatus(store: Store, ctx: CommandContext, cmd: CommandMessage): Result {
-	if (cmd.args === "") {
-		return { kind: "status", outcome: "answered", reply: groupStatus(store, ctx.limits, cmd.chatId), kick: false };
+function statusIdentity(ctx: CommandContext): StatusIdentity {
+	return {
+		repository: ctx.config.github.repo,
+		topicId: ctx.config.telegram.topicId,
+		databasePath: join(ctx.config.paths.dataDir, "coordinator.sqlite"),
+		scopeFile: ctx.config.statusScopeFile,
+		runtime: "running",
+	};
+}
+
+function onStatus(store: Store, ctx: CommandContext, cmd: CommandMessage, scope: ScopeIndex): Result {
+	const options = parseStatusOptions(cmd.args);
+	if (!options) return rejection("status", "/status", ["usage", usageTaskId("/status")]);
+	if (options.task === undefined) {
+		return {
+			kind: "status",
+			outcome: "answered",
+			reply: groupStatus(store, ctx, cmd.chatId, options, scope),
+			kick: false,
+		};
 	}
-	const found = commandTask(store, cmd, "/status");
+	const found = commandTask(store, { ...cmd, args: String(options.task) }, "/status");
 	if ("blocker" in found) return rejection("status", "/status", found.blocker);
+	const selected = selectStatusTasks(store, cmd.chatId, statusIdentity(ctx), options, {
+		telegram: true,
+		scopeIndex: scope,
+	});
+	if (!selected.tasks.some((task) => task.id === found.task.id)) {
+		return rejection("status", "/status", [
+			"outside_scope",
+			`Task ${found.task.id} is outside this repo/topic or has unconfirmed routing; use /status ${found.task.id} --all.`,
+		]);
+	}
 	return {
 		kind: "status",
 		outcome: "answered",
@@ -711,30 +744,24 @@ function onStatus(store: Store, ctx: CommandContext, cmd: CommandMessage): Resul
 	};
 }
 
-function groupStatus(store: Store, limits: Limits, chatId: number): string {
-	const active = store
-		.all<TaskRow>(
-			`SELECT ${TASK_COLUMNS} FROM tasks WHERE chat_id = ? AND state NOT IN ('merged', 'failed', 'cancelled')
-			 ORDER BY id`,
-			chatId,
-		)
-		.map((task) => statusLineOf(store, limits, task));
-	const recent = store
-		.all<TaskRow>(
-			`SELECT ${TASK_COLUMNS} FROM tasks WHERE chat_id = ? AND state IN ('merged', 'failed', 'cancelled')
-			 ORDER BY updated_at DESC, id DESC LIMIT 5`,
-			chatId,
-		)
-		.map((task) => statusLineOf(store, limits, task));
-	const summary = statusSummary({
-		group: store.groupState(chatId),
-		slotsInUse: slotsInUse(store),
-		maxSlots: limits.maxConcurrentRuns,
-		active,
-		recent,
+function groupStatus(
+	store: Store,
+	ctx: CommandContext,
+	chatId: number,
+	options: StatusOptions,
+	scope: ScopeIndex,
+): string {
+	const summary = ownerStatus(store, chatId, [], statusIdentity(ctx), options, {
+		telegram: true,
+		scopeIndex: scope,
+		limits: ctx.limits,
 	});
 	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
-	return pressure === undefined ? summary : `${summary}\nExecution paused: ${pressure}.`;
+	const lines = [summary];
+	if (pressure !== undefined) lines.push(`Execution paused: ${pressure}.`);
+	if (options.verbose) lines.push("Storage: owner status --verbose on the host includes live measurements.");
+	lines.push("Send /status <task id> for details; --all includes other/unconfirmed routing in this group.");
+	return lines.join("\n");
 }
 
 function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
@@ -771,79 +798,6 @@ function taskStatus(store: Store, limits: Limits, task: TaskRow): string {
 function heldNoteOf(store: Store, taskId: number): string | undefined {
 	const hold = readBranchHold(store, taskId);
 	return hold === undefined ? undefined : holdNote({ ...holdFacts(taskId, hold), kind: hold.kind });
-}
-
-function statusLineOf(store: Store, limits: Limits, task: TaskRow): StatusTaskLine {
-	const queue = isTerminal(task.state) ? {} : queueInfo(store, limits, task);
-	return {
-		id: task.id,
-		agent: task.agent_id,
-		state: task.state,
-		position: queue.position,
-		note: queue.note,
-		cancelling: task.cancel_requested === 1 && !isTerminal(task.state),
-		prUrl: task.pr_url,
-		held: readBranchHold(store, task.id) !== undefined,
-	};
-}
-
-/** Queue position and waiting note of a task's queued run, if it has one. */
-function queueInfo(store: Store, limits: Limits, task: TaskRow): { position?: number; note?: string } {
-	const queued = store.get<{ id: number; kind: string }>(
-		"SELECT id, kind FROM runs WHERE task_id = ? AND state = 'queued' ORDER BY id LIMIT 1",
-		task.id,
-	);
-	if (queued === undefined) return {};
-	return {
-		position: agentQueuePosition(store, queued.id),
-		note: waitNote(store, limits, { chatId: task.chat_id, agent: task.agent_id, initial: queued.kind === "initial" }),
-	};
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Shared helpers
-
-/**
- * Why a queued run is not starting right away (Capacity § Waiting): a first run waits for the group to have fewer
- * than `openTasksPerGroup` open tasks and for room on the task disk for its new worktree (Capacity § Disk, while the
- * engine holds new worktrees: engine/task-disk.ts); every run waits for its agent and for a deployment-wide execution
- * slot.
- */
-function waitNote(
-	store: Store,
-	limits: Limits,
-	p: { chatId: number; agent: string; initial: boolean },
-): string | undefined {
-	if (deploymentHeld(store)) return sealingWait();
-	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
-	if (pressure !== undefined) return `waiting for disk safety: ${pressure}`;
-	if (p.initial) {
-		const open = openTaskCount(store, p.chatId);
-		if (open >= limits.openTasksPerGroup) return waitingForReviews(open);
-		const disk = taskDiskNote(store);
-		if (disk !== undefined) return disk;
-	}
-	const agentBusy =
-		store.get<{ n: number }>(
-			`SELECT COUNT(*) AS n FROM slots s JOIN tasks t ON t.id = s.task_id
-			 WHERE s.kind = 'run' AND t.chat_id = ? AND t.agent_id = ?`,
-			p.chatId,
-			p.agent,
-		)?.n ?? 0;
-	if (agentBusy >= limits.runsPerAgent) return waitingForAgent(p.agent);
-	const inUse = slotsInUse(store);
-	if (inUse >= limits.maxConcurrentRuns) return waitingForSlot(inUse, limits.maxConcurrentRuns);
-	return undefined;
-}
-
-/** The note of a held task disk (engine/task-disk.ts), if new worktrees are held now. */
-function taskDiskNote(store: Store): string | undefined {
-	const detail = store.getMeta(TASK_DISK_WAIT_KEY);
-	return detail === undefined ? undefined : waitingForTaskDisk(detail);
-}
-
-function slotsInUse(store: Store): number {
-	return store.get<{ n: number }>("SELECT COUNT(*) AS n FROM slots")?.n ?? 0;
 }
 
 /** The task a /cancel, /approve or /status <id> names, checked against the command's group. */

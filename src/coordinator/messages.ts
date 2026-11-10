@@ -87,7 +87,7 @@ export function usageTask(agents: readonly string[]): string {
 }
 
 export function usageTaskId(command: "/cancel" | "/approve" | "/status"): string {
-	return command === "/status" ? "usage: /status or /status <task id>" : `usage: ${command} <task id>`;
+	return command === "/status" ? "usage: /status [<task id>] [--all] [--verbose]" : `usage: ${command} <task id>`;
 }
 
 export function unknownAgent(given: string, agents: readonly string[]): string {
@@ -1029,7 +1029,7 @@ export function helpText(agents: readonly string[], bot: string, limits: Limits 
 				"A leading configured agent id selects that agent; otherwise the complete request is kept.",
 			"Reply to a task's bot message - follow-up: steered into the task while it runs, or another run on the " +
 				"same branch and pull request while it is in review.",
-			"/status - group state, execution slots and tasks; /status <task id> - details of one task.",
+			"/status - this repo/topic, completed work first; /status <task id> - details. --all shows other/unconfirmed routing in this group; --verbose adds diagnostics.",
 			"/approve <task id> - approve the head commit the bot last posted; it merges after the tests pass on the " +
 				"latest main.",
 			"/cancel <task id> - cancel a task (closes its pull request and keeps its branch).",

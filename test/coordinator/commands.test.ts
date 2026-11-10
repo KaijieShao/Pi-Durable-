@@ -1,6 +1,6 @@
 import "../helpers/env.ts";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -11,6 +11,7 @@ import { type DiskProbe, TASK_DISK_WAIT_KEY } from "../../src/coordinator/disk.t
 import { DEMO_LIMITS, type Limits } from "../../src/coordinator/limits.ts";
 import { Store } from "../../src/coordinator/store.ts";
 import { type LogFields, silentLogger } from "../../src/runtime/log.ts";
+import { statusScopeFile } from "../helpers/status-scope.ts";
 
 const GROUP = -1001234567;
 const OTHER_CHAT = -1009999999;
@@ -79,7 +80,8 @@ function probeOf(freeBytes: (path: string) => number): DiskProbe {
 function fixture(options: FixtureOptions = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pd-commands-"));
 	let clock = 1_800_000_000_000;
-	const store = new Store(join(dir, "coordinator.sqlite"), () => ++clock);
+	mkdirSync(join(dir, "data"));
+	const store = new Store(join(dir, "data", "coordinator.sqlite"), () => ++clock);
 	cleanups.push(() => {
 		store.close();
 		rmSync(dir, { recursive: true, force: true });
@@ -98,6 +100,7 @@ function fixture(options: FixtureOptions = {}) {
 			GITHUB_TOKEN: "test-token",
 			GITHUB_REPO: "acme/signup",
 			PI_DATA_DIR: join(dir, "data"),
+			PI_STATUS_SCOPE_FILE: statusScopeFile(join(dir, "data", "coordinator.sqlite"), "acme/signup", GROUP),
 			PI_TASK_DIR: join(dir, "tasks"),
 			...options.env,
 		},
@@ -499,7 +502,7 @@ describe("handleUpdate: /task", () => {
 		const followup = f.send(ANA, "add a unit test too", { replyTo: f.post(reviewed) });
 		assert.match(f.reply(followup.messageId), /^Follow-up started another run of Task \d+ on the same branch/);
 		const status = f.send(CAROL, "/status");
-		assert.match(f.reply(status.messageId), /^Group: normal\./);
+		assert.match(f.reply(status.messageId), /Group -1001234567: normal/);
 		const cancel = f.send(ANA, `/cancel ${queued}`);
 		assert.equal(f.reply(cancel.messageId), `Task ${queued} cancelled.`);
 		const approve = f.send(BOB, `/approve ${approved}`);
@@ -593,7 +596,7 @@ describe("handleUpdate: frozen group", () => {
 		assert.equal(f.count("tasks"), 2);
 
 		const status = f.send(BOB, "/status");
-		assert.match(f.reply(status.messageId), /^Group: frozen \(stop unconfirmed\)\./);
+		assert.match(f.reply(status.messageId), /Group -1001234567: frozen \(reason: stop unconfirmed\)/);
 		const cancel = f.send(ANA, `/cancel ${queued}`);
 		assert.equal(f.reply(cancel.messageId), `Task ${queued} cancelled.`);
 		assert.equal(f.task(queued).state, "cancelled");
@@ -981,8 +984,9 @@ describe("handleUpdate: /status and /help", () => {
 			f.store.run("UPDATE tasks SET state = ?, archived = 1, worktree_path = NULL WHERE id = ?", state, id);
 			const summary = f.reply(f.send(BOB, "/status").messageId);
 			const detail = f.reply(f.send(BOB, `/status ${id}`).messageId);
-			assert.match(summary, /Execution slots in use: 0\/2/);
-			assert.ok(summary.includes(`Task ${id} · alpha · ${state}`), summary);
+			assert.match(summary, /slots 0\/2/);
+			if (state === "failed") assert.match(summary, /Older failures: 1/);
+			else assert.ok(summary.includes(`Task ${id} · alpha · ${state}`), summary);
 			assert.ok(detail.startsWith(`Task ${id} · agent alpha · ${state}\n`), detail);
 			assert.doesNotMatch(summary, /cancelling/);
 			assert.doesNotMatch(detail, /cancelling/);
@@ -1006,15 +1010,40 @@ describe("handleUpdate: /status and /help", () => {
 		const sent = f.send(BOB, "/status");
 		assert.equal(sent.kick, false);
 		const text = f.reply(sent.messageId);
-		assert.match(text, /^Group: normal\. Execution slots in use: 1\/2\./);
+		assert.match(text, /^Coordinator: live .*slots 1\/2/);
 		const prUrl = `https://github.com/acme/signup/pull/${review + 40}`;
 		assert.ok(text.includes(`Task ${review} · alpha · in review · ${prUrl}`));
 		assert.ok(text.includes(`Task ${running} · beta · running`));
 		assert.ok(text.includes(`Task ${queued} · beta · queued · queue position 1 · waiting for agent beta`));
-		assert.match(text, /Recently finished:\nTask \d+ · gamma · merged · https:\/\/github\.com\/acme\/signup\/pull\/7/);
+		assert.match(text, /Completed:\nTask \d+ · gamma · merged · https:\/\/github\.com\/acme\/signup\/pull\/7/);
 		const row = f.store.get<Row>("SELECT * FROM commands WHERE update_id = ?", sent.updateId);
 		assert.deepEqual([row?.kind, row?.outcome], ["status", "answered"]);
 		assert.ok(text.length <= 4096);
+	});
+
+	test("default status scopes by repo/topic; --all includes history without crossing chats or rewriting task records", () => {
+		const f = fixture();
+		const id = f.submit(ANA, "alpha", "Current demo headline");
+		f.toReview(id);
+		const before = f.store.all("SELECT * FROM tasks ORDER BY id");
+		writeFileSync(
+			f.ctx.config.statusScopeFile as string,
+			JSON.stringify({
+				version: 1,
+				database: join(f.ctx.config.paths.dataDir, "coordinator.sqlite"),
+				periods: [{ firstTask: 1, lastTask: null, repository: "acme/signup", group: GROUP, topic: 124 }],
+			}),
+		);
+		const hidden = f.reply(f.send(BOB, "/status").messageId);
+		assert.doesNotMatch(hidden, /Task 1 ·/);
+		assert.match(hidden, /Hidden outside this scope or unconfirmed: 1/);
+		assert.match(f.reply(f.send(BOB, `/status ${id}`).messageId), /outside this repo\/topic/);
+		assert.match(f.reply(f.send(BOB, "/status --all --verbose").messageId), /Task 1 · alpha · in review/);
+		assert.match(f.reply(f.send(BOB, `/status #${id} --all`).messageId), /Request: Current demo headline/);
+		assert.deepEqual(f.store.all("SELECT * FROM tasks ORDER BY id"), before);
+		assert.equal(f.send(BOB, "/status --all", { chatId: OTHER_CHAT }).kick, false);
+		assert.deepEqual(f.store.all("SELECT * FROM tasks ORDER BY id"), before);
+		assert.match(f.reply(f.send(BOB, "/status --all --all").messageId), /usage:/);
 	});
 
 	test("detail of one task; unknown task rejected", () => {

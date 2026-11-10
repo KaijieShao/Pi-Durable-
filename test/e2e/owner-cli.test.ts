@@ -50,9 +50,10 @@ test("the running Coordinator's owner socket: owner-only, answers the CLI, gone 
 	assert.match(
 		status.stdout,
 		new RegExp(
-			`^Coordinator: running, pid ${process.pid}, since \\S+\\nRepository: acme/demo\\nTelegram routing: group ${GROUP}, topic 1 \\(General\\)\\nDatabase: /[^\\n]+/coordinator\\.sqlite\\nGroup ${GROUP}: normal\\nExecution slots: 0/2 in use\\n`,
+			`^Coordinator: live · acme/demo · group ${GROUP}, topic 1 · slots 0/2 · succeeded 0 / failed 0 / open 0\\nCompleted:`,
 		),
 	);
+	assert.ok(status.stdout.includes(`Database: ${stack.config.paths.dataDir}/coordinator.sqlite`));
 	assert.match(status.stdout, /\nWatchdog: last heartbeat \d+ s ago/);
 	assert.match(status.stdout, /\nBoot disk \(PI_DATA_DIR\): /);
 	assert.deepEqual(await stack.owner("failed-events"), { code: 0, stdout: "No failed events.\n", stderr: "" });
@@ -76,13 +77,10 @@ test("the running Coordinator's owner socket: owner-only, answers the CLI, gone 
 	assert.throws(() => lstatSync(paths.token), /ENOENT/);
 	const down = await stack.owner("status");
 	assert.equal(down.code, 3);
-	assert.match(down.stderr, /^The Coordinator is not running \(/);
-	assert.match(
-		down.stdout,
-		new RegExp(
-			`^READ-ONLY STATUS FROM THE DATABASE: .*\\nRepository: acme/demo\\nTelegram routing: group ${GROUP}, topic 1 \\(General\\)\\nDatabase: /[^\\n]+/coordinator\\.sqlite\\nGroup ${GROUP}: normal\\n`,
-		),
-	);
+	assert.equal(down.stderr, "");
+	assert.match(down.stdout, /^Coordinator: not running \(read-only snapshot\) · acme\/demo/);
+	assert.equal(down.stdout.split("\n").filter((line) => line.includes("not running")).length, 1);
+	assert.ok(down.stdout.includes(`Database: ${stack.config.paths.dataDir}/coordinator.sqlite`));
 	const unfreeze = await stack.owner("unfreeze");
 	assert.equal(unfreeze.code, 3);
 	assert.match(unfreeze.stderr, /An unfreeze needs the running Coordinator/);
