@@ -150,7 +150,7 @@ test("boot disk low: new tasks are refused, follow-ups wait without a slot, stat
 
 	// Commands remain durable, but a follow-up cannot execute below the safety floor.
 	await settle(stack);
-	assert.match(await command(stack, USER2, "/status"), /^Group: normal\..*\nTask 1 · alpha · in review/s);
+	assert.match(await command(stack, USER2, "/status"), /^Coordinator: live .*\n.*Task 1 · alpha · in review/s);
 	const followup = stack.reply(USER1, review1.id, "job-1b follow-up while the boot disk is low");
 	assert.match(
 		(await replyTo(stack, followup)).text,
@@ -277,7 +277,7 @@ test("task disk unreadable or below its free-space floor: new worktrees wait (fa
 	assert.equal(
 		await statusLine(stack, 1),
 		"Task 1 · alpha · queued · queue position 1 · waiting for room on the task disk: its new worktree needs about " +
-			"1.0 GiB on the task disk, but only 1.5 GiB is free and 1.0 GiB must stay free",
+			"1.0 GiB on the task disk, but only 1.5 GiB is free and 1.0 GiB must stay free · job-1 first task · no PR",
 	);
 	await settle(stack);
 	assert.deepEqual([firstRun(stack, 1).state, firstRun(stack, 2).state], ["queued", "queued"]);

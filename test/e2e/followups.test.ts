@@ -236,7 +236,7 @@ function messageIdOf(update: Update): number {
 /** Wait until the poller handled everything queued so far: a /status sent now is answered after it. */
 async function drainUpdates(stack: Stack): Promise<void> {
 	const probe = stack.sendCommand(USER2, "/status");
-	await replyTo(stack, probe, /^Group: /);
+	await replyTo(stack, probe, /^Coordinator: live /);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

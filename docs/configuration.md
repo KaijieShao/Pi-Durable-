@@ -27,6 +27,10 @@ Pi processes, containers, the watchdog and the owner CLI never receive them.
 | `TELEGRAM_MEMBER_IDS` | no | any group member | Comma-separated user ids allowed to submit `/task` (the owner always may). Follow-ups, `/approve` and `/cancel` stay limited to a task's creator and the owner |
 | `TELEGRAM_API_ROOT` | no | `https://api.telegram.org` | Bot API server (tests use a local fake) |
 
+`PI_STATUS_SCOPE_FILE` optionally points to an owner-controlled, non-secret routing-history JSON file.
+It enables default status filtering by configured repo **and topic** without modifying task records.
+Unverified history requires `--all`; see [the status guide](status-display.md) before deployment or a routing change.
+
 ## Agents and model
 
 | Variable | Required | Default | Meaning |

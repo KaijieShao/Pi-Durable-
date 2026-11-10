@@ -137,6 +137,32 @@ export type DiskReportConfig = {
 	readonly disk: CoordinatorConfig["disk"];
 };
 
+/** Constant-time default view: filesystem counters and database metadata, never a worktree/raw-content walk. */
+export function compactDiskReport(store: Store, config: DiskReportConfig): string[] {
+	const settings = diskSettings(config, DEMO_LIMITS);
+	const { dataDir, taskDir } = config.paths;
+	const tasks = measured(() => {
+		const { free, size } = statfsSpace(taskDir);
+		return `${formatBytes(free)} free of ${formatBytes(size)}`;
+	});
+	const worktrees = store.get<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE worktree_path IS NOT NULL")?.n ?? 0;
+	return [
+		bootLine(dataDir, settings),
+		`Task disk: ${tasks}; floor ${formatBytes(settings.taskMinFreeBytes)}; ${worktrees} recorded worktrees.`,
+		`${databaseLine(dataDir).trim()}; --verbose for storage and retention detail.`,
+		...diskHolds(store),
+	];
+}
+
+function diskHolds(store: Store): string[] {
+	const held = store.getMeta(TASK_DISK_WAIT_KEY);
+	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
+	return [
+		...(held === undefined ? [] : [`New worktrees are held: ${held}`]),
+		...(pressure === undefined ? [] : [`All execution is held: ${pressure}`]),
+	];
+}
+
 /** The disk lines of `owner status`. */
 export async function diskReport(store: Store, config: DiskReportConfig): Promise<string[]> {
 	const settings = diskSettings(config, DEMO_LIMITS);
@@ -149,9 +175,6 @@ export async function diskReport(store: Store, config: DiskReportConfig): Promis
 		await taskLine(store, taskDir, settings),
 		await snapshotsLine(store, taskDir),
 	];
-	const held = store.getMeta(TASK_DISK_WAIT_KEY);
-	if (held !== undefined) lines.push(`  New worktrees are held: ${held}`);
-	const pressure = store.getMeta(EXECUTION_DISK_WAIT_KEY)?.split("|").slice(1).join("|");
-	if (pressure !== undefined) lines.push(`  All execution is held: ${pressure}`);
+	lines.push(...diskHolds(store));
 	return lines;
 }

@@ -18,7 +18,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigError, loadOwnerConfig, type OwnerConfig } from "../coordinator/config.ts";
-import { diskReport } from "../coordinator/owner/disk-report.ts";
+import { compactDiskReport, diskReport } from "../coordinator/owner/disk-report.ts";
 import type { OwnerRequest } from "../coordinator/owner/protocol.ts";
 import { ownerStatus } from "../coordinator/owner/report.ts";
 import { Store } from "../coordinator/store.ts";
@@ -51,6 +51,7 @@ export function answerTimeoutMs(request: OwnerRequest): number {
 export function ownerRequestOf(invocation: OwnerInvocation, groupChatId: number): OwnerRequest {
 	switch (invocation.action) {
 		case "status":
+			return statusRequest(invocation);
 		case "failed-events":
 			return { command: invocation.action };
 		case "unfreeze":
@@ -73,33 +74,50 @@ export function ownerRequestOf(invocation: OwnerInvocation, groupChatId: number)
 	}
 }
 
+function statusRequest(invocation: Extract<OwnerInvocation, { action: "status" }>): OwnerRequest {
+	return {
+		command: "status",
+		...(invocation.all ? { all: true } : {}),
+		...(invocation.verbose ? { verbose: true } : {}),
+	};
+}
+
 type Io = { readonly stdout: (text: string) => void; readonly stderr: (text: string) => void };
 
 /**
  * `owner status` while the Coordinator is down: the same report from a read-only, query-only connection (no
  * migration, no write), labelled so nobody takes it for live state.
  */
-async function fallbackStatus(config: OwnerConfig, io: Io): Promise<void> {
+async function fallbackStatus(
+	config: OwnerConfig,
+	invocation: Extract<OwnerInvocation, { action: "status" }>,
+	io: Io,
+): Promise<void> {
 	const path = join(config.paths.dataDir, COORDINATOR_DB);
 	if (!existsSync(path)) {
-		io.stderr(`No Coordinator database at ${path} either: the Coordinator never ran with this PI_DATA_DIR.\n`);
+		io.stderr(`Coordinator: not running; no read-only database at ${path}.\n`);
 		return;
 	}
 	let store: Store | undefined;
 	try {
 		store = new Store(path, Date.now, { readOnly: true });
-		const disk = await diskReport(store, config);
-		const status = ownerStatus(store, config.groupChatId, disk, {
-			repository: config.repository,
-			topicId: config.topicId,
-			databasePath: path,
-		});
-		io.stdout(
-			"READ-ONLY STATUS FROM THE DATABASE: the Coordinator is not running, so nothing below is live and no command " +
-				`can change it.\n${status}\n`,
+		const disk = invocation.verbose ? await diskReport(store, config) : compactDiskReport(store, config);
+		const status = ownerStatus(
+			store,
+			config.groupChatId,
+			disk,
+			{
+				repository: config.repository,
+				topicId: config.topicId,
+				databasePath: path,
+				scopeFile: config.statusScopeFile,
+				runtime: "offline",
+			},
+			invocation,
 		);
+		io.stdout(`${status}\n`);
 	} catch (error) {
-		io.stderr(`The database could not be read: ${errorSummary(error)}\n`);
+		io.stderr(`Coordinator: not running; read-only database unavailable: ${errorSummary(error)}\n`);
 	} finally {
 		store?.close();
 	}
@@ -115,6 +133,10 @@ async function report(result: ClientResult, invocation: OwnerInvocation, config:
 			io.stderr(`${result.response.text}\n`);
 			return OWNER_EXIT.refused;
 		case "not_running": {
+			if (invocation.action === "status") {
+				await fallbackStatus(config, invocation, io);
+				return OWNER_EXIT.notRunning;
+			}
 			const needs =
 				invocation.action === "unfreeze"
 					? " An unfreeze needs the running Coordinator: it repeats the recovery checks before the group may dispatch again."
@@ -122,7 +144,6 @@ async function report(result: ClientResult, invocation: OwnerInvocation, config:
 						? " Sealing needs the running Coordinator: it holds dispatch and starts the evaluator."
 						: "";
 			io.stderr(`The Coordinator is not running (${result.detail}).${needs} Start it (pi-durable-telegram run).\n`);
-			if (invocation.action === "status") await fallbackStatus(config, io);
 			return OWNER_EXIT.notRunning;
 		}
 		case "denied":

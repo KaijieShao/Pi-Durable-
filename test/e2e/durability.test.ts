@@ -813,7 +813,7 @@ async function assertFrozenCommands(stack: Stack, review2: ServerMessage): Promi
 	assert.match(followupAnswer, FROZEN_NOTICE);
 	assert.match(approveAnswer, /^\/approve rejected: /);
 	assert.match(approveAnswer, FROZEN_NOTICE);
-	assert.match(report, /^Group: frozen \(the merge outcome of Task 1 on GitHub is unknown\)\./);
+	assert.match(report, /Group -1001234567890: frozen \(reason: the merge outcome of Task 1 on GitHub is unknown\)/);
 	assert.match(report, /Task 1 · alpha · merging/);
 	assert.match(report, /Task 2 · beta · in review · https:\/\/github\.com\/acme\/demo\/pull\/2/);
 	assert.match(report, /Task 4 · alpha · queued · queue position 1/);

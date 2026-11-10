@@ -26,7 +26,7 @@ import type { CoordinatorConfig } from "../config.ts";
 import type { Engine, SealOutcome, UnfreezeOutcome } from "../engine.ts";
 import { taskList } from "../evaluation.ts";
 import type { Store } from "../store.ts";
-import { diskReport } from "./disk-report.ts";
+import { compactDiskReport, diskReport } from "./disk-report.ts";
 import { inspectConversation } from "./inspect.ts";
 import { type CheckReport, type OwnerRequest, type OwnerResponse, ownerPaths } from "./protocol.ts";
 import { clean, groupConversation, ownerConversations, ownerFailedEvents, ownerStatus } from "./report.ts";
@@ -45,20 +45,29 @@ export type OwnerServiceDeps = {
 
 const refuse = (error: string, text: string): OwnerResponse => ({ ok: false, error, text });
 
-function coordinatorLine(deps: OwnerServiceDeps): string {
-	const running = deps.engine() === undefined ? "starting (recovery in progress)" : "running";
-	return `Coordinator: ${running}, pid ${process.pid}, since ${new Date(deps.startedAt).toISOString()}`;
-}
-
-async function status(deps: OwnerServiceDeps): Promise<OwnerResponse> {
+async function status(
+	deps: OwnerServiceDeps,
+	request: Extract<OwnerRequest, { command: "status" }>,
+): Promise<OwnerResponse> {
 	const { store, config } = deps;
-	const disk = await diskReport(store, config);
-	const text = ownerStatus(store, config.telegram.groupChatId, disk, {
-		repository: config.github.repo,
-		topicId: config.telegram.topicId,
-		databasePath: join(config.paths.dataDir, "coordinator.sqlite"),
-	});
-	return { ok: true, text: `${coordinatorLine(deps)}\n${text}` };
+	const disk = request.verbose ? await diskReport(store, config) : compactDiskReport(store, config);
+	const text = ownerStatus(
+		store,
+		config.telegram.groupChatId,
+		disk,
+		{
+			repository: config.github.repo,
+			topicId: config.telegram.topicId,
+			databasePath: join(config.paths.dataDir, "coordinator.sqlite"),
+			scopeFile: config.statusScopeFile,
+			runtime: deps.engine() === undefined ? "starting" : "running",
+		},
+		request,
+	);
+	const processLine = request.verbose
+		? `\nProcess: pid ${process.pid}, since ${new Date(deps.startedAt).toISOString()}`
+		: "";
+	return { ok: true, text: `${text}${processLine}` };
 }
 
 function checkLines(checks: readonly CheckReport[]): string[] {
@@ -208,7 +217,7 @@ export function ownerService(deps: OwnerServiceDeps): (request: OwnerRequest) =>
 		try {
 			switch (request.command) {
 				case "status":
-					return await status(deps);
+					return await status(deps, request);
 				case "unfreeze":
 					return await unfreeze(deps, request.group);
 				case "resolve":

@@ -25,7 +25,7 @@ plugins, OAuth login and a patched Pi Durable). That code is removed; Pi Durable
 | `/task@smule_code_bot <text>` | A new task, automatically assigned to a configured agent with the smallest queued/running workload and available queue capacity; acknowledged with the chosen agent, task id and queue position |
 | `/task@smule_code_bot <agent> <text>` | Explicitly choose a configured agent. Queue limits, membership, freeze, disk and approval rules remain enforced. |
 | a reply to one of the bot's messages about a task | A follow-up: steered into the task while it runs; while it is in review, another run on the same branch and pull request. Only the creator or the owner. |
-| `/status@smule_code_bot [task]` | Group state, execution slots in use, open and queued tasks with their pull requests; or one task's details |
+| `/status@smule_code_bot [task] [--all] [--verbose]` | Current repo/topic, Completed first, aggregate failures; `--all` includes other/unconfirmed routing in this group |
 | `/cancel@smule_code_bot <task>` | Creator or owner: stops the task, pushes its work, closes its pull request, keeps the branch |
 | `/approve@smule_code_bot <task>` | Creator or owner: approves the head commit the bot last posted; merged when it is still the head and the tests pass |
 | `/help@smule_code_bot` | Commands and limits |
@@ -86,7 +86,8 @@ The common `/task @smule_code_bot <text>` spelling is also accepted when Telegra
 ```sh
 pi-durable-telegram watchdog [--env-file <path>]
 pi-durable-telegram run [--env-file <path>]
-pi-durable-telegram owner status|unfreeze [<group>]|resolve <change>...|failed-events [--env-file <path>]
+pi-durable-telegram owner status [--all] [--verbose]
+pi-durable-telegram owner unfreeze [<group>]|resolve <change>...|failed-events [--env-file <path>]
 pi-durable-telegram owner conversations [<task>]|inspect <conversation> [--env-file <path>]
 pi-durable-telegram owner seal [<group>] [--trial <id>] [--tasks <id,...>] [--env-file <path>]
 ```
@@ -102,7 +103,7 @@ makes the Coordinator repeat its recovery checks and unfreezes the group only if
 your review of an uncertain file change; `owner inspect` prints a quarantined conversation's transcript, read without
 writing anything; `owner seal` is the trial harness: it seals the group and has the isolated evaluator grade a
 snapshot of main ([RUN-LOCAL.md](RUN-LOCAL.md#trial-evaluation-sealing)). Without a running Coordinator it says so and
-exits 3 (`owner status` adds a labelled read-only status from the database) ([RUN-LOCAL.md](RUN-LOCAL.md#owner-cli),
+exits 3 (`owner status` prints one labelled read-only snapshot header) ([RUN-LOCAL.md](RUN-LOCAL.md#owner-cli),
 [security.md](docs/security.md#the-owner-socket)).
 
 ## Model endpoint (OPENAI_BASE_URL)
@@ -138,3 +139,5 @@ npm test          # node --test; Telegram, GitHub and the model are local fakes 
 [MIT](LICENSE) © smixs
 
 Post-acceptance merged-branch housekeeping is an independent, default-disabled worker. It deletes only confirmed merged, completed and archived task branches; cancelled/open/unmerged branches remain. See [branch cleanup operations](docs/branch-cleanup.md).
+
+Status display, routing-history setup and `--all`/`--verbose`: [read-only status guide](docs/status-display.md).
