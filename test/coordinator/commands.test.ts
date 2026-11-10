@@ -268,6 +268,68 @@ describe("handleUpdate: /task", () => {
 		assert.match(f.reply(sent.messageId), /^Task \d+ accepted for agent alpha\. Queue position 1\.$/);
 	});
 
+	for (const prefix of ["/task", `/task@${BOT}`, `/task @${BOT}`]) {
+		test(`${prefix} accepts a requirement without an agent and preserves its complete text`, () => {
+			const f = fixture();
+			const text = "please modify the UI to be a colder color\nand send me the screenshot";
+			const sent = f.send(ANA, `${prefix} ${text}`);
+			assert.equal(sent.kick, true);
+			assert.match(f.reply(sent.messageId), /accepted for agent alpha\. Queue position 1\./);
+			assert.equal(f.task(1).text, text);
+			assert.equal(f.store.get<Row>("SELECT input_text FROM runs")?.input_text, text);
+		});
+	}
+
+	test("automatic assignment prefers a less busy agent and keeps configured order on equal loads", () => {
+		const f = fixture();
+		const first = f.submit(ANA, "alpha");
+		dispatch(f, first, "alpha");
+		const next = f.send(BOB, "/task please update the footer");
+		assert.match(f.reply(next.messageId), /accepted for agent beta/);
+		const third = f.send(CAROL, "/task please update the schedule");
+		assert.match(f.reply(third.messageId), /accepted for agent gamma/);
+	});
+
+	test("automatic assignment skips a full agent queue and preserves group and user queue caps", () => {
+		const f = fixture();
+		f.submit(ANA, "alpha");
+		f.submit(BOB, "alpha");
+		const next = f.send(CAROL, "/task please use cooler colors");
+		assert.match(f.reply(next.messageId), /accepted for agent beta/);
+		f.submit(BOB, "beta");
+		const full = f.send(CAROL, "/task please add a footer note");
+		assert.match(f.reply(full.messageId), /queue full: the group already has 4 waiting tasks/);
+		assert.equal(f.count("tasks"), 4);
+		const user = fixture({ limits: { waitingPerUser: 1 } });
+		user.submit(ANA, "alpha");
+		assert.match(user.reply(user.send(ANA, "/task please update it").messageId), /you already have 1 waiting task/);
+	});
+
+	test("implicit-agent requests still enforce authorization, freeze, disk and text limits", () => {
+		const restricted = fixture({ members: `${ANA}` });
+		assert.match(
+			restricted.reply(restricted.send(BOB, `/task @${BOT} please fix it`).messageId),
+			/only the group's listed members/,
+		);
+		const frozen = fixture();
+		frozen.store.freeze(GROUP, "test hold");
+		assert.match(frozen.reply(frozen.send(ANA, "/task please fix it").messageId), /group is frozen/);
+		const low = fixture({ freeBytes: () => 0 });
+		assert.match(low.reply(low.send(ANA, "/task please fix it").messageId), /boot disk is low/);
+		const long = fixture();
+		assert.match(long.reply(long.send(ANA, `/task ${"x".repeat(4001)}`).messageId), /too long/);
+		for (const f of [restricted, frozen, low, long]) assert.equal(f.count("tasks"), 0);
+	});
+
+	test("a duplicated implicit-agent request does not choose a second agent or create another task", () => {
+		const f = fixture();
+		f.send(ANA, `/task @${BOT} please fix it`, { updateId: 12345 });
+		f.send(ANA, `/task @${BOT} please fix it`, { updateId: 12345 });
+		assert.equal(f.count("tasks"), 1);
+		assert.equal(f.count("runs"), 1);
+		assert.equal(f.count("outbox"), 1);
+	});
+
 	test("duplicate update id: one task, one ack, no second effect", () => {
 		const f = fixture();
 		const first = f.send(ANA, `/task@${BOT} alpha one`, { updateId: 77 });
@@ -329,15 +391,20 @@ describe("handleUpdate: /task", () => {
 		f.submit(BOB, "gamma");
 	});
 
-	test("unknown agent, missing text, too long text are rejected with the reason", () => {
+	test("a non-agent first word remains part of a natural-language request", () => {
 		const f = fixture();
-		const unknown = f.send(ANA, "/task delta fix it");
-		assert.equal(
-			f.reply(unknown.messageId),
-			'Task request rejected: unknown agent "delta"; configured agents: alpha, beta, gamma.',
-		);
+		const sent = f.send(ANA, "/task delta fix it");
+		assert.match(f.reply(sent.messageId), /accepted for agent alpha/);
+		assert.equal(f.task(1).text, "delta fix it");
+	});
+
+	test("missing text and too long text are rejected with the reason", () => {
+		const f = fixture();
 		const bare = f.send(ANA, "/task");
-		assert.match(f.reply(bare.messageId), /rejected: usage: \/task <agent> <text>; agents: alpha, beta, gamma\.$/);
+		assert.match(
+			f.reply(bare.messageId),
+			/rejected: usage: \/task <text> or \/task <agent> <text>; agents: alpha, beta, gamma\.$/,
+		);
 		const empty = f.send(ANA, "/task alpha   ");
 		assert.match(f.reply(empty.messageId), /rejected: the task text is empty/);
 		const long = f.send(ANA, `/task alpha ${"x".repeat(4001)}`);

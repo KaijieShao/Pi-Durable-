@@ -76,7 +76,6 @@ import {
 	terminalForCommand,
 	terminalTask,
 	tooLong,
-	unknownAgent,
 	usageTask,
 	usageTaskId,
 	waitingForAgent,
@@ -252,7 +251,7 @@ function rejection(kind: CommandKind, subject: RejectSubject, blocker: Blocker, 
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// /task <agent> <text>
+// /task [agent] <text>
 
 function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: BootDiskCheck): Result {
 	const { limits } = ctx;
@@ -296,7 +295,7 @@ function onTask(store: Store, ctx: CommandContext, cmd: CommandMessage, disk: Bo
 	};
 }
 
-/** Validate a /task in rule order: member allowlist, frozen group, agent, text, boot disk, waiting caps. */
+/** Validate a /task: member allowlist, frozen group, text, boot disk, agent selection and waiting caps. */
 function taskRequest(
 	store: Store,
 	ctx: CommandContext,
@@ -304,23 +303,53 @@ function taskRequest(
 	disk: BootDiskCheck,
 ): { agent: string; text: string } | { blocker: Blocker } {
 	const { config, limits } = ctx;
-	const members = config.telegram.memberIds;
-	const isMember = cmd.userId === config.telegram.ownerId || members === undefined || members.includes(cmd.userId);
-	if (!isMember) return { blocker: ["not_member", notAMember()] };
-	const group = store.groupState(cmd.chatId);
-	if (group.state === "frozen") return { blocker: ["frozen", frozenNotice(group.reason)] };
+	const denied = taskPermissionBlocker(store, config, cmd);
+	if (denied !== undefined) return { blocker: denied };
 	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(cmd.args);
 	const given = match?.[1];
 	if (given === undefined) return { blocker: ["usage", usageTask(config.agents)] };
-	const agent = given.toLowerCase();
-	if (!config.agents.includes(agent)) return { blocker: ["unknown_agent", unknownAgent(given, config.agents)] };
-	const text = (match?.[2] ?? "").trim();
+	const explicit = config.agents.includes(given.toLowerCase()) ? given.toLowerCase() : undefined;
+	const text = explicit === undefined ? cmd.args : (match?.[2] ?? "").trim();
 	if (text === "") return { blocker: ["empty", `${emptyText("task")}; ${usageTask(config.agents)}`] };
 	if (text.length > limits.taskChars) return { blocker: ["too_long", tooLong("task", text.length, limits.taskChars)] };
 	if (!disk.ok) return { blocker: [disk.code, disk.reason] };
-	const counts = waitingCounts(store, { agentId: agent, chatId: cmd.chatId, userId: cmd.userId });
-	const full = waitingCapReason(limits, counts, agent);
-	return full === undefined ? { agent, text } : { blocker: ["queue_full", full] };
+	const assignment = selectTaskAgent(store, ctx, cmd, explicit);
+	return "blocker" in assignment ? assignment : { agent: assignment.agent, text };
+}
+
+function taskPermissionBlocker(store: Store, config: CoordinatorConfig, cmd: CommandMessage): Blocker | undefined {
+	const members = config.telegram.memberIds;
+	const isMember = cmd.userId === config.telegram.ownerId || members === undefined || members.includes(cmd.userId);
+	if (!isMember) return ["not_member", notAMember()];
+	const group = store.groupState(cmd.chatId);
+	return group.state === "frozen" ? ["frozen", frozenNotice(group.reason)] : undefined;
+}
+
+function selectTaskAgent(
+	store: Store,
+	ctx: CommandContext,
+	cmd: CommandMessage,
+	explicit: string | undefined,
+): { agent: string } | { blocker: Blocker } {
+	const { config, limits } = ctx;
+	const candidates = (explicit === undefined ? config.agents : [explicit]).map((agent) => {
+		const counts = waitingCounts(store, { agentId: agent, chatId: cmd.chatId, userId: cmd.userId });
+		const load =
+			store.get<{ n: number }>(
+				`SELECT COUNT(*) AS n FROM runs r JOIN tasks t ON t.id = r.task_id
+			 WHERE t.chat_id = ? AND t.agent_id = ? AND r.state IN ('queued', 'starting', 'running', 'finalizing')`,
+				cmd.chatId,
+				agent,
+			)?.n ?? 0;
+		return { agent, load, full: waitingCapReason(limits, counts, agent) };
+	});
+	// This runs in the command transaction, so concurrent submissions see the newly reserved queue place.
+	// Stable ordering makes equal loads follow the configured agent order. Explicit choices never get rerouted.
+	candidates.sort((a, b) => a.load - b.load);
+	const selected = candidates.find((candidate) => candidate.full === undefined);
+	return selected === undefined
+		? { blocker: ["queue_full", candidates[0]?.full ?? "no configured agent is available"] }
+		: { agent: selected.agent };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
